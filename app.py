@@ -317,7 +317,11 @@ def attachment_bytes(attachment: Dict[str, Any]) -> bytes:
     data_base64 = safe_str(attachment.get("data_base64", ""))
     if not data_base64:
         return b""
-    return base64.b64decode(data_base64.encode("ascii"))
+
+    try:
+        return base64.b64decode(data_base64.encode("ascii"))
+    except Exception:
+        return b""
 
 
 def attachment_names_summary(attachments: List[Dict[str, Any]]) -> str:
@@ -1446,7 +1450,7 @@ def render_old_parts_attachments(claim: Dict[str, Any]):
     st.markdown("### Adjuntos de piezas viejas")
     st.caption(
         "Adjunta al menos 3 fotos de piezas viejas y, aparte, el certificado de destrucción "
-        "si aplica. Los adjuntos se guardan en el JSON de trabajo y en el paquete ZIP."
+        "si aplica. Los adjuntos se guardan en el JSON de trabajo y en el paquete ZIP, incluidos PDF."
     )
 
     photo_files = st.file_uploader(
@@ -1526,9 +1530,52 @@ def render_old_parts_attachments(claim: Dict[str, Any]):
     claim["attachments"] = attachments
 
 
+def sync_uploaded_attachments_from_session_state(claims: Dict[str, Dict[str, Any]]) -> None:
+    """
+    Sincroniza adjuntos ya subidos con st.session_state antes de construir descargas.
+
+    En Streamlit el script se ejecuta de arriba a abajo. Los botones de descarga están
+    por encima del uploader de adjuntos, así que, si el usuario subía un certificado PDF
+    y descargaba el ZIP en esa misma pantalla, el ZIP podía construirse con el estado
+    anterior. Esta función lee directamente los file_uploader ya presentes en
+    session_state y los persiste en la claim antes de generar JSON/Excel/ZIP.
+    """
+    if not claims:
+        return
+
+    for claim in claims.values():
+        claim_no = safe_str(claim.get("claim_no", ""))
+        if not claim_no:
+            continue
+
+        attachments = get_claim_attachments(claim)
+        version = st.session_state.get(f"attachment_uploader_version_{claim_no}", 0)
+
+        photos_key = f"old_parts_photos_{claim_no}_{version}"
+        photo_files = st.session_state.get(photos_key)
+        if photo_files:
+            if not isinstance(photo_files, list):
+                photo_files = [photo_files]
+            attachments["old_parts_photos"] = [
+                uploaded_file_to_attachment(file)
+                for file in photo_files
+                if file is not None
+            ]
+
+        certificate_key = f"destruction_certificate_{claim_no}_{version}"
+        certificate_file = st.session_state.get(certificate_key)
+        if isinstance(certificate_file, list):
+            certificate_file = certificate_file[0] if certificate_file else None
+        if certificate_file is not None:
+            attachments["destruction_certificate"] = uploaded_file_to_attachment(certificate_file)
+
+        claim["attachments"] = attachments
+
+
 def main():
     st.set_page_config(page_title="Warranty Audit Portal", layout="wide")
     init_state()
+    sync_uploaded_attachments_from_session_state(st.session_state.claims)
 
     st.title("Warranty Audit Portal")
     st.caption("Auditoría online de garantías: documentación + piezas viejas = 100 puntos. Campañas solo informativo. Ficha por claim y adjuntos de piezas viejas.")
@@ -1614,6 +1661,7 @@ def main():
         st.caption("No aplica = máximo del apartado. Campañas = informativo.")
 
     claims: Dict[str, Dict[str, Any]] = st.session_state.claims
+    sync_uploaded_attachments_from_session_state(claims)
 
     if not claims:
         st.info("Sube la checklist de auditoría o añade una claim manual para empezar.")
