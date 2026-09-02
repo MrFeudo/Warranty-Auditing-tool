@@ -16,6 +16,7 @@ Notas de cálculo:
 - No aplica = máxima puntuación del apartado.
 - Campañas son informativas y no suman ni restan.
 - Permite guardar y recargar auditorías de trabajo en JSON.
+- El comentario general puede generarse desde las observaciones de cada apartado.
 """
 
 from __future__ import annotations
@@ -1088,6 +1089,33 @@ def init_state():
         st.session_state.audit_auditor = ""
 
 
+def build_general_comment_from_observations(claim: Dict[str, Any], include_campaigns: bool = True) -> str:
+    """Construye el comentario general usando solo las observaciones escritas en cada apartado.
+
+    No inventa desviaciones por puntuación: simplemente recopila los comentarios manuales
+    que el auditor ha escrito en Documentación, Piezas viejas y, si procede, Campañas.
+    """
+    checks = ALL_CHECKS if include_campaigns else ALL_SCORING_CHECKS
+    lines = []
+
+    for check in checks:
+        evaluation = claim.get("evaluations", {}).get(check.key, {})
+        comment = safe_str(evaluation.get("comment", ""))
+
+        if not comment:
+            continue
+
+        # Evita duplicar el título si el usuario ya ha empezado el comentario con "OR: ...".
+        normalized_comment = comment.lower().lstrip()
+        normalized_label = check.label.lower().strip()
+        if normalized_comment.startswith(normalized_label + ":"):
+            lines.append(comment)
+        else:
+            lines.append(f"{check.label}: {comment}")
+
+    return "\n".join(lines).strip()
+
+
 def render_check_editor(claim: Dict[str, Any], checks: List[AuditCheck]):
     for check in checks:
         evaluation = claim["evaluations"][check.key]
@@ -1315,33 +1343,61 @@ def main():
         if score["pending"]:
             st.warning("Apartados pendientes: " + ", ".join(score["pending"]))
 
-        tabs = st.tabs(["I. Documentación", "II. Piezas viejas", "Campañas", "Comentarios", "Informe"])
+        section_names = ["I. Documentación", "II. Piezas viejas", "Campañas", "Comentarios", "Informe"]
 
-        with tabs[0]:
+        if "active_audit_section" not in st.session_state:
+            st.session_state.active_audit_section = section_names[0]
+
+        if st.session_state.active_audit_section not in section_names:
+            st.session_state.active_audit_section = section_names[0]
+
+        st.radio(
+            "Sección de revisión",
+            section_names,
+            index=section_names.index(st.session_state.active_audit_section),
+            horizontal=True,
+            key="active_audit_section",
+            label_visibility="collapsed",
+        )
+
+        selected_section = st.session_state.active_audit_section
+
+        if selected_section == "I. Documentación":
             render_check_editor(claim, DOCUMENT_CHECKS)
 
-        with tabs[1]:
+        elif selected_section == "II. Piezas viejas":
             render_check_editor(claim, OLD_PARTS_CHECKS)
 
-        with tabs[2]:
+        elif selected_section == "Campañas":
             render_campaign_editor(claim)
 
-        with tabs[3]:
+        elif selected_section == "Comentarios":
+            st.caption(
+                "El comentario general se puede generar automáticamente a partir de las "
+                "observaciones que hayas escrito en cada apartado. No inventa nada por la nota."
+            )
+
+            general_comment_key = f"general_comment_{claim['claim_no']}"
+            if general_comment_key not in st.session_state:
+                st.session_state[general_comment_key] = claim.get("general_comment", "")
+
+            if st.button("Generar desde observaciones de apartados", key=f"generate_comment_{claim['claim_no']}"):
+                generated_comment = build_general_comment_from_observations(claim, include_campaigns=True)
+
+                if generated_comment:
+                    claim["general_comment"] = generated_comment
+                    st.session_state[general_comment_key] = generated_comment
+                    st.success("Comentario general generado desde las observaciones de los apartados.")
+                else:
+                    st.warning("No hay observaciones escritas en los apartados para generar el comentario general.")
+
             claim["general_comment"] = st.text_area(
                 "Comentarios generales de la claim",
-                value=claim.get("general_comment", ""),
-                key=f"general_comment_{claim['claim_no']}",
+                key=general_comment_key,
                 height=180,
             )
 
-            if st.button("Generar comentario base desde desviaciones", key=f"generate_comment_{claim['claim_no']}"):
-                pieces = []
-                for block, area, lost, max_points, status in score["lost_by_area"]:
-                    pieces.append(f"{area}: desviación detectada ({status}), {lost}/{max_points} puntos perdidos.")
-                claim["general_comment"] = "\n".join(pieces)
-                st.rerun()
-
-        with tabs[4]:
+        elif selected_section == "Informe":
             report = generate_text_report(claims, audit_name, dealer, auditor)
             st.text_area("Informe generado", value=report, height=420)
             st.download_button(
@@ -1350,6 +1406,53 @@ def main():
                 file_name=f"audit_report_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
                 mime="text/plain",
             )
+
+        st.divider()
+        section_index = section_names.index(st.session_state.active_audit_section)
+        section_nav_cols = st.columns([1, 1, 2])
+
+        with section_nav_cols[0]:
+            if st.button(
+                "← Apartado anterior",
+                disabled=section_index == 0,
+                use_container_width=True,
+                key=f"previous_section_{claim['claim_no']}",
+            ):
+                st.session_state.active_audit_section = section_names[section_index - 1]
+                st.rerun()
+
+        with section_nav_cols[1]:
+            if st.button(
+                "Siguiente apartado →",
+                type="primary",
+                disabled=section_index >= len(section_names) - 1,
+                use_container_width=True,
+                key=f"next_section_{claim['claim_no']}",
+            ):
+                st.session_state.active_audit_section = section_names[section_index + 1]
+                st.rerun()
+
+        with section_nav_cols[2]:
+            st.caption(f"Apartado {section_index + 1} de {len(section_names)} · {st.session_state.active_audit_section}")
+
+        st.divider()
+        current_index = claim_options.index(st.session_state.selected_claim)
+        nav_cols = st.columns([1, 1, 2])
+
+        with nav_cols[0]:
+            if st.button("← Anterior claim", disabled=current_index == 0, use_container_width=True):
+                st.session_state.selected_claim = claim_options[current_index - 1]
+                st.session_state.active_audit_section = section_names[0]
+                st.rerun()
+
+        with nav_cols[1]:
+            if st.button("Siguiente claim →", disabled=current_index >= len(claim_options) - 1, use_container_width=True):
+                st.session_state.selected_claim = claim_options[current_index + 1]
+                st.session_state.active_audit_section = section_names[0]
+                st.rerun()
+
+        with nav_cols[2]:
+            st.caption(f"Claim {current_index + 1} de {len(claim_options)}")
 
 
 if __name__ == "__main__":
