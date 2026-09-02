@@ -17,11 +17,16 @@ Notas de cálculo:
 - Campañas son informativas y no suman ni restan.
 - Permite guardar y recargar auditorías de trabajo en JSON.
 - El comentario general puede generarse desde las observaciones de cada apartado.
+- Permite completar ficha por claim: dealer, VIN, modelo e importe.
+- Permite adjuntar fotos de piezas viejas y certificado de destrucción por claim.
 """
 
 from __future__ import annotations
 
+import base64
 import json
+import re
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
@@ -185,6 +190,9 @@ MAX_DOCUMENT_POINTS = sum(check.max_points for check in DOCUMENT_CHECKS)  # 58
 MAX_OLD_PARTS_POINTS = sum(check.max_points for check in OLD_PARTS_CHECKS)  # 42
 MAX_TOTAL_POINTS = MAX_DOCUMENT_POINTS + MAX_OLD_PARTS_POINTS  # 100
 
+OLD_PART_PHOTO_FILE_TYPES = ["jpg", "jpeg", "png", "webp"]
+DESTRUCTION_CERTIFICATE_FILE_TYPES = ["jpg", "jpeg", "png", "webp", "pdf"]
+
 
 # =============================================================================
 # UTILIDADES
@@ -231,6 +239,135 @@ def safe_str(value: Any) -> str:
     return str(value).strip()
 
 
+def sanitize_for_filename(value: Any, fallback: str = "item") -> str:
+    """Limpia nombres para usarlos en ZIP/descargas sin romper rutas."""
+    text = safe_str(value) or fallback
+    text = re.sub(r"[^\w\-. ]+", "_", text, flags=re.UNICODE).strip()
+    text = re.sub(r"\s+", "_", text)
+    return text or fallback
+
+
+def uploaded_file_to_attachment(uploaded_file) -> Dict[str, Any]:
+    """Convierte un UploadedFile de Streamlit en un registro serializable en JSON."""
+    data = uploaded_file.getvalue()
+    return {
+        "name": safe_str(getattr(uploaded_file, "name", "archivo")) or "archivo",
+        "type": safe_str(getattr(uploaded_file, "type", "")),
+        "size": len(data),
+        "uploaded_at": datetime.now().isoformat(timespec="seconds"),
+        "data_base64": base64.b64encode(data).decode("ascii"),
+    }
+
+
+def normalize_loaded_attachment(raw_attachment: Any) -> Optional[Dict[str, Any]]:
+    """Normaliza adjuntos cargados desde JSON y evita registros corruptos."""
+    if not isinstance(raw_attachment, dict):
+        return None
+
+    name = safe_str(raw_attachment.get("name", ""))
+    data_base64 = safe_str(raw_attachment.get("data_base64", ""))
+
+    if not name and not data_base64:
+        return None
+
+    try:
+        size = int(raw_attachment.get("size", 0) or 0)
+    except Exception:
+        size = 0
+
+    return {
+        "name": name or "archivo",
+        "type": safe_str(raw_attachment.get("type", "")),
+        "size": size,
+        "uploaded_at": safe_str(raw_attachment.get("uploaded_at", "")),
+        "data_base64": data_base64,
+    }
+
+
+def normalize_claim_attachments(raw_attachments: Any) -> Dict[str, Any]:
+    """Estructura estable de adjuntos por claim."""
+    attachments = {
+        "old_parts_photos": [],
+        "destruction_certificate": None,
+    }
+
+    if not isinstance(raw_attachments, dict):
+        return attachments
+
+    raw_photos = raw_attachments.get("old_parts_photos", [])
+    if isinstance(raw_photos, list):
+        attachments["old_parts_photos"] = [
+            item for item in (normalize_loaded_attachment(photo) for photo in raw_photos)
+            if item is not None
+        ]
+
+    certificate = normalize_loaded_attachment(raw_attachments.get("destruction_certificate"))
+    attachments["destruction_certificate"] = certificate
+
+    return attachments
+
+
+def get_claim_attachments(claim: Dict[str, Any]) -> Dict[str, Any]:
+    """Garantiza que la claim tenga estructura de adjuntos aunque venga de versiones antiguas."""
+    claim["attachments"] = normalize_claim_attachments(claim.get("attachments", {}))
+    return claim["attachments"]
+
+
+def attachment_bytes(attachment: Dict[str, Any]) -> bytes:
+    data_base64 = safe_str(attachment.get("data_base64", ""))
+    if not data_base64:
+        return b""
+    return base64.b64decode(data_base64.encode("ascii"))
+
+
+def attachment_names_summary(attachments: List[Dict[str, Any]]) -> str:
+    if not attachments:
+        return ""
+    names = [safe_str(item.get("name", "archivo")) or "archivo" for item in attachments]
+    return f"{len(names)} archivo(s): " + " | ".join(names)
+
+
+def old_parts_photos_summary(claim: Dict[str, Any]) -> str:
+    attachments = get_claim_attachments(claim)
+    return attachment_names_summary(attachments.get("old_parts_photos", []))
+
+
+def destruction_certificate_summary(claim: Dict[str, Any]) -> str:
+    attachments = get_claim_attachments(claim)
+    certificate = attachments.get("destruction_certificate")
+    if not certificate:
+        return ""
+    return safe_str(certificate.get("name", "Certificado adjunto")) or "Certificado adjunto"
+
+
+def build_attachments_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for claim in claims.values():
+        attachments = get_claim_attachments(claim)
+        for index, photo in enumerate(attachments.get("old_parts_photos", []), start=1):
+            rows.append({
+                "Claim No.": claim.get("claim_no", ""),
+                "Tipo adjunto": "Foto pieza vieja",
+                "Nº": index,
+                "Archivo": safe_str(photo.get("name", "")),
+                "Formato": safe_str(photo.get("type", "")),
+                "Tamaño bytes": photo.get("size", 0),
+                "Subido en": safe_str(photo.get("uploaded_at", "")),
+            })
+        certificate = attachments.get("destruction_certificate")
+        if certificate:
+            rows.append({
+                "Claim No.": claim.get("claim_no", ""),
+                "Tipo adjunto": "Certificado destrucción",
+                "Nº": 1,
+                "Archivo": safe_str(certificate.get("name", "")),
+                "Formato": safe_str(certificate.get("type", "")),
+                "Tamaño bytes": certificate.get("size", 0),
+                "Subido en": safe_str(certificate.get("uploaded_at", "")),
+            })
+    return pd.DataFrame(rows)
+
+
 def new_evaluation(check: AuditCheck, prefill_points: Any = None) -> Dict[str, Any]:
     option = option_from_points(check, prefill_points)
     return {
@@ -253,6 +390,10 @@ def empty_claim_record(claim_no: str) -> Dict[str, Any]:
         "submission_date": "",
         "general_comment": "",
         "evaluations": {check.key: new_evaluation(check) for check in ALL_CHECKS},
+        "attachments": {
+            "old_parts_photos": [],
+            "destruction_certificate": None,
+        },
     }
 
 
@@ -403,6 +544,8 @@ def normalize_loaded_claim(raw_claim: Any, fallback_claim_no: str = "") -> Optio
         for check in ALL_CHECKS:
             if check.key in raw_evaluations:
                 claim["evaluations"][check.key] = normalize_loaded_evaluation(check, raw_evaluations[check.key])
+
+    claim["attachments"] = normalize_claim_attachments(raw_claim.get("attachments", {}))
 
     return claim
 
@@ -584,6 +727,8 @@ def build_summary_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
             "Claim No.": claim["claim_no"],
             "Dealer": claim.get("dealer", ""),
             "VIN": claim.get("vin", ""),
+            "Modelo": claim.get("model", ""),
+            "Importe": claim.get("amount", ""),
             "Puntos documentación": score["doc_points"],
             "Puntos piezas viejas": score["old_points"],
             "Resultado /100": score["total_points"],
@@ -591,6 +736,8 @@ def build_summary_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
             "Estado": "Completada" if score["completed"] else "Pendiente",
             "Pendientes": " | ".join(score["pending"]),
             "Comentarios": claim.get("general_comment", ""),
+            "Fotos piezas viejas": old_parts_photos_summary(claim),
+            "Certificado destrucción": destruction_certificate_summary(claim),
         })
     return pd.DataFrame(rows)
 
@@ -603,6 +750,10 @@ def build_detail_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
             check = check_by_key[key]
             rows.append({
                 "Claim No.": claim["claim_no"],
+                "Dealer": claim.get("dealer", ""),
+                "VIN": claim.get("vin", ""),
+                "Modelo": claim.get("model", ""),
+                "Importe": claim.get("amount", ""),
                 "Bloque": check.block,
                 "Apartado": check.label,
                 "Estado": evaluation.get("status", ""),
@@ -622,6 +773,10 @@ def build_improvement_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFra
         for block, area, lost, max_points, status in score["lost_by_area"]:
             rows.append({
                 "Claim No.": claim["claim_no"],
+                "Dealer": claim.get("dealer", ""),
+                "VIN": claim.get("vin", ""),
+                "Modelo": claim.get("model", ""),
+                "Importe": claim.get("amount", ""),
                 "Bloque": block,
                 "Área de mejora": area,
                 "Estado": status,
@@ -645,6 +800,7 @@ def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str
         summary_export_df["% éxito"] = pd.to_numeric(summary_export_df["% éxito"], errors="coerce") / 100
     detail_df = build_detail_dataframe(claims)
     improvement_df = build_improvement_dataframe(claims)
+    attachments_df = build_attachments_dataframe(claims)
     audit_score = calculate_audit_score(claims)
 
     cover_df = pd.DataFrame([
@@ -663,6 +819,7 @@ def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str
         summary_export_df.to_excel(writer, index=False, sheet_name="Claims")
         detail_df.to_excel(writer, index=False, sheet_name="Detalle apartados")
         improvement_df.to_excel(writer, index=False, sheet_name="Áreas de mejora")
+        attachments_df.to_excel(writer, index=False, sheet_name="Adjuntos")
 
         workbook = writer.book
         header_format = workbook.add_format({
@@ -680,9 +837,10 @@ def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str
 
         sheet_widths = {
             "Resumen auditoría": [22, 55],
-            "Claims": [18, 24, 22, 20, 20, 14, 14, 16, 45, 60],
-            "Detalle apartados": [18, 26, 30, 26, 18, 14, 14, 14, 45, 80],
-            "Áreas de mejora": [18, 28, 32, 18, 18, 18, 60],
+            "Claims": [18, 24, 22, 18, 14, 20, 20, 14, 14, 16, 45, 60, 42, 34],
+            "Detalle apartados": [18, 24, 22, 18, 14, 28, 30, 26, 18, 14, 14, 45, 80],
+            "Áreas de mejora": [18, 24, 22, 18, 14, 28, 32, 18, 18, 18, 60],
+            "Adjuntos": [18, 24, 8, 42, 24, 16, 22],
         }
 
         for sheet_name, worksheet in writer.sheets.items():
@@ -691,6 +849,7 @@ def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str
                 "Claims": summary_export_df,
                 "Detalle apartados": detail_df,
                 "Áreas de mejora": improvement_df,
+                "Adjuntos": attachments_df,
             }[sheet_name]
 
             rows, cols = df.shape
@@ -707,14 +866,19 @@ def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str
                 worksheet.set_column(col_num, col_num, width, body_format)
 
             if sheet_name == "Claims" and rows > 0:
-                worksheet.set_column(3, 5, 16, integer_format)
-                worksheet.set_column(6, 6, 14, percent_format)
-                worksheet.conditional_format(1, 6, rows, 6, {
-                    "type": "3_color_scale",
-                    "min_color": "#F4CCCC",
-                    "mid_color": "#FFF2CC",
-                    "max_color": "#E2F0D9",
-                })
+                for points_column in ["Puntos documentación", "Puntos piezas viejas", "Resultado /100"]:
+                    if points_column in df.columns:
+                        col_idx = df.columns.get_loc(points_column)
+                        worksheet.set_column(col_idx, col_idx, 16, integer_format)
+                if "% éxito" in df.columns:
+                    percent_col = df.columns.get_loc("% éxito")
+                    worksheet.set_column(percent_col, percent_col, 14, percent_format)
+                    worksheet.conditional_format(1, percent_col, rows, percent_col, {
+                        "type": "3_color_scale",
+                        "min_color": "#F4CCCC",
+                        "mid_color": "#FFF2CC",
+                        "max_color": "#E2F0D9",
+                    })
 
     return output.getvalue()
 
@@ -830,11 +994,12 @@ def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str,
         grade_ws = workbook.add_worksheet("Boletín de notas")
         grade_ws.merge_range("A1:J1", "Boletín de notas - Warranty Audit", fmt_title)
         grade_headers = [
-            "Claim No.", "Dealer", "VIN", "Documentación /58", "Piezas viejas /42",
-            "Total /100", "% éxito", "Resultado", "Pendientes", "Comentarios",
+            "Claim No.", "Dealer", "VIN", "Modelo", "Importe",
+            "Documentación /58", "Piezas viejas /42", "Total /100", "% éxito",
+            "Resultado", "Pendientes", "Comentarios", "Fotos piezas viejas", "Certificado destrucción",
         ]
         write_headers(grade_ws, 2, grade_headers)
-        set_widths(grade_ws, [20, 24, 24, 18, 18, 14, 14, 16, 48, 60])
+        set_widths(grade_ws, [20, 24, 24, 18, 14, 18, 18, 14, 14, 16, 48, 60, 42, 34])
         grade_ws.freeze_panes(3, 0)
 
         row_idx = 3
@@ -845,6 +1010,8 @@ def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str,
                 claim["claim_no"],
                 claim.get("dealer", dealer or ""),
                 claim.get("vin", ""),
+                claim.get("model", ""),
+                claim.get("amount", ""),
                 score["doc_points"],
                 score["old_points"],
                 total_points,
@@ -852,17 +1019,19 @@ def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str,
                 result_label(total_points),
                 " | ".join(score["pending"]),
                 claim.get("general_comment", ""),
+                old_parts_photos_summary(claim),
+                destruction_certificate_summary(claim),
             ]
             write_row(grade_ws, row_idx, row_values, fmt_body)
-            grade_ws.write_number(row_idx, 3, score["doc_points"], fmt_int)
-            grade_ws.write_number(row_idx, 4, score["old_points"], fmt_int)
-            grade_ws.write_number(row_idx, 5, total_points, result_format(total_points))
-            grade_ws.write_number(row_idx, 6, score["success_percent"] / 100, fmt_percent)
-            grade_ws.write(row_idx, 7, result_label(total_points), result_format(total_points))
+            grade_ws.write_number(row_idx, 5, score["doc_points"], fmt_int)
+            grade_ws.write_number(row_idx, 6, score["old_points"], fmt_int)
+            grade_ws.write_number(row_idx, 7, total_points, result_format(total_points))
+            grade_ws.write_number(row_idx, 8, score["success_percent"] / 100, fmt_percent)
+            grade_ws.write(row_idx, 9, result_label(total_points), result_format(total_points))
             row_idx += 1
         if row_idx > 3:
             grade_ws.autofilter(2, 0, row_idx - 1, len(grade_headers) - 1)
-            grade_ws.conditional_format(3, 6, row_idx - 1, 6, {
+            grade_ws.conditional_format(3, 8, row_idx - 1, 8, {
                 "type": "3_color_scale",
                 "min_color": "#F4CCCC",
                 "mid_color": "#FFF2CC",
@@ -936,9 +1105,10 @@ def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str,
             "No.", "Claim No.",
             *[check.label for check in OLD_PARTS_CHECKS],
             "Total piezas viejas", "Resultado piezas viejas %", "Comentarios",
+            "Fotos piezas viejas", "Certificado destrucción",
         ]
         write_headers(old_ws, 0, old_headers)
-        set_widths(old_ws, [8, 20, 18, 20, 16, 24, 20, 26, 18, 18, 50])
+        set_widths(old_ws, [8, 20, 18, 20, 16, 24, 20, 26, 18, 18, 50, 42, 34])
         old_ws.freeze_panes(1, 2)
         for idx, claim in enumerate(claims.values(), start=1):
             excel_row = idx + 1
@@ -947,6 +1117,8 @@ def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str,
             row.append(f"=SUM(C{excel_row}:H{excel_row})")
             row.append(f"=I{excel_row}/{MAX_OLD_PARTS_POINTS}")
             row.append(claim.get("general_comment", ""))
+            row.append(old_parts_photos_summary(claim))
+            row.append(destruction_certificate_summary(claim))
             write_row(old_ws, idx, row, fmt_body)
             for c in range(2, 8):
                 if isinstance(row[c], (int, float)):
@@ -994,6 +1166,23 @@ def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str,
             write_row(imp_ws, imp_row, ["", "Sin desviaciones puntuables", "", "", ""], fmt_body)
             imp_row += 1
         imp_ws.autofilter(0, 0, imp_row - 1, len(imp_headers) - 1)
+
+        # ------------------------------------------------------------------
+        # Adjuntos piezas viejas
+        # ------------------------------------------------------------------
+        attachments_ws = workbook.add_worksheet("Adjuntos")
+        attachments_headers = ["Claim No.", "Tipo adjunto", "Nº", "Archivo", "Formato", "Tamaño bytes", "Subido en"]
+        write_headers(attachments_ws, 0, attachments_headers)
+        set_widths(attachments_ws, [20, 26, 8, 42, 24, 16, 22])
+        attachments_ws.freeze_panes(1, 0)
+        attachments_df = build_attachments_dataframe(claims)
+        if attachments_df.empty:
+            write_row(attachments_ws, 1, ["", "Sin adjuntos", "", "", "", "", ""], fmt_body)
+            attachments_ws.autofilter(0, 0, 1, len(attachments_headers) - 1)
+        else:
+            for row_idx, (_, attachment_row) in enumerate(attachments_df.iterrows(), start=1):
+                write_row(attachments_ws, row_idx, [attachment_row.get(header, "") for header in attachments_headers], fmt_body)
+            attachments_ws.autofilter(0, 0, len(attachments_df), len(attachments_headers) - 1)
 
         # ------------------------------------------------------------------
         # Evaluation content
@@ -1070,6 +1259,51 @@ def generate_text_report(claims: Dict[str, Dict[str, Any]], audit_name: str, dea
         "reforzando la calidad documental, la justificación técnica y la trazabilidad de piezas viejas cuando aplique."
     )
     return "\n".join(lines)
+
+
+def export_audit_package_zip(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> bytes:
+    """Exporta un paquete completo con Excel, boletín, informe, JSON de trabajo y adjuntos reales."""
+    output = BytesIO()
+    base_name = sanitize_for_filename(audit_name or "auditoria_garantias")
+
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        zip_file.writestr(
+            f"{base_name}/audit_workfile.json",
+            serialize_audit_workfile(claims, audit_name, dealer, auditor),
+        )
+        zip_file.writestr(
+            f"{base_name}/audit_export.xlsx",
+            export_excel(claims, audit_name, dealer, auditor),
+        )
+        zip_file.writestr(
+            f"{base_name}/audit_boletin.xlsx",
+            export_report_card_excel(claims, audit_name, dealer, auditor),
+        )
+        zip_file.writestr(
+            f"{base_name}/audit_report.txt",
+            generate_text_report(claims, audit_name, dealer, auditor).encode("utf-8"),
+        )
+
+        for claim in claims.values():
+            claim_folder = sanitize_for_filename(claim.get("claim_no", "claim"), "claim")
+            attachments = get_claim_attachments(claim)
+
+            for index, photo in enumerate(attachments.get("old_parts_photos", []), start=1):
+                filename = sanitize_for_filename(photo.get("name", f"foto_{index}"), f"foto_{index}")
+                zip_file.writestr(
+                    f"{base_name}/evidencias/{claim_folder}/piezas_viejas/fotos/{index:02d}_{filename}",
+                    attachment_bytes(photo),
+                )
+
+            certificate = attachments.get("destruction_certificate")
+            if certificate:
+                filename = sanitize_for_filename(certificate.get("name", "certificado_destruccion"), "certificado_destruccion")
+                zip_file.writestr(
+                    f"{base_name}/evidencias/{claim_folder}/piezas_viejas/certificado_destruccion/{filename}",
+                    attachment_bytes(certificate),
+                )
+
+    return output.getvalue()
 
 
 # =============================================================================
@@ -1171,21 +1405,133 @@ def display_value(value: Any, fallback: str = "No informado") -> str:
     return value if value else fallback
 
 
-def render_claim_quick_card(claim: Dict[str, Any], default_dealer: str = ""):
-    """Mantiene internamente el dealer si viene informado, pero no muestra campos extra.
+def sync_claim_meta_field(claim: Dict[str, Any], field: str, label: str, default_value: str = "") -> str:
+    claim_no = claim["claim_no"]
+    key = f"claim_meta_{claim_no}_{field}"
 
-    La lista de HQ suele traer solo el número de claim, así que VIN/importe/modelo
-    no se muestran para mantener la revisión rápida y limpia.
-    """
-    if not claim.get("dealer") and default_dealer:
-        claim["dealer"] = default_dealer
+    if not safe_str(claim.get(field, "")) and default_value:
+        claim[field] = default_value
+
+    if key not in st.session_state:
+        st.session_state[key] = safe_str(claim.get(field, ""))
+
+    value = st.text_input(label, key=key)
+    claim[field] = safe_str(value)
+    return claim[field]
+
+
+def render_claim_quick_card(claim: Dict[str, Any], default_dealer: str = ""):
+    """Ficha editable por claim: útil para futura integración en plataforma mayor."""
+    st.caption("Ficha de la garantía")
+    cols = st.columns(4)
+    with cols[0]:
+        sync_claim_meta_field(claim, "dealer", "Dealer", default_dealer)
+    with cols[1]:
+        sync_claim_meta_field(claim, "vin", "VIN")
+    with cols[2]:
+        sync_claim_meta_field(claim, "model", "Modelo")
+    with cols[3]:
+        sync_claim_meta_field(claim, "amount", "Importe")
+
+
+def render_old_parts_attachments(claim: Dict[str, Any]):
+    """Adjuntos específicos de la pestaña de piezas viejas."""
+    attachments = get_claim_attachments(claim)
+    claim_no = claim["claim_no"]
+    version_key = f"attachment_uploader_version_{claim_no}"
+    if version_key not in st.session_state:
+        st.session_state[version_key] = 0
+    version = st.session_state[version_key]
+
+    st.markdown("### Adjuntos de piezas viejas")
+    st.caption(
+        "Adjunta al menos 3 fotos de piezas viejas y, aparte, el certificado de destrucción "
+        "si aplica. Los adjuntos se guardan en el JSON de trabajo y en el paquete ZIP."
+    )
+
+    photo_files = st.file_uploader(
+        "Fotos de piezas viejas — mínimo 3 archivos",
+        type=OLD_PART_PHOTO_FILE_TYPES,
+        accept_multiple_files=True,
+        key=f"old_parts_photos_{claim_no}_{version}",
+        help="Formatos admitidos: JPG, JPEG, PNG y WEBP.",
+    )
+
+    if photo_files:
+        attachments["old_parts_photos"] = [uploaded_file_to_attachment(file) for file in photo_files]
+
+    photos = attachments.get("old_parts_photos", [])
+    if len(photos) >= 3:
+        st.success(f"Fotos de piezas viejas adjuntas: {len(photos)} archivo(s).")
+    elif len(photos) > 0:
+        st.warning(f"Fotos de piezas viejas adjuntas: {len(photos)} archivo(s). Recomendado mínimo: 3.")
+    else:
+        st.info("Todavía no hay fotos de piezas viejas adjuntas para esta claim.")
+
+    if photos:
+        with st.expander("Ver / descargar fotos adjuntas"):
+            for index, photo in enumerate(photos, start=1):
+                col_name, col_download = st.columns([3, 1])
+                with col_name:
+                    st.write(f"{index}. {safe_str(photo.get('name', 'foto'))} · {photo.get('size', 0)} bytes")
+                with col_download:
+                    st.download_button(
+                        "Descargar",
+                        data=attachment_bytes(photo),
+                        file_name=safe_str(photo.get("name", f"foto_{index}")) or f"foto_{index}",
+                        mime=safe_str(photo.get("type", "application/octet-stream")) or "application/octet-stream",
+                        key=f"download_photo_{claim_no}_{index}_{safe_str(photo.get('name', 'foto'))}",
+                    )
+
+        if st.button("Eliminar fotos adjuntas", key=f"clear_photos_{claim_no}"):
+            attachments["old_parts_photos"] = []
+            st.session_state[version_key] += 1
+            st.rerun()
+
+    certificate_file = st.file_uploader(
+        "Certificado de destrucción — foto o PDF",
+        type=DESTRUCTION_CERTIFICATE_FILE_TYPES,
+        accept_multiple_files=False,
+        key=f"destruction_certificate_{claim_no}_{version}",
+        help="Formatos admitidos: JPG, JPEG, PNG, WEBP y PDF.",
+    )
+
+    if certificate_file is not None:
+        attachments["destruction_certificate"] = uploaded_file_to_attachment(certificate_file)
+
+    certificate = attachments.get("destruction_certificate")
+    if certificate:
+        cert_cols = st.columns([3, 1, 1])
+        with cert_cols[0]:
+            st.success(
+                f"Certificado adjunto: {safe_str(certificate.get('name', 'certificado'))} "
+                f"· {certificate.get('size', 0)} bytes"
+            )
+        with cert_cols[1]:
+            st.download_button(
+                "Descargar certificado",
+                data=attachment_bytes(certificate),
+                file_name=safe_str(certificate.get("name", "certificado_destruccion")) or "certificado_destruccion",
+                mime=safe_str(certificate.get("type", "application/octet-stream")) or "application/octet-stream",
+                key=f"download_certificate_{claim_no}",
+            )
+        with cert_cols[2]:
+            if st.button("Eliminar certificado", key=f"clear_certificate_{claim_no}"):
+                attachments["destruction_certificate"] = None
+                st.session_state[version_key] += 1
+                st.rerun()
+    else:
+        st.info("Todavía no hay certificado de destrucción adjunto para esta claim.")
+
+    claim["attachments"] = attachments
+
 
 def main():
     st.set_page_config(page_title="Warranty Audit Portal", layout="wide")
     init_state()
 
     st.title("Warranty Audit Portal")
-    st.caption("Auditoría online de garantías: documentación + piezas viejas = 100 puntos. Campañas solo informativo.")
+    st.caption("Auditoría online de garantías: documentación + piezas viejas = 100 puntos. Campañas solo informativo. Ficha por claim y adjuntos de piezas viejas.")
 
     with st.sidebar:
         st.header("Auditoría")
@@ -1327,6 +1673,14 @@ def main():
             help="Genera un Excel con hojas tipo plantilla: documentación, piezas viejas, áreas de mejora, criterios y boletín por claim.",
         )
 
+        st.download_button(
+            "Exportar paquete completo (.zip)",
+            data=export_audit_package_zip(claims, audit_name, dealer, auditor),
+            file_name=f"audit_package_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+            mime="application/zip",
+            help="Incluye Excel analítico, boletín, informe TXT, JSON de trabajo y los archivos adjuntos reales por claim.",
+        )
+
     with right:
         claim = claims[st.session_state.selected_claim]
         score = calculate_claim_score(claim)
@@ -1367,6 +1721,7 @@ def main():
 
         elif selected_section == "II. Piezas viejas":
             render_check_editor(claim, OLD_PARTS_CHECKS)
+            render_old_parts_attachments(claim)
 
         elif selected_section == "Campañas":
             render_campaign_editor(claim)
