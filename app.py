@@ -15,10 +15,12 @@ Notas de cálculo:
 - Total auditoría = 100 puntos.
 - No aplica = máxima puntuación del apartado.
 - Campañas son informativas y no suman ni restan.
+- Permite guardar y recargar auditorías de trabajo en JSON.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
@@ -334,6 +336,134 @@ def calculate_audit_score(claims: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+
+# =============================================================================
+# GUARDAR / CARGAR AUDITORÍA DE TRABAJO
+# =============================================================================
+
+def normalize_loaded_evaluation(check: AuditCheck, raw_evaluation: Any) -> Dict[str, Any]:
+    """Normaliza una evaluación cargada desde JSON para que siempre sea compatible."""
+    base = new_evaluation(check)
+
+    if not isinstance(raw_evaluation, dict):
+        return base
+
+    label = safe_str(raw_evaluation.get("label", ""))
+    status = safe_str(raw_evaluation.get("status", ""))
+    raw_points = raw_evaluation.get("points", None)
+
+    option = None
+    if label:
+        option = option_from_label(check, label)
+    elif raw_points is not None:
+        option = option_from_points(check, raw_points)
+
+    if option is None:
+        option = PENDING
+
+    # Si venía como Pendiente con points None, respetamos pendiente.
+    points = option.points
+    if raw_points is None and status.lower() == "pendiente":
+        points = None
+
+    return {
+        "status": status or option.status,
+        "label": label or option.label,
+        "points": points,
+        "max_points": check.max_points,
+        "comment": safe_str(raw_evaluation.get("comment", "")),
+    }
+
+
+def normalize_loaded_claim(raw_claim: Any, fallback_claim_no: str = "") -> Optional[Dict[str, Any]]:
+    """Convierte una claim guardada en JSON a la estructura interna actual."""
+    if not isinstance(raw_claim, dict):
+        return None
+
+    claim_no = safe_str(raw_claim.get("claim_no", fallback_claim_no))
+    if not claim_no:
+        return None
+
+    claim = empty_claim_record(claim_no)
+
+    for field in [
+        "dealer",
+        "vin",
+        "model",
+        "amount",
+        "repair_date",
+        "submission_date",
+        "general_comment",
+    ]:
+        claim[field] = safe_str(raw_claim.get(field, claim.get(field, "")))
+
+    raw_evaluations = raw_claim.get("evaluations", {})
+    if isinstance(raw_evaluations, dict):
+        for check in ALL_CHECKS:
+            if check.key in raw_evaluations:
+                claim["evaluations"][check.key] = normalize_loaded_evaluation(check, raw_evaluations[check.key])
+
+    return claim
+
+
+def serialize_audit_workfile(
+    claims: Dict[str, Dict[str, Any]],
+    audit_name: str,
+    dealer: str,
+    auditor: str,
+) -> bytes:
+    """Genera un archivo JSON descargable para poder continuar la auditoría otro día."""
+    payload = {
+        "file_type": "warranty_audit_workfile",
+        "version": 1,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "audit": {
+            "audit_name": audit_name or "",
+            "dealer": dealer or "",
+            "auditor": auditor or "",
+        },
+        "claims": claims,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def load_audit_workfile(uploaded_file) -> Tuple[Dict[str, Dict[str, Any]], str, str, str]:
+    """Carga una auditoría de trabajo guardada previamente como JSON."""
+    content = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+    if isinstance(content, bytes):
+        content = content.decode("utf-8")
+    payload = json.loads(content)
+
+    if not isinstance(payload, dict) or payload.get("file_type") != "warranty_audit_workfile":
+        raise ValueError("El archivo no parece una auditoría de trabajo generada por esta app.")
+
+    audit = payload.get("audit", {}) if isinstance(payload.get("audit", {}), dict) else {}
+    raw_claims = payload.get("claims", {})
+
+    claims: Dict[str, Dict[str, Any]] = {}
+
+    if isinstance(raw_claims, dict):
+        iterable = raw_claims.items()
+    elif isinstance(raw_claims, list):
+        iterable = ((safe_str(item.get("claim_no", "")) if isinstance(item, dict) else "", item) for item in raw_claims)
+    else:
+        iterable = []
+
+    for fallback_claim_no, raw_claim in iterable:
+        claim = normalize_loaded_claim(raw_claim, fallback_claim_no)
+        if claim is not None:
+            claims[claim["claim_no"]] = claim
+
+    if not claims:
+        raise ValueError("El archivo se pudo abrir, pero no contiene claims válidas.")
+
+    return (
+        claims,
+        safe_str(audit.get("audit_name", "Auditoría garantías")) or "Auditoría garantías",
+        safe_str(audit.get("dealer", "")),
+        safe_str(audit.get("auditor", "")),
+    )
+
 # =============================================================================
 # IMPORTACIÓN DE EXCEL
 # =============================================================================
@@ -453,7 +583,6 @@ def build_summary_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
             "Claim No.": claim["claim_no"],
             "Dealer": claim.get("dealer", ""),
             "VIN": claim.get("vin", ""),
-            "Modelo": claim.get("model", ""),
             "Puntos documentación": score["doc_points"],
             "Puntos piezas viejas": score["old_points"],
             "Resultado /100": score["total_points"],
@@ -510,6 +639,9 @@ def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str
     """
     output = BytesIO()
     summary_df = build_summary_dataframe(claims)
+    summary_export_df = summary_df.copy()
+    if "% éxito" in summary_export_df.columns:
+        summary_export_df["% éxito"] = pd.to_numeric(summary_export_df["% éxito"], errors="coerce") / 100
     detail_df = build_detail_dataframe(claims)
     improvement_df = build_improvement_dataframe(claims)
     audit_score = calculate_audit_score(claims)
@@ -527,7 +659,7 @@ def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         cover_df.to_excel(writer, index=False, sheet_name="Resumen auditoría")
-        summary_df.to_excel(writer, index=False, sheet_name="Claims")
+        summary_export_df.to_excel(writer, index=False, sheet_name="Claims")
         detail_df.to_excel(writer, index=False, sheet_name="Detalle apartados")
         improvement_df.to_excel(writer, index=False, sheet_name="Áreas de mejora")
 
@@ -547,7 +679,7 @@ def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str
 
         sheet_widths = {
             "Resumen auditoría": [22, 55],
-            "Claims": [18, 22, 22, 18, 18, 18, 14, 14, 16, 45, 60],
+            "Claims": [18, 24, 22, 20, 20, 14, 14, 16, 45, 60],
             "Detalle apartados": [18, 26, 30, 26, 18, 14, 14, 14, 45, 80],
             "Áreas de mejora": [18, 28, 32, 18, 18, 18, 60],
         }
@@ -555,7 +687,7 @@ def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str
         for sheet_name, worksheet in writer.sheets.items():
             df = {
                 "Resumen auditoría": cover_df,
-                "Claims": summary_df,
+                "Claims": summary_export_df,
                 "Detalle apartados": detail_df,
                 "Áreas de mejora": improvement_df,
             }[sheet_name]
@@ -574,9 +706,9 @@ def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str
                 worksheet.set_column(col_num, col_num, width, body_format)
 
             if sheet_name == "Claims" and rows > 0:
-                worksheet.set_column(4, 6, 16, integer_format)
-                worksheet.set_column(7, 7, 14, percent_format)
-                worksheet.conditional_format(1, 7, rows, 7, {
+                worksheet.set_column(3, 5, 16, integer_format)
+                worksheet.set_column(6, 6, 14, percent_format)
+                worksheet.conditional_format(1, 6, rows, 6, {
                     "type": "3_color_scale",
                     "min_color": "#F4CCCC",
                     "mid_color": "#FFF2CC",
@@ -695,13 +827,13 @@ def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str,
         # Boletín de notas
         # ------------------------------------------------------------------
         grade_ws = workbook.add_worksheet("Boletín de notas")
-        grade_ws.merge_range("A1:K1", "Boletín de notas - Warranty Audit", fmt_title)
+        grade_ws.merge_range("A1:J1", "Boletín de notas - Warranty Audit", fmt_title)
         grade_headers = [
-            "Claim No.", "Dealer", "VIN", "Modelo", "Documentación /58", "Piezas viejas /42",
+            "Claim No.", "Dealer", "VIN", "Documentación /58", "Piezas viejas /42",
             "Total /100", "% éxito", "Resultado", "Pendientes", "Comentarios",
         ]
         write_headers(grade_ws, 2, grade_headers)
-        set_widths(grade_ws, [20, 24, 24, 20, 18, 18, 14, 14, 16, 48, 60])
+        set_widths(grade_ws, [20, 24, 24, 18, 18, 14, 14, 16, 48, 60])
         grade_ws.freeze_panes(3, 0)
 
         row_idx = 3
@@ -712,7 +844,6 @@ def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str,
                 claim["claim_no"],
                 claim.get("dealer", dealer or ""),
                 claim.get("vin", ""),
-                claim.get("model", ""),
                 score["doc_points"],
                 score["old_points"],
                 total_points,
@@ -722,15 +853,15 @@ def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str,
                 claim.get("general_comment", ""),
             ]
             write_row(grade_ws, row_idx, row_values, fmt_body)
-            grade_ws.write_number(row_idx, 4, score["doc_points"], fmt_int)
-            grade_ws.write_number(row_idx, 5, score["old_points"], fmt_int)
-            grade_ws.write_number(row_idx, 6, total_points, result_format(total_points))
-            grade_ws.write_number(row_idx, 7, score["success_percent"] / 100, fmt_percent)
-            grade_ws.write(row_idx, 8, result_label(total_points), result_format(total_points))
+            grade_ws.write_number(row_idx, 3, score["doc_points"], fmt_int)
+            grade_ws.write_number(row_idx, 4, score["old_points"], fmt_int)
+            grade_ws.write_number(row_idx, 5, total_points, result_format(total_points))
+            grade_ws.write_number(row_idx, 6, score["success_percent"] / 100, fmt_percent)
+            grade_ws.write(row_idx, 7, result_label(total_points), result_format(total_points))
             row_idx += 1
         if row_idx > 3:
             grade_ws.autofilter(2, 0, row_idx - 1, len(grade_headers) - 1)
-            grade_ws.conditional_format(3, 7, row_idx - 1, 7, {
+            grade_ws.conditional_format(3, 6, row_idx - 1, 6, {
                 "type": "3_color_scale",
                 "min_color": "#F4CCCC",
                 "mid_color": "#FFF2CC",
@@ -785,11 +916,11 @@ def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str,
             for c in range(2, 11):
                 if isinstance(row[c], (int, float)):
                     doc_ws.write_number(idx, c, row[c], fmt_int)
-            doc_ws.write_formula(idx, 11, f"=SUM(C{excel_row}:K{excel_row})", fmt_int)
-            doc_ws.write_formula(idx, 12, f"=L{excel_row}/{MAX_DOCUMENT_POINTS}", fmt_formula_percent)
+            doc_ws.write_formula(idx, 13, f"=SUM(C{excel_row}:K{excel_row})", fmt_int)
+            doc_ws.write_formula(idx, 14, f"=N{excel_row}/{MAX_DOCUMENT_POINTS}", fmt_formula_percent)
         if len(claims) > 0:
             doc_ws.autofilter(0, 0, len(claims), len(doc_headers) - 1)
-            doc_ws.conditional_format(1, 12, len(claims), 12, {
+            doc_ws.conditional_format(1, 14, len(claims), 14, {
                 "type": "3_color_scale",
                 "min_color": "#F4CCCC",
                 "mid_color": "#FFF2CC",
@@ -949,6 +1080,12 @@ def init_state():
         st.session_state.claims = {}
     if "selected_claim" not in st.session_state:
         st.session_state.selected_claim = None
+    if "audit_name" not in st.session_state:
+        st.session_state.audit_name = "Auditoría garantías"
+    if "audit_dealer" not in st.session_state:
+        st.session_state.audit_dealer = ""
+    if "audit_auditor" not in st.session_state:
+        st.session_state.audit_auditor = ""
 
 
 def render_check_editor(claim: Dict[str, Any], checks: List[AuditCheck]):
@@ -1001,6 +1138,20 @@ def render_campaign_editor(claim: Dict[str, Any]):
     render_check_editor(claim, CAMPAIGN_CHECKS)
 
 
+def display_value(value: Any, fallback: str = "No informado") -> str:
+    value = safe_str(value)
+    return value if value else fallback
+
+
+def render_claim_quick_card(claim: Dict[str, Any], default_dealer: str = ""):
+    """Mantiene internamente el dealer si viene informado, pero no muestra campos extra.
+
+    La lista de HQ suele traer solo el número de claim, así que VIN/importe/modelo
+    no se muestran para mantener la revisión rápida y limpia.
+    """
+    if not claim.get("dealer") and default_dealer:
+        claim["dealer"] = default_dealer
+
 def main():
     st.set_page_config(page_title="Warranty Audit Portal", layout="wide")
     init_state()
@@ -1010,18 +1161,63 @@ def main():
 
     with st.sidebar:
         st.header("Auditoría")
-        audit_name = st.text_input("Nombre auditoría", value="Auditoría garantías")
-        dealer = st.text_input("Dealer", value="")
-        auditor = st.text_input("Auditor", value="")
+
+        st.subheader("Guardar / cargar progreso")
+        workfile = st.file_uploader(
+            "Cargar auditoría guardada (.json)",
+            type=["json"],
+            key="workfile_upload",
+            help="Carga un archivo generado con el botón 'Guardar auditoría de trabajo'.",
+        )
+        if workfile is not None and st.button("Cargar auditoría guardada", type="primary"):
+            try:
+                loaded_claims, loaded_audit_name, loaded_dealer, loaded_auditor = load_audit_workfile(workfile)
+                st.session_state.claims = loaded_claims
+                st.session_state.selected_claim = next(iter(loaded_claims.keys()))
+                st.session_state.audit_name = loaded_audit_name
+                st.session_state.audit_dealer = loaded_dealer
+                st.session_state.audit_auditor = loaded_auditor
+                st.success(f"Auditoría cargada: {len(loaded_claims)} claims.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"No se pudo cargar la auditoría guardada: {exc}")
+
+        if st.session_state.claims:
+            st.download_button(
+                "Guardar auditoría de trabajo (.json)",
+                data=serialize_audit_workfile(
+                    st.session_state.claims,
+                    st.session_state.audit_name,
+                    st.session_state.audit_dealer,
+                    st.session_state.audit_auditor,
+                ),
+                file_name=f"audit_workfile_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                mime="application/json",
+                help="Guarda todo el progreso: claims, estados, N/A, comentarios y datos de cabecera.",
+            )
 
         st.divider()
-        uploaded_file = st.file_uploader("Subir checklist o lista HQ", type=["xlsx", "xlsm", "xls"])
-        if uploaded_file is not None and st.button("Cargar claims", type="primary"):
+        audit_name = st.text_input("Nombre auditoría", key="audit_name")
+        dealer = st.text_input("Dealer", key="audit_dealer")
+        auditor = st.text_input("Auditor", key="audit_auditor")
+
+        st.divider()
+        uploaded_file = st.file_uploader("Subir checklist o lista HQ", type=["xlsx", "xlsm", "xls"], key="claims_upload")
+        if uploaded_file is not None and st.button("Cargar claims", type="secondary"):
             try:
                 st.session_state.claims = read_claims_from_uploaded_excel(uploaded_file)
                 if st.session_state.claims:
+                    # Si la checklist oficial no trae dealer por claim, usamos el dealer general
+                    # indicado en la barra lateral para que no quede la ficha en blanco.
+                    default_dealer = safe_str(st.session_state.get("audit_dealer", ""))
+                    if default_dealer:
+                        for loaded_claim in st.session_state.claims.values():
+                            if not safe_str(loaded_claim.get("dealer", "")):
+                                loaded_claim["dealer"] = default_dealer
+
                     st.session_state.selected_claim = next(iter(st.session_state.claims.keys()))
                     st.success(f"Cargadas {len(st.session_state.claims)} claims.")
+                    st.rerun()
                 else:
                     st.warning("No se encontraron claims en el archivo.")
             except Exception as exc:
@@ -1034,6 +1230,7 @@ def main():
             st.session_state.claims.setdefault(claim_no, empty_claim_record(claim_no))
             st.session_state.selected_claim = claim_no
             st.success(f"Claim {claim_no} añadida.")
+            st.rerun()
 
         st.divider()
         st.subheader("Regla de puntuación")
@@ -1063,7 +1260,18 @@ def main():
     with left:
         st.subheader("Claims")
         summary_df = build_summary_dataframe(claims)
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        compact_columns = [
+            "Claim No.",
+            "Puntos documentación",
+            "Puntos piezas viejas",
+            "Resultado /100",
+            "Estado",
+        ]
+        st.dataframe(
+            summary_df[compact_columns],
+            use_container_width=True,
+            hide_index=True,
+        )
 
         claim_options = list(claims.keys())
         if st.session_state.selected_claim not in claim_options:
@@ -1096,11 +1304,7 @@ def main():
         score = calculate_claim_score(claim)
 
         st.subheader(f"Revisión claim {claim['claim_no']}")
-        header_cols = st.columns(4)
-        claim["dealer"] = header_cols[0].text_input("Dealer claim", value=claim.get("dealer", ""), key=f"dealer_{claim['claim_no']}")
-        claim["vin"] = header_cols[1].text_input("VIN", value=claim.get("vin", ""), key=f"vin_{claim['claim_no']}")
-        claim["model"] = header_cols[2].text_input("Modelo", value=claim.get("model", ""), key=f"model_{claim['claim_no']}")
-        claim["amount"] = header_cols[3].text_input("Importe", value=claim.get("amount", ""), key=f"amount_{claim['claim_no']}")
+        render_claim_quick_card(claim, dealer or "")
 
         score_cols = st.columns(4)
         score_cols[0].metric("Documentación", f"{score['doc_points']}/{MAX_DOCUMENT_POINTS}")
