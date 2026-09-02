@@ -502,7 +502,12 @@ def build_improvement_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFra
     return pd.DataFrame(rows)
 
 
+
 def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> bytes:
+    """
+    Exportación analítica en Excel usando xlsxwriter.
+    Requiere en requirements.txt: xlsxwriter
+    """
     output = BytesIO()
     summary_df = build_summary_dataframe(claims)
     detail_df = build_detail_dataframe(claims)
@@ -527,30 +532,360 @@ def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str
         improvement_df.to_excel(writer, index=False, sheet_name="Áreas de mejora")
 
         workbook = writer.book
-        header_format = workbook.add_format({"bold": True, "bg_color": "#D9EAF7", "border": 1})
-        percent_format = workbook.add_format({"num_format": "0.0%"})
-        integer_format = workbook.add_format({"num_format": "0"})
-        wrap_format = workbook.add_format({"text_wrap": True, "valign": "top"})
+        header_format = workbook.add_format({
+            "bold": True,
+            "font_color": "white",
+            "bg_color": "#1F4E78",
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+            "text_wrap": True,
+        })
+        body_format = workbook.add_format({"border": 1, "valign": "top", "text_wrap": True})
+        percent_format = workbook.add_format({"num_format": "0.0%", "border": 1, "valign": "top"})
+        integer_format = workbook.add_format({"num_format": "0", "border": 1, "valign": "top"})
 
-        for sheet_name in writer.sheets:
-            worksheet = writer.sheets[sheet_name]
+        sheet_widths = {
+            "Resumen auditoría": [22, 55],
+            "Claims": [18, 22, 22, 18, 18, 18, 14, 14, 16, 45, 60],
+            "Detalle apartados": [18, 26, 30, 26, 18, 14, 14, 14, 45, 80],
+            "Áreas de mejora": [18, 28, 32, 18, 18, 18, 60],
+        }
+
+        for sheet_name, worksheet in writer.sheets.items():
+            df = {
+                "Resumen auditoría": cover_df,
+                "Claims": summary_df,
+                "Detalle apartados": detail_df,
+                "Áreas de mejora": improvement_df,
+            }[sheet_name]
+
+            rows, cols = df.shape
             worksheet.freeze_panes(1, 0)
-            worksheet.set_row(0, None, header_format)
-            worksheet.autofilter(0, 0, 0, 20)
-            worksheet.set_column(0, 0, 18)
-            worksheet.set_column(1, 4, 24)
-            worksheet.set_column(5, 20, 18)
-            if sheet_name in ["Detalle apartados", "Áreas de mejora", "Claims"]:
-                worksheet.set_column(8, 10, 45, wrap_format)
-                worksheet.set_column(9, 9, 60, wrap_format)
+            if rows >= 0 and cols > 0:
+                worksheet.autofilter(0, 0, rows, cols - 1)
 
-        if "Claims" in writer.sheets:
-            ws = writer.sheets["Claims"]
-            ws.set_column(4, 7, 18, integer_format)
-            ws.set_column(10, 10, 60, wrap_format)
+            for col_num, value in enumerate(df.columns.values):
+                worksheet.write(0, col_num, value, header_format)
+
+            widths = sheet_widths.get(sheet_name, [])
+            for col_num in range(cols):
+                width = widths[col_num] if col_num < len(widths) else 18
+                worksheet.set_column(col_num, col_num, width, body_format)
+
+            if sheet_name == "Claims" and rows > 0:
+                worksheet.set_column(4, 6, 16, integer_format)
+                worksheet.set_column(7, 7, 14, percent_format)
+                worksheet.conditional_format(1, 7, rows, 7, {
+                    "type": "3_color_scale",
+                    "min_color": "#F4CCCC",
+                    "mid_color": "#FFF2CC",
+                    "max_color": "#E2F0D9",
+                })
 
     return output.getvalue()
 
+
+def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> bytes:
+    """
+    Genera un Excel tipo "boletín de notas" usando xlsxwriter.
+
+    Hojas:
+    - Boletín de notas
+    - content
+    - Claim document checklist I
+    - Claim old parts checklist II
+    - Improvement of claim issues III
+    - Evaluation content
+
+    Regla de puntuación:
+    - Documentación = 58 puntos
+    - Piezas viejas = 42 puntos
+    - Total = 100 puntos
+    - No aplica = máxima puntuación del apartado
+    - Campañas = informativo, sin sumar ni restar
+    """
+    output = BytesIO()
+    workbook = None
+
+    try:
+        import xlsxwriter  # noqa: F401
+        workbook = xlsxwriter.Workbook(output, {"in_memory": True})
+
+        # ------------------------------------------------------------------
+        # Formatos
+        # ------------------------------------------------------------------
+        fmt_title = workbook.add_format({
+            "bold": True,
+            "font_size": 14,
+            "font_color": "#1F4E78",
+            "valign": "vcenter",
+            "text_wrap": True,
+        })
+        fmt_header = workbook.add_format({
+            "bold": True,
+            "font_color": "white",
+            "bg_color": "#1F4E78",
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+            "text_wrap": True,
+        })
+        fmt_body = workbook.add_format({"border": 1, "valign": "top", "text_wrap": True})
+        fmt_bold = workbook.add_format({"bold": True, "border": 1, "valign": "top", "text_wrap": True})
+        fmt_int = workbook.add_format({"border": 1, "valign": "top", "num_format": "0"})
+        fmt_percent = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "0.0%", "bold": True})
+        fmt_formula_percent = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "0.0%"})
+        fmt_ok = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "bg_color": "#E2F0D9", "bold": True})
+        fmt_mid = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "bg_color": "#FFF2CC", "bold": True})
+        fmt_bad = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "bg_color": "#F4CCCC", "bold": True})
+        fmt_gray = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "bg_color": "#E7E6E6"})
+
+        def write_row(ws, row_idx, values, fmt=fmt_body):
+            for col_idx, value in enumerate(values):
+                ws.write(row_idx, col_idx, value, fmt)
+
+        def write_headers(ws, row_idx, headers):
+            ws.set_row(row_idx, 30)
+            for col_idx, value in enumerate(headers):
+                ws.write(row_idx, col_idx, value, fmt_header)
+
+        def set_widths(ws, widths):
+            for col_idx, width in enumerate(widths):
+                ws.set_column(col_idx, col_idx, width)
+
+        def result_label(points):
+            try:
+                p = float(points)
+            except Exception:
+                return "Pendiente"
+            if p >= 90:
+                return "Excelente"
+            if p >= 80:
+                return "Correcto"
+            if p >= 60:
+                return "Mejorable"
+            return "Crítico"
+
+        def result_format(points):
+            try:
+                p = float(points)
+            except Exception:
+                return fmt_gray
+            if p >= 80:
+                return fmt_ok
+            if p >= 60:
+                return fmt_mid
+            return fmt_bad
+
+        def evaluation_value(claim, check):
+            evaluation = claim["evaluations"].get(check.key, {})
+            points = evaluation.get("points")
+            return "" if points is None else points
+
+        def evaluation_status(claim, check):
+            evaluation = claim["evaluations"].get(check.key, {})
+            return evaluation.get("status", "")
+
+        def evaluation_comment(claim, check):
+            evaluation = claim["evaluations"].get(check.key, {})
+            return evaluation.get("comment", "")
+
+        # ------------------------------------------------------------------
+        # Boletín de notas
+        # ------------------------------------------------------------------
+        grade_ws = workbook.add_worksheet("Boletín de notas")
+        grade_ws.merge_range("A1:K1", "Boletín de notas - Warranty Audit", fmt_title)
+        grade_headers = [
+            "Claim No.", "Dealer", "VIN", "Modelo", "Documentación /58", "Piezas viejas /42",
+            "Total /100", "% éxito", "Resultado", "Pendientes", "Comentarios",
+        ]
+        write_headers(grade_ws, 2, grade_headers)
+        set_widths(grade_ws, [20, 24, 24, 20, 18, 18, 14, 14, 16, 48, 60])
+        grade_ws.freeze_panes(3, 0)
+
+        row_idx = 3
+        for claim in claims.values():
+            score = calculate_claim_score(claim)
+            total_points = score["total_points"]
+            row_values = [
+                claim["claim_no"],
+                claim.get("dealer", dealer or ""),
+                claim.get("vin", ""),
+                claim.get("model", ""),
+                score["doc_points"],
+                score["old_points"],
+                total_points,
+                score["success_percent"] / 100,
+                result_label(total_points),
+                " | ".join(score["pending"]),
+                claim.get("general_comment", ""),
+            ]
+            write_row(grade_ws, row_idx, row_values, fmt_body)
+            grade_ws.write_number(row_idx, 4, score["doc_points"], fmt_int)
+            grade_ws.write_number(row_idx, 5, score["old_points"], fmt_int)
+            grade_ws.write_number(row_idx, 6, total_points, result_format(total_points))
+            grade_ws.write_number(row_idx, 7, score["success_percent"] / 100, fmt_percent)
+            grade_ws.write(row_idx, 8, result_label(total_points), result_format(total_points))
+            row_idx += 1
+        if row_idx > 3:
+            grade_ws.autofilter(2, 0, row_idx - 1, len(grade_headers) - 1)
+            grade_ws.conditional_format(3, 7, row_idx - 1, 7, {
+                "type": "3_color_scale",
+                "min_color": "#F4CCCC",
+                "mid_color": "#FFF2CC",
+                "max_color": "#E2F0D9",
+            })
+
+        # ------------------------------------------------------------------
+        # content
+        # ------------------------------------------------------------------
+        content_ws = workbook.add_worksheet("content")
+        content_ws.merge_range("A1:D1", "Warranty audit report card / Boletín de auditoría", fmt_title)
+        content_rows = [
+            ["Audit name", audit_name or ""],
+            ["Dealer", dealer or ""],
+            ["Auditor", auditor or ""],
+            ["Export date", datetime.now().strftime("%Y-%m-%d %H:%M")],
+            ["Scoring rule", "Claim document checklist I = 58 / Claim old parts checklist II = 42 / Total = 100"],
+            ["N/A rule", "No aplica = maximum score of the section"],
+            ["Campaigns", "Informative only. No points added or deducted."],
+        ]
+        set_widths(content_ws, [24, 90, 18, 18])
+        for idx, row in enumerate(content_rows, start=2):
+            content_ws.write(idx, 0, row[0], fmt_bold)
+            content_ws.write(idx, 1, row[1], fmt_body)
+        audit_score = calculate_audit_score(claims)
+        content_ws.write(10, 0, "Global result", fmt_bold)
+        content_ws.write(10, 1, f"{audit_score['success_percent']:.1f}% ({audit_score['total_points']}/{audit_score['max_points']})", result_format(audit_score["success_percent"]))
+
+        # ------------------------------------------------------------------
+        # Claim document checklist I
+        # ------------------------------------------------------------------
+        doc_ws = workbook.add_worksheet("Claim document checklist I")
+        doc_headers = [
+            "No.", "Claim No.",
+            *[check.label for check in DOCUMENT_CHECKS],
+            "Comprobación campañas", "Campañas pendientes",
+            "Total documentación", "Resultado documentación %", "Comentarios",
+        ]
+        write_headers(doc_ws, 0, doc_headers)
+        set_widths(doc_ws, [8, 20, 12, 18, 14, 12, 14, 12, 16, 18, 12, 24, 24, 18, 18, 50])
+        doc_ws.freeze_panes(1, 2)
+        for idx, claim in enumerate(claims.values(), start=1):
+            excel_row = idx + 1
+            row = [idx, claim["claim_no"]]
+            row.extend(evaluation_value(claim, check) for check in DOCUMENT_CHECKS)
+            row.append(claim["evaluations"].get("info_campaign_check", {}).get("comment", ""))
+            row.append(claim["evaluations"].get("info_pending_campaigns", {}).get("comment", ""))
+            row.append(f"=SUM(C{excel_row}:K{excel_row})")
+            row.append(f"=L{excel_row}/{MAX_DOCUMENT_POINTS}")
+            row.append(claim.get("general_comment", ""))
+            write_row(doc_ws, idx, row, fmt_body)
+            for c in range(2, 11):
+                if isinstance(row[c], (int, float)):
+                    doc_ws.write_number(idx, c, row[c], fmt_int)
+            doc_ws.write_formula(idx, 11, f"=SUM(C{excel_row}:K{excel_row})", fmt_int)
+            doc_ws.write_formula(idx, 12, f"=L{excel_row}/{MAX_DOCUMENT_POINTS}", fmt_formula_percent)
+        if len(claims) > 0:
+            doc_ws.autofilter(0, 0, len(claims), len(doc_headers) - 1)
+            doc_ws.conditional_format(1, 12, len(claims), 12, {
+                "type": "3_color_scale",
+                "min_color": "#F4CCCC",
+                "mid_color": "#FFF2CC",
+                "max_color": "#E2F0D9",
+            })
+
+        # ------------------------------------------------------------------
+        # Claim old parts checklist II
+        # ------------------------------------------------------------------
+        old_ws = workbook.add_worksheet("Claim old parts checklist II")
+        old_headers = [
+            "No.", "Claim No.",
+            *[check.label for check in OLD_PARTS_CHECKS],
+            "Total piezas viejas", "Resultado piezas viejas %", "Comentarios",
+        ]
+        write_headers(old_ws, 0, old_headers)
+        set_widths(old_ws, [8, 20, 18, 20, 16, 24, 20, 26, 18, 18, 50])
+        old_ws.freeze_panes(1, 2)
+        for idx, claim in enumerate(claims.values(), start=1):
+            excel_row = idx + 1
+            row = [idx, claim["claim_no"]]
+            row.extend(evaluation_value(claim, check) for check in OLD_PARTS_CHECKS)
+            row.append(f"=SUM(C{excel_row}:H{excel_row})")
+            row.append(f"=I{excel_row}/{MAX_OLD_PARTS_POINTS}")
+            row.append(claim.get("general_comment", ""))
+            write_row(old_ws, idx, row, fmt_body)
+            for c in range(2, 8):
+                if isinstance(row[c], (int, float)):
+                    old_ws.write_number(idx, c, row[c], fmt_int)
+            old_ws.write_formula(idx, 8, f"=SUM(C{excel_row}:H{excel_row})", fmt_int)
+            old_ws.write_formula(idx, 9, f"=I{excel_row}/{MAX_OLD_PARTS_POINTS}", fmt_formula_percent)
+        if len(claims) > 0:
+            old_ws.autofilter(0, 0, len(claims), len(old_headers) - 1)
+            old_ws.conditional_format(1, 9, len(claims), 9, {
+                "type": "3_color_scale",
+                "min_color": "#F4CCCC",
+                "mid_color": "#FFF2CC",
+                "max_color": "#E2F0D9",
+            })
+
+        # ------------------------------------------------------------------
+        # Improvement of claim issues III
+        # ------------------------------------------------------------------
+        imp_ws = workbook.add_worksheet("Improvement of claim issues III")
+        imp_headers = ["Claim No.", "Parameter / auditable area", "Exception / comments", "Observations", "Countermeasure"]
+        write_headers(imp_ws, 0, imp_headers)
+        set_widths(imp_ws, [20, 32, 32, 60, 60])
+        imp_ws.freeze_panes(1, 0)
+        imp_row = 1
+        for claim in claims.values():
+            score = calculate_claim_score(claim)
+            for block, area, lost, max_points, status in score["lost_by_area"]:
+                comments = []
+                check = next((item for item in ALL_SCORING_CHECKS if item.block == block and item.label == area), None)
+                if check is not None:
+                    section_comment = evaluation_comment(claim, check)
+                    if section_comment:
+                        comments.append(section_comment)
+                if claim.get("general_comment", ""):
+                    comments.append(claim.get("general_comment", ""))
+                write_row(imp_ws, imp_row, [
+                    claim["claim_no"],
+                    area,
+                    f"{status}: {lost}/{max_points} puntos perdidos",
+                    "\n".join(comments),
+                    "Reforzar el cumplimiento del criterio y revisar la documentación antes del envío de la claim.",
+                ], fmt_body)
+                imp_row += 1
+        if imp_row == 1:
+            write_row(imp_ws, imp_row, ["", "Sin desviaciones puntuables", "", "", ""], fmt_body)
+            imp_row += 1
+        imp_ws.autofilter(0, 0, imp_row - 1, len(imp_headers) - 1)
+
+        # ------------------------------------------------------------------
+        # Evaluation content
+        # ------------------------------------------------------------------
+        eval_ws = workbook.add_worksheet("Evaluation content")
+        eval_headers = ["Checklist", "Apartado", "Máximo", "Opciones", "Criterio"]
+        write_headers(eval_ws, 0, eval_headers)
+        set_widths(eval_ws, [28, 34, 12, 42, 85])
+        eval_ws.freeze_panes(1, 0)
+        for row_idx, check in enumerate(ALL_CHECKS, start=1):
+            options_text = " | ".join(
+                f"{option.status}: {'-' if option.points is None else option.points}"
+                for option in check.options
+            )
+            write_row(eval_ws, row_idx, [check.block, check.label, check.max_points, options_text, check.guidance], fmt_body)
+        eval_ws.autofilter(0, 0, len(ALL_CHECKS), len(eval_headers) - 1)
+
+        workbook.close()
+        workbook = None
+        return output.getvalue()
+
+    finally:
+        if workbook is not None:
+            workbook.close()
 
 def generate_text_report(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> str:
     audit_score = calculate_audit_score(claims)
@@ -746,6 +1081,14 @@ def main():
             data=export_excel(claims, audit_name, dealer, auditor),
             file_name=f"audit_export_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        st.download_button(
+            "Exportar boletín de notas Excel",
+            data=export_report_card_excel(claims, audit_name, dealer, auditor),
+            file_name=f"audit_boletin_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Genera un Excel con hojas tipo plantilla: documentación, piezas viejas, áreas de mejora, criterios y boletín por claim.",
         )
 
     with right:
