@@ -18,6 +18,8 @@ Notas de cálculo:
 - Permite guardar y recargar auditorías de trabajo en JSON.
 - El comentario general puede generarse desde las observaciones de cada apartado.
 - Permite completar ficha por claim: dealer, VIN, modelo e importe.
+- Dealer se selecciona desde listado de dealers activos.
+- Los archivos exportados usan el nombre base Dealer_fecha_auditor.
 - Permite adjuntar fotos de piezas viejas y certificado de destrucción por claim.
 """
 
@@ -193,6 +195,139 @@ MAX_TOTAL_POINTS = MAX_DOCUMENT_POINTS + MAX_OLD_PARTS_POINTS  # 100
 OLD_PART_PHOTO_FILE_TYPES = ["jpg", "jpeg", "png", "webp"]
 DESTRUCTION_CERTIFICATE_FILE_TYPES = ["jpg", "jpeg", "png", "webp", "pdf"]
 
+ACTIVE_DEALERS: List[str] = [
+    "ACAI MOTOR MÁLAGA",
+    "ALFAVISA BILBAO",
+    "ALIMOTOR ELCHE",
+    "ANFERPA SEGOVIA",
+    "AUTO YALDE CALAHORRA",
+    "AUTO YALDE LOGROÑO",
+    "AUTOCAM MOTOR VILAFRANCA",
+    "AUTOCAM VILANOVA",
+    "AUTOCYL PALENCIA",
+    "AUTOCYL VALLADOLID",
+    "AUTOVIDAL PALMA DE MALLORCA",
+    "AVANTI GRANADA",
+    "AXIS MOTORS",
+    "BLENDIO LAREDO",
+    "BLENDIO LUGO",
+    "BLENDIO OURENSE",
+    "BLENDIO OVIEDO",
+    "BLENDIO SANTANDER",
+    "BLENDIO TORRELAVEGA",
+    "BORJAMOTOR ALICANTE",
+    "CERVERA AVILA",
+    "CERVERA SALAMANCA",
+    "CHINARES GUADALAJARA",
+    "DILOAUTOJAEN",
+    "DUMOSA BENAVENTE",
+    "ESLAUTO LEON",
+    "FIMALAGA MÁLAGA",
+    "FIMALAGA MARBELLA",
+    "GRUP BASOLS IGUALADA",
+    "GRUPO JULIAN BURGOS",
+    "GRUPO NIETO MÁLAGA",
+    "GRUPO NIETO MARBELLA",
+    "HIMASA SEDAVÍ",
+    "JEMOYA SORIA",
+    "JOVERAUTO MELILLA",
+    "LASACAR MIRANDA DE EBRO",
+    "LASACAR VITORIA",
+    "LEPAS AUTOCAM VILANOVA",
+    "LEPAS AUTOVIVO SANT BOI",
+    "LEPAS BASOLS IGUALADA",
+    "LEPAS BASOLS VIC",
+    "LEPAS GAMBOA MAJADAHONDA",
+    "LEPAS JULIÁN BURGOS",
+    "LEPAS MONECAR SAGUNTO",
+    "LEPAS PREMIER VITORIA",
+    "LEPAS RAFAEL AFONSO LAS PALMAS",
+    "LEPAS RESNOVA CORUÑA",
+    "LEPAS RESNOVA VIGO",
+    "LEPAS TECNOTARRACO TARRAGONA",
+    "LEPAS TUMASA HUESCA",
+    "LEPAS VALLESCAR SABADELL",
+    "LEPAS VALLESCAR TERRASSA",
+    "LEPAS ZEN MOTOR GIPUZKOA",
+    "LEPAS ZEN MOTOR ZARAGOZA",
+    "M AUTOMOCIÓN ALCALÁ",
+    "M AUTOMOCIÓN BCN (GRAN VÍA)",
+    "M AUTOMOCIÓN BCN GUAYAQUIL",
+    "M AUTOMOCIÓN CASTELLÓN",
+    "M AUTOMOCIÓN GERONA",
+    "M AUTOMOCIÓN MATARÓ",
+    "M TECNIK ALCALÁ DE HENARES",
+    "M TECNIK BARCELONA MAQUINISTA",
+    "M TECNIK CASTELLÓN",
+    "M TECNIK FIGUERES",
+    "M TECNIK GERONA",
+    "M TECNIK MATARÓ",
+    "M TECNIK VINAROZ",
+    "MARTIN LIZAGA TERUEL",
+    "MAS AUTO LEGANÉS",
+    "MAVEN BADAJOZ",
+    "MAVEN CÁCERES",
+    "MAVEN DON BENITO",
+    "MAVEN MÉRIDA",
+    "MAVEN PLASENCIA",
+    "MOLL MOTOR DENIA",
+    "MOLL MOTOR GANDIA",
+    "MOLL VALENCIA",
+    "MONECAR CUENCA",
+    "MOTOR NACIENTE LEGANÉS",
+    "MOVINSUR GRANADA",
+    "MOVINSUR JAÉN",
+    "MOVINSUR MOTRIL",
+    "MY CARS CÓRDOBA",
+    "NOVACAR BCN SANT BOI",
+    "PALAUSA ZAMORA",
+    "PROCHERY ALBACETE",
+    "PROCHERY CARTAGENA",
+    "PROCHERY MURCIA",
+    "PRUNA CAR GO GRANOLLERS",
+    "RAFAEL AFONSO AGUIMES",
+    "RAFAEL AFONSO LANZAROTE",
+    "RAFAEL AFONSO LAS PALMAS",
+    "RAFAEL AFONSO TENERIFE",
+    "RESNOVA MOTOR CORUÑA",
+    "RESNOVA MOTOR GIJÓN",
+    "RESNOVA MOTOR NARÓN",
+    "RESNOVA MOTOR OVIEDO",
+    "RESNOVA MOTOR SANTIAGO",
+    "RESNOVA MOTOR VIGO",
+    "SEGRE LLEIDA",
+    "SEGRE MOTORS LERIDA",
+    "SERTECAUTO PONFERRADA",
+    "SYRSA ALGECIRAS",
+    "SYRSA ALMERIA",
+    "SYRSA EJIDO",
+    "SYRSA HUELVA",
+    "SYRSA SEVILLA",
+    "TALAUTO CAZALEGAS",
+    "TALAUTO TOLEDO",
+    "TALLERES CHINARES",
+    "TECNOTARRACO TARRAGONA",
+    "TERRY MOBILITY JERÉZ",
+    "TRADECAR GAMBOA ALCORCÓN",
+    "TRADECAR GAMBOA MADRID",
+    "TRADECAR GAMBOA MAJADAHONDA",
+    "TRADECAR GAMBOA RIVAS",
+    "TUMASA HUESCA",
+    "TUMASA MONZÓN",
+    "UNIONE ALCAZAR DE SAN JUAN",
+    "UNIONE CIUDAD REAL",
+    "VALLESCAR SABADELL",
+    "VALLESCAR TERRASSA",
+    "VIAN ALCORCÓN",
+    "VIAN AUTOMOBILE VILLALBA",
+    "VIAN MÓSTOLES",
+    "VIAN NAVARRA",
+    "ZEN MOTOR OLABERRIA",
+    "ZEN MOTOR PAMPLONA",
+    "ZEN MOTOR SAN SEBASTIÁN",
+    "ZEN MOTOR ZARAGOZA",
+]
+
 
 # =============================================================================
 # UTILIDADES
@@ -245,6 +380,41 @@ def sanitize_for_filename(value: Any, fallback: str = "item") -> str:
     text = re.sub(r"[^\w\-. ]+", "_", text, flags=re.UNICODE).strip()
     text = re.sub(r"\s+", "_", text)
     return text or fallback
+
+
+def get_dealer_options(current_value: str = "") -> List[str]:
+    """Lista de dealers para selectbox, conservando valores cargados de JSON antiguos."""
+    current_value = safe_str(current_value)
+    options = [""] + ACTIVE_DEALERS.copy()
+
+    if current_value and current_value not in options:
+        options.insert(1, current_value)
+
+    return options
+
+
+def format_dealer_option(value: str) -> str:
+    return "Selecciona dealer" if not safe_str(value) else value
+
+
+def build_audit_file_basename(dealer: str, auditor: str, when: Optional[datetime] = None) -> str:
+    """Base común para todos los archivos exportados: Dealer_fecha_auditor."""
+    when = when or datetime.now()
+    dealer_part = sanitize_for_filename(dealer, "Dealer")
+    date_part = when.strftime("%Y%m%d")
+    auditor_part = sanitize_for_filename(auditor, "Auditor")
+    return f"{dealer_part}_{date_part}_{auditor_part}"
+
+
+def apply_default_dealer_to_blank_claims(claims: Dict[str, Dict[str, Any]], dealer: str) -> None:
+    """Aplica el dealer general a claims sin dealer propio, sin pisar valores ya informados."""
+    dealer = safe_str(dealer)
+    if not dealer:
+        return
+
+    for claim in claims.values():
+        if not safe_str(claim.get("dealer", "")):
+            claim["dealer"] = dealer
 
 
 def uploaded_file_to_attachment(uploaded_file) -> Dict[str, Any]:
@@ -1268,23 +1438,23 @@ def generate_text_report(claims: Dict[str, Dict[str, Any]], audit_name: str, dea
 def export_audit_package_zip(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> bytes:
     """Exporta un paquete completo con Excel, boletín, informe, JSON de trabajo y adjuntos reales."""
     output = BytesIO()
-    base_name = sanitize_for_filename(audit_name or "auditoria_garantias")
+    base_name = build_audit_file_basename(dealer, auditor)
 
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
         zip_file.writestr(
-            f"{base_name}/audit_workfile.json",
+            f"{base_name}/{base_name}.json",
             serialize_audit_workfile(claims, audit_name, dealer, auditor),
         )
         zip_file.writestr(
-            f"{base_name}/audit_export.xlsx",
+            f"{base_name}/{base_name}_analitico.xlsx",
             export_excel(claims, audit_name, dealer, auditor),
         )
         zip_file.writestr(
-            f"{base_name}/audit_boletin.xlsx",
+            f"{base_name}/{base_name}_boletin.xlsx",
             export_report_card_excel(claims, audit_name, dealer, auditor),
         )
         zip_file.writestr(
-            f"{base_name}/audit_report.txt",
+            f"{base_name}/{base_name}_informe.txt",
             generate_text_report(claims, audit_name, dealer, auditor).encode("utf-8"),
         )
 
@@ -1424,12 +1594,39 @@ def sync_claim_meta_field(claim: Dict[str, Any], field: str, label: str, default
     return claim[field]
 
 
+def sync_claim_dealer_field(claim: Dict[str, Any], default_dealer: str = "") -> str:
+    """Dealer por claim mediante desplegable de dealers activos."""
+    claim_no = claim["claim_no"]
+    key = f"claim_meta_{claim_no}_dealer"
+
+    if not safe_str(claim.get("dealer", "")) and default_dealer:
+        claim["dealer"] = default_dealer
+
+    current_value = safe_str(claim.get("dealer", ""))
+    options = get_dealer_options(current_value or default_dealer)
+
+    if key not in st.session_state or st.session_state[key] not in options:
+        st.session_state[key] = current_value if current_value in options else ""
+
+    if not safe_str(st.session_state.get(key, "")) and current_value:
+        st.session_state[key] = current_value
+
+    value = st.selectbox(
+        "Dealer",
+        options,
+        key=key,
+        format_func=format_dealer_option,
+    )
+    claim["dealer"] = safe_str(value)
+    return claim["dealer"]
+
+
 def render_claim_quick_card(claim: Dict[str, Any], default_dealer: str = ""):
     """Ficha editable por claim: útil para futura integración en plataforma mayor."""
     st.caption("Ficha de la garantía")
     cols = st.columns(4)
     with cols[0]:
-        sync_claim_meta_field(claim, "dealer", "Dealer", default_dealer)
+        sync_claim_dealer_field(claim, default_dealer)
     with cols[1]:
         sync_claim_meta_field(claim, "vin", "VIN")
     with cols[2]:
@@ -1605,22 +1802,37 @@ def main():
 
         if st.session_state.claims:
             st.download_button(
-                "Guardar auditoría de trabajo (.json)",
+                "Descargar auditoría de trabajo (.json)",
                 data=serialize_audit_workfile(
                     st.session_state.claims,
                     st.session_state.audit_name,
                     st.session_state.audit_dealer,
                     st.session_state.audit_auditor,
                 ),
-                file_name=f"audit_workfile_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                file_name=f"{build_audit_file_basename(st.session_state.get('audit_dealer', ''), st.session_state.get('audit_auditor', ''))}.json",
                 mime="application/json",
-                help="Guarda todo el progreso: claims, estados, N/A, comentarios y datos de cabecera.",
+                help="Descarga el archivo de progreso para poder reabrir la auditoría más adelante.",
+                key="download_workfile_sidebar",
             )
+            st.caption("Este JSON es el archivo de trabajo editable. El ZIP también incluye una copia.")
+        else:
+            st.caption("Carga claims para poder descargar el JSON de trabajo.")
 
         st.divider()
         audit_name = st.text_input("Nombre auditoría", key="audit_name")
-        dealer = st.text_input("Dealer", key="audit_dealer")
+
+        dealer_values = get_dealer_options(st.session_state.get("audit_dealer", ""))
+        dealer = st.selectbox(
+            "Dealer",
+            dealer_values,
+            key="audit_dealer",
+            format_func=format_dealer_option,
+            help="Listado de dealers activos. Si cargas un JSON antiguo con otro dealer, se conservará como opción temporal.",
+        )
+
         auditor = st.text_input("Auditor", key="audit_auditor")
+        export_base_name = build_audit_file_basename(dealer, auditor)
+        st.caption(f"Nombre base de archivos: `{export_base_name}`")
 
         st.divider()
         uploaded_file = st.file_uploader("Subir checklist o lista HQ", type=["xlsx", "xlsm", "xls"], key="claims_upload")
@@ -1648,7 +1860,10 @@ def main():
         manual_claim = st.text_input("Añadir claim manual")
         if st.button("Añadir claim") and manual_claim.strip():
             claim_no = manual_claim.strip()
-            st.session_state.claims.setdefault(claim_no, empty_claim_record(claim_no))
+            new_claim = empty_claim_record(claim_no)
+            if safe_str(st.session_state.get("audit_dealer", "")):
+                new_claim["dealer"] = safe_str(st.session_state.audit_dealer)
+            st.session_state.claims.setdefault(claim_no, new_claim)
             st.session_state.selected_claim = claim_no
             st.success(f"Claim {claim_no} añadida.")
             st.rerun()
@@ -1661,6 +1876,7 @@ def main():
         st.caption("No aplica = máximo del apartado. Campañas = informativo.")
 
     claims: Dict[str, Dict[str, Any]] = st.session_state.claims
+    apply_default_dealer_to_blank_claims(claims, dealer)
     sync_uploaded_attachments_from_session_state(claims)
 
     if not claims:
@@ -1707,16 +1923,25 @@ def main():
         st.session_state.selected_claim = selected_claim
 
         st.download_button(
+            "💾 Guardar progreso editable (.json)",
+            data=serialize_audit_workfile(claims, audit_name, dealer, auditor),
+            file_name=f"{build_audit_file_basename(st.session_state.get('audit_dealer', ''), st.session_state.get('audit_auditor', ''))}.json",
+            mime="application/json",
+            help="Este es el archivo que debes subir en 'Cargar auditoría guardada' para continuar editando otro día.",
+            key="download_workfile_main",
+        )
+
+        st.download_button(
             "Exportar auditoría a Excel",
             data=export_excel(claims, audit_name, dealer, auditor),
-            file_name=f"audit_export_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            file_name=f"{export_base_name}_analitico.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
         st.download_button(
             "Exportar boletín de notas Excel",
             data=export_report_card_excel(claims, audit_name, dealer, auditor),
-            file_name=f"audit_boletin_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            file_name=f"{export_base_name}_boletin.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             help="Genera un Excel con hojas tipo plantilla: documentación, piezas viejas, áreas de mejora, criterios y boletín por claim.",
         )
@@ -1724,7 +1949,7 @@ def main():
         st.download_button(
             "Exportar paquete completo (.zip)",
             data=export_audit_package_zip(claims, audit_name, dealer, auditor),
-            file_name=f"audit_package_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+            file_name=f"{export_base_name}.zip",
             mime="application/zip",
             help="Incluye Excel analítico, boletín, informe TXT, JSON de trabajo y los archivos adjuntos reales por claim.",
         )
@@ -1806,7 +2031,7 @@ def main():
             st.download_button(
                 "Descargar informe .txt",
                 data=report.encode("utf-8"),
-                file_name=f"audit_report_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+                file_name=f"{export_base_name}_informe.txt",
                 mime="text/plain",
             )
 
@@ -1860,4 +2085,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
