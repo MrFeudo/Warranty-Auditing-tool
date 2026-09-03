@@ -21,6 +21,7 @@ Qué hace:
 - Exporta boletín en español para dealer usando claim local CO...
 - Exporta scorecard en inglés para HQ usando identificador HQ/IDMS/TAC/2810...
 - Rellena la hoja/page 3 "Improvement of claim issues III" con las observaciones de los campos.
+- En exportaciones EN, traduce las observaciones con un glosario local de auditoría.
 """
 
 from __future__ import annotations
@@ -179,8 +180,8 @@ OLD_PARTS_CHECKS: List[AuditCheck] = [
     ),
     AuditCheck(
         "old_parts", "old_failure_info", "Info tipo fallo pieza causa", "Causal part failure information", 7, options_old_binary_0_7(),
-        "Comprobar que la información del fallo sea coherente con la pieza y las fotos/evidencias.",
-        "Check whether the failure information is consistent with the part and with the photos/evidence.",
+        "Comprobar que la información del fallo sea coherente con la pieza y las evidencias disponibles.",
+        "Check whether the failure information is consistent with the part and with the available evidence.",
     ),
     AuditCheck(
         "old_parts", "old_destruction", "Destrucción pieza vieja", "Old part destruction", 7, options_0_5_7(),
@@ -189,8 +190,8 @@ OLD_PARTS_CHECKS: List[AuditCheck] = [
     ),
     AuditCheck(
         "old_parts", "old_destruction_certificate", "Certificado destrucción piezas viejas", "Old parts destruction certificate", 7, options_0_5_7(),
-        "El certificado/informe de destrucción debe existir, subirse y archivarse en plazo.",
-        "The destruction certificate/report must exist and be uploaded/archived within the required period.",
+        "El certificado/informe de destrucción debe existir y archivarse en plazo.",
+        "The destruction certificate/report must exist and be archived within the required period.",
     ),
 ]
 
@@ -347,7 +348,7 @@ TEXT = {
         "lowest_claims": "Lowest scoring claims",
         "conclusion": "Conclusion",
         "campaign_info": "Campaigns: informative review only, with no impact on scoring.",
-        "not_translated_note": "Note: manual observations are included exactly as written.",
+        "not_translated_note": "Note: manual observations are translated into English using the built-in audit glossary. Review uncommon wording before sending externally.",
     },
 }
 
@@ -560,6 +561,240 @@ def result_label(points: Any, language: str = "es") -> str:
     if p >= 60:
         return t["improvable"]
     return t["critical"]
+
+
+# =============================================================================
+# TRADUCCIÓN LOCAL DE OBSERVACIONES
+# =============================================================================
+
+# Glosario sencillo para que los exports EN no arrastren comentarios en español.
+# No usa IA ni servicios externos: es determinista, rápido y seguro para Streamlit Cloud.
+_COMMENT_TRANSLATION_PATTERNS: List[Tuple[str, str]] = [
+    (r"\bno se adjuntan\b", "are not attached"),
+    (r"\bno se adjunta\b", "is not attached"),
+    (r"\bno adjuntan\b", "do not attach"),
+    (r"\bno adjunta\b", "does not attach"),
+    (r"\bfaltan\b", "missing"),
+    (r"\bfalta\b", "missing"),
+    (r"\bsin\b", "without"),
+    (r"\bno hay\b", "there is no"),
+    (r"\bno existe\b", "does not exist"),
+    (r"\bno procede\b", "not applicable"),
+    (r"\bno aplica\b", "not applicable"),
+    (r"\bincompleto\b", "incomplete"),
+    (r"\bincompleta\b", "incomplete"),
+    (r"\bincorrecto\b", "incorrect"),
+    (r"\bincorrecta\b", "incorrect"),
+    (r"\bcorrecto\b", "correct"),
+    (r"\bcorrecta\b", "correct"),
+    (r"\binsuficiente\b", "insufficient"),
+    (r"\binsuficientes\b", "insufficient"),
+    (r"\bno conforme\b", "non-compliant"),
+    (r"\bconforme\b", "compliant"),
+    (r"\bno queda justificado\b", "is not justified"),
+    (r"\bno justificado\b", "not justified"),
+    (r"\bno justificada\b", "not justified"),
+    (r"\bjustificar\b", "justify"),
+    (r"\bjustificado\b", "justified"),
+    (r"\bjustificada\b", "justified"),
+    (r"\bfuera de plazo\b", "outside the allowed deadline"),
+    (r"\bplazo\b", "deadline"),
+    (r"\bplazos\b", "deadlines"),
+    (r"\bfecha de envio\b", "submission date"),
+    (r"\bfecha de envío\b", "submission date"),
+    (r"\bfecha de reparacion\b", "repair date"),
+    (r"\bfecha de reparación\b", "repair date"),
+    (r"\borden de reparacion\b", "repair order"),
+    (r"\borden de reparación\b", "repair order"),
+    (r"\bla or\b", "the repair order"),
+    (r"\bel or\b", "the repair order"),
+    (r"\bor previa\b", "previous repair order"),
+    (r"\bor\b", "repair order"),
+    (r"\breparacion\b", "repair"),
+    (r"\breparación\b", "repair"),
+    (r"\breparaciones\b", "repairs"),
+    (r"\bpedido de piezas\b", "parts order"),
+    (r"\balbaran\b", "delivery note"),
+    (r"\balbarán\b", "delivery note"),
+    (r"\bevidencias\b", "evidence"),
+    (r"\bevidencia\b", "evidence"),
+    (r"\bfotos\b", "photos"),
+    (r"\bfoto\b", "photo"),
+    (r"\bpieza causa\b", "causal part"),
+    (r"\bpiezas viejas\b", "old parts"),
+    (r"\bpieza vieja\b", "old part"),
+    (r"\bpieza sustituida\b", "replaced part"),
+    (r"\bpieza nueva\b", "new part"),
+    (r"\bpiezas\b", "parts"),
+    (r"\bpieza\b", "part"),
+    (r"\bmano de obra adicional\b", "additional labour"),
+    (r"\bmano de obra\b", "labour"),
+    (r"\bmaterial auxiliar\b", "auxiliary material"),
+    (r"\bcoste auxiliar\b", "auxiliary cost"),
+    (r"\bcostes adicionales\b", "additional costs"),
+    (r"\bcoste\b", "cost"),
+    (r"\bimporte\b", "amount"),
+    (r"\btiempo adicional\b", "additional time"),
+    (r"\btiempo extra\b", "extra time"),
+    (r"\bbaremo\b", "standard time"),
+    (r"\boperacion\b", "operation"),
+    (r"\boperación\b", "operation"),
+    (r"\boperaciones\b", "operations"),
+    (r"\bdiagnostico\b", "diagnosis"),
+    (r"\bdiagnóstico\b", "diagnosis"),
+    (r"\baveria\b", "failure"),
+    (r"\bavería\b", "failure"),
+    (r"\bsintoma\b", "symptom"),
+    (r"\bsíntoma\b", "symptom"),
+    (r"\bsolucion\b", "solution"),
+    (r"\bsolución\b", "solution"),
+    (r"\bfirma del cliente\b", "customer signature"),
+    (r"\bfirma\b", "signature"),
+    (r"\bcliente\b", "customer"),
+    (r"\bvehiculo\b", "vehicle"),
+    (r"\bvehículo\b", "vehicle"),
+    (r"\bkilometraje\b", "mileage"),
+    (r"\betiqueta\b", "label"),
+    (r"\betiquetado\b", "labelling"),
+    (r"\bdestruccion\b", "destruction"),
+    (r"\bdestrucción\b", "destruction"),
+    (r"\bcertificado\b", "certificate"),
+    (r"\binforme\b", "report"),
+    (r"\bcampañas\b", "campaigns"),
+    (r"\bcampana\b", "campaign"),
+    (r"\bcampaña\b", "campaign"),
+    (r"\bpendiente\b", "pending"),
+    (r"\bpendientes\b", "pending"),
+    (r"\brevisar\b", "review"),
+    (r"\badjuntar\b", "attach"),
+    (r"\badjunta\b", "attaches"),
+    (r"\badjuntado\b", "attached"),
+    (r"\badjuntada\b", "attached"),
+    (r"\bsubir\b", "upload"),
+    (r"\barchivar\b", "archive"),
+    (r"\bcomprobar\b", "check"),
+    (r"\bverificar\b", "verify"),
+    (r"\bcoherente\b", "consistent"),
+    (r"\bcoherencia\b", "consistency"),
+    (r"\bcausa\b", "cause"),
+    (r"\bfallo\b", "failure"),
+    (r"\btipo de fallo\b", "failure type"),
+    (r"\bdatos\b", "data"),
+    (r"\breclamacion\b", "claim"),
+    (r"\breclamación\b", "claim"),
+    (r"\bgarantia\b", "warranty"),
+    (r"\bgarantía\b", "warranty"),
+    (r"\bde la\b", "of the"),
+    (r"\bde las\b", "of the"),
+    (r"\bde los\b", "of the"),
+    (r"\bdel\b", "of the"),
+    (r"\bde\b", "of"),
+]
+
+
+def looks_like_english(text: str) -> bool:
+    sample = normalize_text(text)
+    if not sample:
+        return True
+    spanish_markers = [
+        " falta ", " faltan ", " evidencia ", " evidencias ", " pieza ", " piezas ",
+        " reparacion ", " garantia ", " reclamacion ", " albaran ", " fecha ",
+        " no se ", " mano de obra ", " material auxiliar ", " certificado ",
+    ]
+    english_markers = [
+        " missing ", " evidence ", " repair ", " warranty ", " claim ", " labour ",
+        " part ", " parts ", " delivery note ", " certificate ", " deadline ",
+    ]
+    padded = f" {sample} "
+    spanish_hits = sum(marker in padded for marker in spanish_markers)
+    english_hits = sum(marker in padded for marker in english_markers)
+    return english_hits > 0 and spanish_hits == 0
+
+
+def translate_comment_to_english(text: Any) -> str:
+    """
+    Traduce observaciones habituales de auditoría al inglés usando un glosario local.
+    Si el texto ya parece inglés, lo deja intacto. No llama a APIs externas.
+    """
+    original = safe_str(text)
+    if not original or looks_like_english(original):
+        return original
+
+    translated_lines = []
+    for line in original.splitlines():
+        line = safe_str(line)
+        if not line:
+            translated_lines.append("")
+            continue
+
+        translated = line
+        # Primero, expresiones completas muy comunes.
+        exact_map = {
+            "ok": "OK",
+            "no aplica": "Not applicable",
+            "pendiente": "Pending",
+            "sin observación específica.": "No specific observation.",
+            "sin observacion especifica.": "No specific observation.",
+            "falta evidencia de diagnostico": "Missing diagnosis evidence.",
+            "falta evidencia de diagnostico.": "Missing diagnosis evidence.",
+            "faltan evidencias de diagnostico": "Missing diagnosis evidence.",
+            "faltan evidencias de diagnostico.": "Missing diagnosis evidence.",
+            "tiempo adicional no justificado": "Additional time is not justified.",
+            "tiempo adicional no justificado.": "Additional time is not justified.",
+            "mano de obra adicional no justificada": "Additional labour is not justified.",
+            "mano de obra adicional no justificada.": "Additional labour is not justified.",
+            "falta firma del cliente": "Missing customer signature.",
+            "falta firma del cliente.": "Missing customer signature.",
+            "no se adjunta la or": "The repair order is not attached.",
+            "no se adjunta la or.": "The repair order is not attached.",
+        }
+        normalized_line = normalize_text(line)
+        if normalized_line in exact_map:
+            translated_lines.append(exact_map[normalized_line])
+            continue
+
+        # Sustituciones por glosario. Se hacen con ignorecase y manteniendo lo demás.
+        for pattern, replacement in _COMMENT_TRANSLATION_PATTERNS:
+            translated = re.sub(pattern, replacement, translated, flags=re.IGNORECASE)
+
+        # Limpieza mínima de dobles espacios y mayúscula inicial.
+        translated = re.sub(r"\s+", " ", translated).strip()
+        if translated and translated[0].islower():
+            translated = translated[0].upper() + translated[1:]
+        translated_lines.append(translated)
+
+    return "\n".join(translated_lines).strip()
+
+
+def comment_for_language(text: Any, language: str = "es") -> str:
+    comment = safe_str(text)
+    if language == "en":
+        return translate_comment_to_english(comment)
+    return comment
+
+
+def status_for_language(status: Any, language: str = "es") -> str:
+    value = safe_str(status)
+    if language != "en":
+        return value
+    normalized = normalize_text(value)
+    return {
+        "pendiente": "Pending",
+        "ok": "OK",
+        "parcial": "Partial",
+        "nok": "NOK",
+        "n a": "N/A",
+        "na": "N/A",
+    }.get(normalized, value)
+
+
+def pending_items_for_language(claim: Dict[str, Any], language: str = "es") -> List[str]:
+    pending = []
+    for check in ALL_SCORING_CHECKS:
+        evaluation = claim.get("evaluations", {}).get(check.key, {})
+        if evaluation.get("points") is None:
+            pending.append(check_label(check, language))
+    return pending
 
 
 # =============================================================================
@@ -893,7 +1128,7 @@ def build_general_comment_from_observations(claim: Dict[str, Any], include_campa
     checks = ALL_CHECKS if include_campaigns else ALL_SCORING_CHECKS
     lines = []
     for check in checks:
-        comment = evaluation_comment(claim, check)
+        comment = comment_for_language(evaluation_comment(claim, check), language)
         if not comment:
             continue
         label = check_label(check, language)
@@ -913,8 +1148,8 @@ def build_action_plan_rows(claims: Dict[str, Dict[str, Any]], language: str = "e
         for claim in claims.values():
             evaluation = claim.get("evaluations", {}).get(check.key, {})
             points = evaluation.get("points")
-            status = safe_str(evaluation.get("status", "")) or ("Pendiente" if language == "es" else "Pending")
-            comment = evaluation_comment(claim, check)
+            status = status_for_language(evaluation.get("status", ""), language) or ("Pendiente" if language == "es" else "Pending")
+            comment = comment_for_language(evaluation_comment(claim, check), language)
             lost = check.max_points if points is None else max(0, check.max_points - int(points or 0))
             if lost > 0 or comment:
                 affected_claims += 1
@@ -966,8 +1201,8 @@ def build_summary_dataframe(claims: Dict[str, Dict[str, Any]], language: str = "
             t["total_score"]: score["total_points"],
             t["success"]: score["success_percent"],
             t["result"]: result_label(score["total_points"], language),
-            t["pending"]: " | ".join(score["pending"]),
-            t["comments"]: claim.get("general_comment", ""),
+            t["pending"]: " | ".join(pending_items_for_language(claim, language)),
+            t["comments"]: comment_for_language(claim.get("general_comment", ""), language),
         })
     return pd.DataFrame(rows)
 
@@ -989,11 +1224,11 @@ def build_detail_dataframe(claims: Dict[str, Dict[str, Any]], language: str = "e
                 t["amount"]: claim.get("amount", ""),
                 "Bloque" if language == "es" else "Section": block_label(check.block_key, language),
                 "Apartado" if language == "es" else "Item": check_label(check, language),
-                "Estado" if language == "es" else "Status": evaluation.get("status", ""),
+                "Estado" if language == "es" else "Status": status_for_language(evaluation.get("status", ""), language),
                 "Puntos" if language == "es" else "Points": points,
                 "Máximo" if language == "es" else "Max": max_points,
                 "Pérdida" if language == "es" else "Lost": "" if points is None else max_points - int(points or 0),
-                "Comentario apartado" if language == "es" else "Item observation": evaluation.get("comment", ""),
+                "Comentario apartado" if language == "es" else "Item observation": comment_for_language(evaluation.get("comment", ""), language),
                 "Criterio" if language == "es" else "Criterion": check_guidance(check, language),
             })
     return pd.DataFrame(rows)
@@ -1127,8 +1362,8 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
                 score["total_points"],
                 score["success_percent"] / 100,
                 result_label(score["total_points"], language),
-                " | ".join(score["pending"]),
-                claim.get("general_comment", ""),
+                " | ".join(pending_items_for_language(claim, language)),
+                comment_for_language(claim.get("general_comment", ""), language),
             ]
             write_row(grade_ws, idx, row_values, fmt_body)
             grade_ws.write_number(idx, 6, score["doc_points"], fmt_int)
@@ -1180,11 +1415,11 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             excel_row = idx + 1
             row = [idx, claim_identifier(claim, language), claim_other_identifier(claim, language)]
             row.extend(evaluation_value(claim, check) for check in DOCUMENT_CHECKS)
-            row.append(evaluation_comment(claim, CAMPAIGN_CHECKS[0]))
-            row.append(evaluation_comment(claim, CAMPAIGN_CHECKS[1]))
+            row.append(comment_for_language(evaluation_comment(claim, CAMPAIGN_CHECKS[0]), language))
+            row.append(comment_for_language(evaluation_comment(claim, CAMPAIGN_CHECKS[1]), language))
             row.append(f"=SUM(D{excel_row}:L{excel_row})")
             row.append(f"=N{excel_row}/{MAX_DOCUMENT_POINTS}")
-            row.append(claim.get("general_comment", ""))
+            row.append(comment_for_language(claim.get("general_comment", ""), language))
             write_row(doc_ws, idx, row, fmt_body)
             for col_idx in range(3, 12):
                 if isinstance(row[col_idx], (int, float)):
@@ -1213,7 +1448,7 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             row.extend(evaluation_value(claim, check) for check in OLD_PARTS_CHECKS)
             row.append(f"=SUM(D{excel_row}:I{excel_row})")
             row.append(f"=J{excel_row}/{MAX_OLD_PARTS_POINTS}")
-            row.append(claim.get("general_comment", ""))
+            row.append(comment_for_language(claim.get("general_comment", ""), language))
             write_row(old_ws, idx, row, fmt_body)
             for col_idx in range(3, 9):
                 if isinstance(row[col_idx], (int, float)):
@@ -1615,8 +1850,18 @@ def main():
         section_names = ["I. Documentación", "II. Piezas viejas", "Campañas", "Comentarios", "Informe"]
         if st.session_state.active_audit_section not in section_names:
             st.session_state.active_audit_section = section_names[0]
-        st.radio("Sección", section_names, index=section_names.index(st.session_state.active_audit_section), horizontal=True, key="active_audit_section", label_visibility="collapsed")
-        selected_section = st.session_state.active_audit_section
+
+        # No usamos key="active_audit_section" en el radio.
+        # Streamlit bloquea modificar una key después de instanciar su widget,
+        # y eso rompía los botones de apartado anterior/siguiente.
+        selected_section = st.radio(
+            "Sección",
+            section_names,
+            index=section_names.index(st.session_state.active_audit_section),
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+        st.session_state.active_audit_section = selected_section
 
         if selected_section == "I. Documentación":
             render_check_editor(claim, DOCUMENT_CHECKS)
