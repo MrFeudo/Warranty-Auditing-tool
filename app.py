@@ -10,18 +10,19 @@ Ejecución:
 
 Qué hace:
 - Permite pegar una lista de claims en una tabla editable tipo Excel.
-- Permite trabajar claim por claim.
+- Permite trabajar por bloques: primero documentación para todas las claims y después piezas viejas en almacén.
 - Calcula automáticamente la puntuación:
     Claim document checklist I = 58 puntos
     Claim old parts checklist II = 42 puntos
     Total = 100 puntos
+- Por defecto todos los apartados arrancan como OK / puntuación máxima.
 - No aplica = puntuación máxima del apartado.
-- Campañas = informativo, no suma ni resta.
 - Genera comentario general desde observaciones por apartado.
 - Exporta boletín en español para dealer usando claim local CO...
 - Exporta scorecard en inglés para HQ usando identificador HQ/IDMS/TAC/2810...
 - Rellena la hoja/page 3 "Improvement of claim issues III" con las observaciones de los campos.
 - En exportaciones EN, traduce las observaciones con un glosario local de auditoría.
+- Permite registrar deducción parcial o total. El botón "No es garantía" pone la claim a 0/100 y marca deducción total.
 """
 
 from __future__ import annotations
@@ -105,14 +106,6 @@ def options_old_binary_0_7() -> Tuple[AuditOption, ...]:
     )
 
 
-def options_campaigns() -> Tuple[AuditOption, ...]:
-    return (
-        AuditOption("pending", "Pendiente de revisar", "Pending review", None, "Pendiente"),
-        AuditOption("ok", "OK", "OK", None, "OK"),
-        AuditOption("nok", "NOK / revisar", "NOK / review required", None, "NOK"),
-        AuditOption("na", "No aplica", "Not applicable", None, "N/A"),
-    )
-
 
 DOCUMENT_CHECKS: List[AuditCheck] = [
     AuditCheck(
@@ -195,21 +188,8 @@ OLD_PARTS_CHECKS: List[AuditCheck] = [
     ),
 ]
 
-CAMPAIGN_CHECKS: List[AuditCheck] = [
-    AuditCheck(
-        "campaigns", "info_campaign_check", "Comprobación campañas", "Campaign check", 0, options_campaigns(),
-        "Campo informativo. No afecta al porcentaje de éxito.",
-        "Informative field. It does not affect the success percentage.",
-    ),
-    AuditCheck(
-        "campaigns", "info_pending_campaigns", "Campañas pendientes", "Pending campaigns", 0, options_campaigns(),
-        "Campo informativo. Indicar si existen campañas pendientes o si se ha revisado correctamente.",
-        "Informative field. Indicate whether there are pending campaigns or whether the check has been completed correctly.",
-    ),
-]
-
 ALL_SCORING_CHECKS = DOCUMENT_CHECKS + OLD_PARTS_CHECKS
-ALL_CHECKS = DOCUMENT_CHECKS + OLD_PARTS_CHECKS + CAMPAIGN_CHECKS
+ALL_CHECKS = ALL_SCORING_CHECKS
 CHECK_BY_KEY = {check.key: check for check in ALL_CHECKS}
 MAX_DOCUMENT_POINTS = sum(check.max_points for check in DOCUMENT_CHECKS)
 MAX_OLD_PARTS_POINTS = sum(check.max_points for check in OLD_PARTS_CHECKS)
@@ -276,6 +256,13 @@ TEXT = {
         "vin": "VIN",
         "model": "Modelo",
         "amount": "Importe",
+        "deduction_type": "Tipo deducción",
+        "deduction_amount": "Deducción",
+        "deduction_reason": "Motivo deducción",
+        "no_deduction": "Sin deducción",
+        "partial_deduction": "Deducción parcial",
+        "full_deduction": "Deducción total",
+        "not_warranty": "No es garantía",
         "doc_score": "Documentación /58",
         "old_score": "Piezas viejas /42",
         "total_score": "Total /100",
@@ -283,8 +270,6 @@ TEXT = {
         "result": "Resultado",
         "pending": "Pendientes",
         "comments": "Comentarios",
-        "campaign_check": "Comprobación campañas",
-        "pending_campaigns": "Campañas pendientes",
         "action_plan_title": "Plan de mejora",
         "auditable_list": "Lista de parámetros auditables",
         "exception_comments": "Excepciones/comentarios",
@@ -302,7 +287,6 @@ TEXT = {
         "improvement_areas": "Principales áreas de mejora",
         "lowest_claims": "Claims con menor puntuación",
         "conclusion": "Conclusión",
-        "campaign_info": "Campañas: revisión informativa, sin impacto en puntuación.",
         "not_translated_note": "Nota: las observaciones manuales se incluyen tal como se han escrito.",
     },
     "en": {
@@ -321,6 +305,13 @@ TEXT = {
         "vin": "VIN",
         "model": "Model",
         "amount": "Amount",
+        "deduction_type": "Deduction type",
+        "deduction_amount": "Deduction",
+        "deduction_reason": "Deduction reason",
+        "no_deduction": "No deduction",
+        "partial_deduction": "Partial deduction",
+        "full_deduction": "Full deduction",
+        "not_warranty": "Not covered by warranty",
         "doc_score": "Document checklist /58",
         "old_score": "Old parts checklist /42",
         "total_score": "Total /100",
@@ -328,8 +319,6 @@ TEXT = {
         "result": "Result",
         "pending": "Pending items",
         "comments": "Comments",
-        "campaign_check": "Campaign check",
-        "pending_campaigns": "Pending campaigns",
         "action_plan_title": "Improvement plan",
         "auditable_list": "Auditable parameter list",
         "exception_comments": "Exceptions/comments",
@@ -347,7 +336,6 @@ TEXT = {
         "improvement_areas": "Main improvement areas",
         "lowest_claims": "Lowest scoring claims",
         "conclusion": "Conclusion",
-        "campaign_info": "Campaigns: informative review only, with no impact on scoring.",
         "not_translated_note": "Note: manual observations are translated into English using the built-in audit glossary. Review uncommon wording before sending externally.",
     },
 }
@@ -454,6 +442,92 @@ def build_audit_file_basename(dealer: str, auditor: str, when: Optional[datetime
     return f"{sanitize_for_filename(dealer, 'Dealer')}_{when.strftime('%Y%m%d')}_{sanitize_for_filename(auditor, 'Auditor')}"
 
 
+
+
+def parse_amount_value(value: Any) -> float:
+    """Convierte importes escritos como 1.234,56 €, 1234.56 o 1234 a float."""
+    text = safe_str(value)
+    if not text:
+        return 0.0
+    text = text.replace("€", "").replace(" ", "")
+    text = re.sub(r"[^0-9,.-]", "", text)
+    if not text:
+        return 0.0
+    # Formato europeo: 1.234,56
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        text = text.replace(",", ".")
+    try:
+        return max(0.0, float(text))
+    except Exception:
+        return 0.0
+
+
+def format_amount_value(value: Any) -> str:
+    amount = parse_amount_value(value)
+    if amount <= 0:
+        return ""
+    return f"{amount:.2f}"
+
+
+def deduction_type_label(value: Any, language: str = "es") -> str:
+    key = safe_str(value) or "none"
+    t = TEXT[language]
+    return {
+        "none": t["no_deduction"],
+        "partial": t["partial_deduction"],
+        "total": t["full_deduction"],
+    }.get(key, key)
+
+
+def claim_deduction_amount(claim: Dict[str, Any]) -> float:
+    return parse_amount_value(claim.get("deduction_amount", 0))
+
+
+def claim_deduction_reason(claim: Dict[str, Any], language: str = "es") -> str:
+    return comment_for_language(claim.get("deduction_reason", ""), language)
+
+
+def has_deduction(claim: Dict[str, Any]) -> bool:
+    return safe_str(claim.get("deduction_type", "none")) != "none" or claim_deduction_amount(claim) > 0
+
+
+def mark_claim_as_not_warranty(claim: Dict[str, Any]) -> None:
+    """Marca la claim como no garantía: todos los apartados puntuables a 0 y deducción total."""
+    for check in ALL_SCORING_CHECKS:
+        evaluation = claim.setdefault("evaluations", {}).setdefault(check.key, new_evaluation(check))
+        evaluation["option_key"] = "nok"
+        evaluation["status"] = "NOK"
+        evaluation["points"] = 0
+        evaluation["max_points"] = check.max_points
+        if not safe_str(evaluation.get("comment", "")):
+            evaluation["comment"] = "No corresponde a una reparación cubierta por garantía."
+
+    claim["deduction_type"] = "total"
+    amount = parse_amount_value(claim.get("amount", ""))
+    claim["deduction_amount"] = amount
+    claim["deduction_reason"] = "No corresponde a una reparación cubierta por garantía. Deducción del importe completo de la claim."
+    claim["general_comment"] = build_general_comment_from_observations(claim, include_campaigns=False, language="es") or claim["deduction_reason"]
+
+
+def mark_claim_as_not_warranty_callback(claim_key: str) -> None:
+    claim = st.session_state.claims.get(claim_key)
+    if not claim:
+        return
+    mark_claim_as_not_warranty(claim)
+    # Sincronizar widgets de selectbox/text_area antes del siguiente rerun.
+    for check in ALL_SCORING_CHECKS:
+        st.session_state[f"select_{claim_key}_{check.key}"] = option_display(option_from_key(check, "nok"), "es")
+        st.session_state[f"comment_{claim_key}_{check.key}"] = claim["evaluations"][check.key].get("comment", "")
+    st.session_state[f"deduction_type_{claim_key}"] = "total"
+    st.session_state[f"deduction_amount_{claim_key}"] = parse_amount_value(claim.get("amount", ""))
+    st.session_state[f"deduction_reason_{claim_key}"] = claim.get("deduction_reason", "")
+    st.session_state[f"general_comment_{claim_key}"] = claim.get("general_comment", "")
+
 def get_dealer_options(current_value: str = "") -> List[str]:
     current_value = safe_str(current_value)
     options = [""] + ACTIVE_DEALERS.copy()
@@ -487,7 +561,7 @@ def block_label(block_key: str, language: str = "es") -> str:
         return TEXT[language]["document_section"]
     if block_key == "old_parts":
         return TEXT[language]["old_parts_section"]
-    return "Campañas informativas" if language == "es" else "Informative campaigns"
+    return safe_str(block_key)
 
 
 def option_from_label(check: AuditCheck, label: str) -> AuditOption:
@@ -570,6 +644,42 @@ def result_label(points: Any, language: str = "es") -> str:
 # Glosario sencillo para que los exports EN no arrastren comentarios en español.
 # No usa IA ni servicios externos: es determinista, rápido y seguro para Streamlit Cloud.
 _COMMENT_TRANSLATION_PATTERNS: List[Tuple[str, str]] = [
+    # Etiquetas y frases completas antes de sustituir palabras sueltas.
+    (r"Pedido piezas / albarán", "Parts order / delivery note"),
+    (r"Pedido piezas / albaran", "Parts order / delivery note"),
+    (r"Pieza causa correcta", "Correct causal part"),
+    (r"Fecha/hora envío Claim", "Claim submission and repair date"),
+    (r"Fecha/hora envio Claim", "Claim submission and repair date"),
+    (r"Gestión piezas viejas", "Old parts management"),
+    (r"Gestion piezas viejas", "Old parts management"),
+    (r"Etiquetado pieza vieja", "Old part labelling"),
+    (r"Info tipo fallo pieza causa", "Causal part failure information"),
+    (r"Destrucción pieza vieja", "Old part destruction"),
+    (r"Destruccion pieza vieja", "Old part destruction"),
+    (r"Certificado destrucción piezas viejas", "Old parts destruction certificate"),
+    (r"Certificado destruccion piezas viejas", "Old parts destruction certificate"),
+    (r"\bpedido piezas / albarán\b", "parts order / delivery note"),
+    (r"\bpedido piezas / albaran\b", "parts order / delivery note"),
+    (r"\bpieza causa correcta\b", "correct causal part"),
+    (r"\bfecha/hora envío claim\b", "claim submission and repair date"),
+    (r"\bfecha/hora envio claim\b", "claim submission and repair date"),
+    (r"\bgestión piezas viejas\b", "old parts management"),
+    (r"\bgestion piezas viejas\b", "old parts management"),
+    (r"\betiquetado pieza vieja\b", "old part labelling"),
+    (r"\binfo tipo fallo pieza causa\b", "causal part failure information"),
+    (r"\bdestrucción pieza vieja\b", "old part destruction"),
+    (r"\bdestruccion pieza vieja\b", "old part destruction"),
+    (r"\bcertificado destrucción piezas viejas\b", "old parts destruction certificate"),
+    (r"\bcertificado destruccion piezas viejas\b", "old parts destruction certificate"),
+    (r"\bmano de obra\b", "labour"),
+    (r"\bmaterial auxiliar\b", "auxiliary material"),
+    (r"\bevidencias\b", "evidence"),
+    (r"\bpieza causa\b", "causal part"),
+    # Frases completas antes de sustituir palabras sueltas.
+    (r"\bno corresponde a una reparación cubierta por garantía\b", "this does not correspond to a repair covered by warranty"),
+    (r"\bno corresponde a una reparacion cubierta por garantia\b", "this does not correspond to a repair covered by warranty"),
+    (r"\bdeducción del importe completo de la claim\b", "full deduction of the claim amount"),
+    (r"\bdeduccion del importe completo de la claim\b", "full deduction of the claim amount"),
     (r"\bno se adjuntan\b", "are not attached"),
     (r"\bno se adjunta\b", "is not attached"),
     (r"\bno adjuntan\b", "do not attach"),
@@ -583,6 +693,8 @@ _COMMENT_TRANSLATION_PATTERNS: List[Tuple[str, str]] = [
     (r"\bno aplica\b", "not applicable"),
     (r"\bincompleto\b", "incomplete"),
     (r"\bincompleta\b", "incomplete"),
+    (r"\bparcial\b", "partial"),
+    (r"\btotal\b", "full"),
     (r"\bincorrecto\b", "incorrect"),
     (r"\bincorrecta\b", "incorrect"),
     (r"\bcorrecto\b", "correct"),
@@ -634,6 +746,13 @@ _COMMENT_TRANSLATION_PATTERNS: List[Tuple[str, str]] = [
     (r"\bcostes adicionales\b", "additional costs"),
     (r"\bcoste\b", "cost"),
     (r"\bimporte\b", "amount"),
+    (r"\bdeduccion\b", "deduction"),
+    (r"\bdeducción\b", "deduction"),
+    (r"\bdeducir\b", "deduct"),
+    (r"\bno es garantia\b", "not covered by warranty"),
+    (r"\bno es garantía\b", "not covered by warranty"),
+    (r"\bno corresponde a una reparacion cubierta por garantia\b", "does not correspond to a repair covered by warranty"),
+    (r"\bno corresponde a una reparación cubierta por garantía\b", "does not correspond to a repair covered by warranty"),
     (r"\btiempo adicional\b", "additional time"),
     (r"\btiempo extra\b", "extra time"),
     (r"\bbaremo\b", "standard time"),
@@ -747,6 +866,14 @@ def translate_comment_to_english(text: Any) -> str:
             "falta firma del cliente.": "Missing customer signature.",
             "no se adjunta la or": "The repair order is not attached.",
             "no se adjunta la or.": "The repair order is not attached.",
+            "no es garantia": "Not covered by warranty.",
+            "no es garantía": "Not covered by warranty.",
+            "deduccion parcial": "Partial deduction.",
+            "deducción parcial": "Partial deduction.",
+            "deduccion total": "Full deduction.",
+            "deducción total": "Full deduction.",
+            "no corresponde a una reparacion cubierta por garantia": "This does not correspond to a repair covered by warranty.",
+            "no corresponde a una reparación cubierta por garantía": "This does not correspond to a repair covered by warranty.",
         }
         normalized_line = normalize_text(line)
         if normalized_line in exact_map:
@@ -803,7 +930,19 @@ def pending_items_for_language(claim: Dict[str, Any], language: str = "es") -> L
 
 
 def new_evaluation(check: AuditCheck, prefill_points: Any = None) -> Dict[str, Any]:
-    option = option_from_points(check, prefill_points)
+    """
+    Crea la evaluación inicial de un apartado.
+
+    Para agilizar la auditoría, por defecto se considera OK / puntuación máxima.
+    El auditor solo tiene que tocar los apartados con desviación.
+
+    Si llega una puntuación existente desde una plantilla/JSON, se respeta.
+    """
+    if prefill_points is None or safe_str(prefill_points) == "":
+        option = option_from_key(check, "ok")
+    else:
+        option = option_from_points(check, prefill_points)
+
     return {
         "option_key": option.key,
         "status": option.status,
@@ -826,6 +965,9 @@ def empty_claim_record(claim_no: str = "", local_claim_no: str = "", hq_claim_no
         "vin": "",
         "model": "",
         "amount": "",
+        "deduction_type": "none",
+        "deduction_amount": 0.0,
+        "deduction_reason": "",
         "repair_date": "",
         "submission_date": "",
         "general_comment": "",
@@ -908,7 +1050,8 @@ def normalize_loaded_evaluation(check: AuditCheck, raw: Any) -> Dict[str, Any]:
     elif points is not None:
         option = option_from_points(check, points)
     else:
-        option = PENDING
+        # Si no hay evaluación guardada, tratamos el apartado como OK por defecto.
+        option = option_from_key(check, "ok")
     # Mantener pendiente si venía explícitamente pendiente.
     final_points = None if status.lower().startswith("pend") and points is None else option.points
     return {
@@ -929,7 +1072,7 @@ def normalize_loaded_claim(raw_claim: Any, fallback: str = "") -> Optional[Dict[
     if not any([claim_no, local, hq]):
         return None
     claim = empty_claim_record(claim_no, local, hq)
-    for field in ["dealer", "vin", "model", "amount", "repair_date", "submission_date", "general_comment", "internal_comment"]:
+    for field in ["dealer", "vin", "model", "amount", "deduction_type", "deduction_amount", "deduction_reason", "repair_date", "submission_date", "general_comment", "internal_comment"]:
         claim[field] = safe_str(raw_claim.get(field, claim.get(field, "")))
     raw_evaluations = raw_claim.get("evaluations", {})
     if isinstance(raw_evaluations, dict):
@@ -1041,14 +1184,6 @@ def read_claims_from_uploaded_excel(uploaded_file) -> Dict[str, Dict[str, Any]]:
                 comment = safe_str(doc_df.iloc[row_idx, 15])
                 if comment:
                     claim["general_comment"] = comment
-            if doc_df.shape[1] > 11:
-                campaign_value = safe_str(doc_df.iloc[row_idx, 11])
-                if campaign_value:
-                    claim["evaluations"]["info_campaign_check"]["comment"] = campaign_value
-            if doc_df.shape[1] > 12:
-                campaign_pending = safe_str(doc_df.iloc[row_idx, 12])
-                if campaign_pending:
-                    claim["evaluations"]["info_pending_campaigns"]["comment"] = campaign_pending
 
     if "Claim old parts checklist II" in xls.sheet_names:
         old_df = pd.read_excel(uploaded_file, sheet_name="Claim old parts checklist II", header=None)
@@ -1125,7 +1260,8 @@ def evaluation_comment(claim: Dict[str, Any], check: AuditCheck) -> str:
 
 
 def build_general_comment_from_observations(claim: Dict[str, Any], include_campaigns: bool = True, language: str = "es") -> str:
-    checks = ALL_CHECKS if include_campaigns else ALL_SCORING_CHECKS
+    # Campañas eliminadas del flujo: el comentario general se genera solo desde apartados auditables.
+    checks = ALL_SCORING_CHECKS
     lines = []
     for check in checks:
         comment = comment_for_language(evaluation_comment(claim, check), language)
@@ -1176,6 +1312,44 @@ def build_action_plan_rows(claims: Dict[str, Dict[str, Any]], language: str = "e
                 "lost_points": total_lost,
                 "affected_claims": affected_claims,
             })
+    # Ajustes económicos / deducciones: no forman parte de la puntuación, pero sí del plan de acción.
+    deduction_entries = []
+    total_deduction = 0.0
+    affected_deductions = 0
+    for claim in claims.values():
+        dtype = safe_str(claim.get("deduction_type", "none")) or "none"
+        amount = claim_deduction_amount(claim)
+        reason = claim_deduction_reason(claim, language)
+        if dtype != "none" or amount > 0 or reason:
+            affected_deductions += 1
+            total_deduction += amount
+            claim_id = claim_identifier(claim, language)
+            label = deduction_type_label(dtype, language)
+            amount_text = f"{amount:.2f}" if amount > 0 else ("importe completo" if language == "es" and dtype == "total" else "full amount" if dtype == "total" else "0")
+            if reason:
+                deduction_entries.append(f"{claim_id}: {label} - {amount_text}. {reason}")
+            else:
+                deduction_entries.append(f"{claim_id}: {label} - {amount_text}.")
+    if affected_deductions:
+        if language == "es":
+            exception = f"{affected_deductions} claim(s) con deducción registrada. Importe deducido informado: {total_deduction:.2f}."
+            countermeasure = "Revisar el importe reclamado y comunicar claramente al dealer la deducción aplicada y su motivo."
+            parameter = "Deducción / ajuste económico"
+            block = "Coste de garantía"
+        else:
+            exception = f"{affected_deductions} claim(s) with registered deduction. Reported deducted amount: {total_deduction:.2f}."
+            countermeasure = "Review the claimed amount and clearly communicate the applied deduction and its reason to the dealer."
+            parameter = "Deduction / financial adjustment"
+            block = "Warranty cost"
+        rows.append({
+            "block": block,
+            "parameter": parameter,
+            "exception": exception,
+            "observations": "\n".join(deduction_entries),
+            "countermeasure": countermeasure,
+            "lost_points": 0,
+            "affected_claims": affected_deductions,
+        })
     return rows
 
 
@@ -1183,14 +1357,14 @@ def build_action_plan_rows(claims: Dict[str, Dict[str, Any]], language: str = "e
 # CARGA RÁPIDA DE CLAIMS DESDE TABLA EDITABLE
 # =============================================================================
 
-CLAIM_PASTE_COLUMNS = ["Claim HQ / IDMS", "Claim España / Dealer"]
+CLAIM_PASTE_COLUMNS = ["Claim HQ / IDMS", "Claim España / Dealer", "Dealer"]
 
 
 def blank_claim_paste_dataframe(rows: int = 12) -> pd.DataFrame:
     """Crea una tabla vacía para pegar claims desde Excel."""
     return pd.DataFrame(
         [
-            {"Claim HQ / IDMS": "", "Claim España / Dealer": ""}
+            {"Claim HQ / IDMS": "", "Claim España / Dealer": "", "Dealer": ""}
             for _ in range(rows)
         ]
     )
@@ -1203,8 +1377,10 @@ def read_claims_from_pasted_table(table_df: pd.DataFrame) -> Dict[str, Dict[str,
     Formato esperado:
     - Columna 1: Claim HQ / IDMS (2810..., TAC..., etc.)
     - Columna 2: Claim España / Dealer (CO...)
+    - Columna 3: Dealer / instalación
 
     Si una fila solo trae un identificador, se intenta inferir si es local o HQ.
+    Si Dealer viene vacío, se aplicará el dealer general de la barra lateral.
     """
     claims: Dict[str, Dict[str, Any]] = {}
 
@@ -1214,6 +1390,7 @@ def read_claims_from_pasted_table(table_df: pd.DataFrame) -> Dict[str, Dict[str,
     for _, row in table_df.iterrows():
         local_value = safe_str(row.get("Claim España / Dealer", ""))
         hq_value = safe_str(row.get("Claim HQ / IDMS", ""))
+        dealer_value = safe_str(row.get("Dealer", ""))
 
         # Si el usuario pega un único identificador en la primera columna, inferimos.
         if local_value and not hq_value:
@@ -1239,6 +1416,8 @@ def read_claims_from_pasted_table(table_df: pd.DataFrame) -> Dict[str, Dict[str,
         claim["local_claim_no"] = local_value
         claim["hq_claim_no"] = hq_value
         claim["claim_no"] = local_value or hq_value
+        if dealer_value:
+            claim["dealer"] = dealer_value
 
     return claims
 
@@ -1260,6 +1439,9 @@ def build_summary_dataframe(claims: Dict[str, Dict[str, Any]], language: str = "
             t["vin"]: claim.get("vin", ""),
             t["model"]: claim.get("model", ""),
             t["amount"]: claim.get("amount", ""),
+            t["deduction_type"]: deduction_type_label(claim.get("deduction_type", "none"), language),
+            t["deduction_amount"]: claim_deduction_amount(claim),
+            t["deduction_reason"]: claim_deduction_reason(claim, language),
             t["doc_score"]: score["doc_points"],
             t["old_score"]: score["old_points"],
             t["total_score"]: score["total_points"],
@@ -1286,6 +1468,9 @@ def build_detail_dataframe(claims: Dict[str, Dict[str, Any]], language: str = "e
                 t["vin"]: claim.get("vin", ""),
                 t["model"]: claim.get("model", ""),
                 t["amount"]: claim.get("amount", ""),
+                t["deduction_type"]: deduction_type_label(claim.get("deduction_type", "none"), language),
+                t["deduction_amount"]: claim_deduction_amount(claim),
+                t["deduction_reason"]: claim_deduction_reason(claim, language),
                 "Bloque" if language == "es" else "Section": block_label(check.block_key, language),
                 "Apartado" if language == "es" else "Item": check_label(check, language),
                 "Estado" if language == "es" else "Status": status_for_language(evaluation.get("status", ""), language),
@@ -1314,6 +1499,7 @@ def export_analytical_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, 
         {"Campo" if language == "es" else "Field": "Auditor", "Valor" if language == "es" else "Value": auditor},
         {"Campo" if language == "es" else "Field": "Fecha exportación" if language == "es" else "Export date", "Valor" if language == "es" else "Value": datetime.now().strftime("%Y-%m-%d %H:%M")},
         {"Campo" if language == "es" else "Field": "Resultado", "Valor" if language == "es" else "Value": f"{audit_score['success_percent']:.1f}% ({audit_score['total_points']}/{audit_score['max_points']})"},
+        {"Campo" if language == "es" else "Field": "Deducción total registrada" if language == "es" else "Total registered deduction", "Valor" if language == "es" else "Value": f"{sum(claim_deduction_amount(c) for c in claims.values()):.2f}"},
     ])
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
@@ -1404,13 +1590,14 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
         # Scorecard / Boletín
         # ------------------------------------------------------------------
         grade_ws = workbook.add_worksheet(t["scorecard"][:31])
-        grade_ws.merge_range("A1:M1", f"{t['scorecard']} - Warranty Audit", fmt_title)
+        grade_ws.merge_range("A1:P1", f"{t['scorecard']} - Warranty Audit", fmt_title)
         grade_headers = [
             t["claim_no"], t["other_id"], t["dealer"], t["vin"], t["model"], t["amount"],
+            t["deduction_type"], t["deduction_amount"], t["deduction_reason"],
             t["doc_score"], t["old_score"], t["total_score"], t["success"], t["result"], t["pending"], t["comments"],
         ]
         write_headers(grade_ws, 2, grade_headers)
-        set_widths(grade_ws, [20, 20, 24, 22, 18, 14, 18, 18, 14, 14, 16, 45, 70])
+        set_widths(grade_ws, [20, 20, 24, 22, 18, 14, 18, 14, 45, 18, 18, 14, 14, 16, 45, 70])
         grade_ws.freeze_panes(3, 0)
         for idx, claim in enumerate(claims.values(), start=3):
             score = calculate_claim_score(claim)
@@ -1421,6 +1608,9 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
                 claim.get("vin", ""),
                 claim.get("model", ""),
                 claim.get("amount", ""),
+                deduction_type_label(claim.get("deduction_type", "none"), language),
+                claim_deduction_amount(claim),
+                claim_deduction_reason(claim, language),
                 score["doc_points"],
                 score["old_points"],
                 score["total_points"],
@@ -1430,14 +1620,15 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
                 comment_for_language(claim.get("general_comment", ""), language),
             ]
             write_row(grade_ws, idx, row_values, fmt_body)
-            grade_ws.write_number(idx, 6, score["doc_points"], fmt_int)
-            grade_ws.write_number(idx, 7, score["old_points"], fmt_int)
-            grade_ws.write_number(idx, 8, score["total_points"], result_format(score["total_points"]))
-            grade_ws.write_number(idx, 9, score["success_percent"] / 100, fmt_percent)
-            grade_ws.write(idx, 10, result_label(score["total_points"], language), result_format(score["total_points"]))
+            grade_ws.write_number(idx, 7, claim_deduction_amount(claim), fmt_int)
+            grade_ws.write_number(idx, 9, score["doc_points"], fmt_int)
+            grade_ws.write_number(idx, 10, score["old_points"], fmt_int)
+            grade_ws.write_number(idx, 11, score["total_points"], result_format(score["total_points"]))
+            grade_ws.write_number(idx, 12, score["success_percent"] / 100, fmt_percent)
+            grade_ws.write(idx, 13, result_label(score["total_points"], language), result_format(score["total_points"]))
         if claims:
             grade_ws.autofilter(2, 0, len(claims) + 2, len(grade_headers) - 1)
-            grade_ws.conditional_format(3, 9, len(claims) + 2, 9, {"type": "3_color_scale", "min_color": "#F4CCCC", "mid_color": "#FFF2CC", "max_color": "#E2F0D9"})
+            grade_ws.conditional_format(3, 12, len(claims) + 2, 12, {"type": "3_color_scale", "min_color": "#F4CCCC", "mid_color": "#FFF2CC", "max_color": "#E2F0D9"})
 
         # ------------------------------------------------------------------
         # Content
@@ -1451,8 +1642,8 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             ["Export date" if language == "en" else "Fecha exportación", datetime.now().strftime("%Y-%m-%d %H:%M")],
             ["Scoring rule" if language == "en" else "Regla de puntuación", "Claim document checklist I = 58 / Claim old parts checklist II = 42 / Total = 100"],
             ["N/A rule" if language == "en" else "Regla N/A", "No aplica = maximum score" if language == "en" else "No aplica = puntuación máxima del apartado"],
-            ["Campaigns" if language == "en" else "Campañas", t["campaign_info"]],
             ["Manual observations" if language == "en" else "Observaciones manuales", t["not_translated_note"]],
+            ["Deduction" if language == "en" else "Deducción", "Financial deduction is informative and does not modify the audit score unless the claim is marked as not covered by warranty." if language == "en" else "La deducción económica es informativa y no modifica la nota salvo que se marque la claim como no cubierta por garantía."],
         ]
         set_widths(content_ws, [28, 90, 18, 18])
         for row_idx, row in enumerate(content_rows, start=2):
@@ -1470,29 +1661,31 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
         doc_headers = [
             "No.", t["claim_no"], t["other_id"],
             *[check_label(check, language) for check in DOCUMENT_CHECKS],
-            t["campaign_check"], t["pending_campaigns"], t["doc_score"], "Document %" if language == "en" else "Resultado documentación %", t["comments"],
+            t["doc_score"], "Document %" if language == "en" else "Resultado documentación %",
+            t["deduction_amount"], t["deduction_reason"], t["comments"],
         ]
         write_headers(doc_ws, 0, doc_headers)
-        set_widths(doc_ws, [8, 20, 20, 12, 20, 18, 12, 16, 12, 18, 22, 12, 24, 24, 18, 18, 60])
+        set_widths(doc_ws, [8, 20, 20, 12, 20, 18, 12, 16, 12, 18, 22, 12, 18, 18, 14, 45, 60])
         doc_ws.freeze_panes(1, 3)
         for idx, claim in enumerate(claims.values(), start=1):
             excel_row = idx + 1
             row = [idx, claim_identifier(claim, language), claim_other_identifier(claim, language)]
             row.extend(evaluation_value(claim, check) for check in DOCUMENT_CHECKS)
-            row.append(comment_for_language(evaluation_comment(claim, CAMPAIGN_CHECKS[0]), language))
-            row.append(comment_for_language(evaluation_comment(claim, CAMPAIGN_CHECKS[1]), language))
             row.append(f"=SUM(D{excel_row}:L{excel_row})")
-            row.append(f"=N{excel_row}/{MAX_DOCUMENT_POINTS}")
+            row.append(f"=M{excel_row}/{MAX_DOCUMENT_POINTS}")
+            row.append(claim_deduction_amount(claim))
+            row.append(claim_deduction_reason(claim, language))
             row.append(comment_for_language(claim.get("general_comment", ""), language))
             write_row(doc_ws, idx, row, fmt_body)
             for col_idx in range(3, 12):
                 if isinstance(row[col_idx], (int, float)):
                     doc_ws.write_number(idx, col_idx, row[col_idx], fmt_int)
-            doc_ws.write_formula(idx, 14, f"=SUM(D{excel_row}:L{excel_row})", fmt_int)
-            doc_ws.write_formula(idx, 15, f"=O{excel_row}/{MAX_DOCUMENT_POINTS}", fmt_formula_percent)
+            doc_ws.write_formula(idx, 12, f"=SUM(D{excel_row}:L{excel_row})", fmt_int)
+            doc_ws.write_formula(idx, 13, f"=M{excel_row}/{MAX_DOCUMENT_POINTS}", fmt_formula_percent)
+            doc_ws.write_number(idx, 14, claim_deduction_amount(claim), fmt_int)
         if claims:
             doc_ws.autofilter(0, 0, len(claims), len(doc_headers) - 1)
-            doc_ws.conditional_format(1, 15, len(claims), 15, {"type": "3_color_scale", "min_color": "#F4CCCC", "mid_color": "#FFF2CC", "max_color": "#E2F0D9"})
+            doc_ws.conditional_format(1, 13, len(claims), 13, {"type": "3_color_scale", "min_color": "#F4CCCC", "mid_color": "#FFF2CC", "max_color": "#E2F0D9"})
 
         # ------------------------------------------------------------------
         # Claim old parts checklist II
@@ -1501,10 +1694,10 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
         old_headers = [
             "No.", t["claim_no"], t["other_id"],
             *[check_label(check, language) for check in OLD_PARTS_CHECKS],
-            t["old_score"], "Old parts %" if language == "en" else "Resultado piezas viejas %", t["comments"],
+            t["old_score"], "Old parts %" if language == "en" else "Resultado piezas viejas %", t["deduction_amount"], t["deduction_reason"], t["comments"],
         ]
         write_headers(old_ws, 0, old_headers)
-        set_widths(old_ws, [8, 20, 20, 22, 22, 18, 28, 24, 30, 18, 18, 65])
+        set_widths(old_ws, [8, 20, 20, 22, 22, 18, 28, 24, 30, 18, 18, 14, 45, 65])
         old_ws.freeze_panes(1, 3)
         for idx, claim in enumerate(claims.values(), start=1):
             excel_row = idx + 1
@@ -1512,6 +1705,8 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             row.extend(evaluation_value(claim, check) for check in OLD_PARTS_CHECKS)
             row.append(f"=SUM(D{excel_row}:I{excel_row})")
             row.append(f"=J{excel_row}/{MAX_OLD_PARTS_POINTS}")
+            row.append(claim_deduction_amount(claim))
+            row.append(claim_deduction_reason(claim, language))
             row.append(comment_for_language(claim.get("general_comment", ""), language))
             write_row(old_ws, idx, row, fmt_body)
             for col_idx in range(3, 9):
@@ -1519,6 +1714,7 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
                     old_ws.write_number(idx, col_idx, row[col_idx], fmt_int)
             old_ws.write_formula(idx, 9, f"=SUM(D{excel_row}:I{excel_row})", fmt_int)
             old_ws.write_formula(idx, 10, f"=J{excel_row}/{MAX_OLD_PARTS_POINTS}", fmt_formula_percent)
+            old_ws.write_number(idx, 11, claim_deduction_amount(claim), fmt_int)
         if claims:
             old_ws.autofilter(0, 0, len(claims), len(old_headers) - 1)
             old_ws.conditional_format(1, 10, len(claims), 10, {"type": "3_color_scale", "min_color": "#F4CCCC", "mid_color": "#FFF2CC", "max_color": "#E2F0D9"})
@@ -1604,7 +1800,6 @@ def generate_text_report(claims: Dict[str, Dict[str, Any]], audit_name: str, dea
     else:
         lines.append(f"- Claim documentation: {audit_score['doc_points']}/{audit_score['claims'] * MAX_DOCUMENT_POINTS} points.")
         lines.append(f"- Old parts: {audit_score['old_points']}/{audit_score['claims'] * MAX_OLD_PARTS_POINTS} points.")
-    lines.append(f"- {t['campaign_info']}")
     lines.append("")
     lines.append(t["improvement_areas"])
     if not action_rows:
@@ -1689,9 +1884,21 @@ def sync_audit_section_from_radio(section_names: tuple) -> None:
         set_audit_section_index(0, section_names)
 
 
-def set_selected_claim_and_reset_section(claim_key: str, section_names: tuple) -> None:
+def set_selected_claim_keep_section(claim_key: str, section_names: tuple) -> None:
+    """
+    Cambia de claim manteniendo el apartado activo.
+    Esto encaja con el flujo real de auditoría:
+    primero se revisa documentación para todas las claims y después piezas viejas en almacén.
+    """
     st.session_state.selected_claim = claim_key
-    set_audit_section_index(0, section_names)
+    # No tocamos audit_section_index: el siguiente rerun mantiene I. Documentación,
+    # II. Piezas viejas, comentarios o informe según donde estuvieras.
+
+
+def set_selected_claim_and_section(claim_key: str, section_index: int, section_names: tuple) -> None:
+    """Cambia de claim y fuerza un apartado concreto."""
+    st.session_state.selected_claim = claim_key
+    set_audit_section_index(section_index, section_names)
 
 
 def apply_default_dealer_to_blank_claims(claims: Dict[str, Dict[str, Any]], dealer: str) -> None:
@@ -1756,11 +1963,65 @@ def render_claim_quick_card(claim: Dict[str, Any], default_dealer: str = ""):
         st.rerun()
 
 
+def render_deduction_editor(claim: Dict[str, Any]):
+    claim_key = make_claim_key(claim.get("local_claim_no"), claim.get("hq_claim_no"), claim.get("claim_no"))
+    with st.expander("Deducción / ajuste económico", expanded=has_deduction(claim)):
+        st.caption(
+            "La deducción no cambia la nota de auditoría salvo que uses el botón 'No es garantía'. "
+            "Para deducciones parciales, informa solo el importe y el motivo."
+        )
+        st.button(
+            "🚫 No es garantía → 0/100 y deducción total",
+            type="secondary",
+            use_container_width=True,
+            on_click=mark_claim_as_not_warranty_callback,
+            args=(claim_key,),
+            key=f"not_warranty_{claim_key}",
+        )
+
+        type_options = ["none", "partial", "total"]
+        type_key = f"deduction_type_{claim_key}"
+        if type_key not in st.session_state or st.session_state[type_key] not in type_options:
+            st.session_state[type_key] = safe_str(claim.get("deduction_type", "none")) or "none"
+        selected_type = st.selectbox(
+            "Tipo de deducción",
+            type_options,
+            key=type_key,
+            format_func=lambda value: deduction_type_label(value, "es"),
+        )
+        claim["deduction_type"] = selected_type
+
+        amount_key = f"deduction_amount_{claim_key}"
+        if amount_key not in st.session_state:
+            st.session_state[amount_key] = claim_deduction_amount(claim)
+        amount = st.number_input(
+            "Importe a deducir",
+            min_value=0.0,
+            step=1.0,
+            format="%.2f",
+            key=amount_key,
+        )
+        claim["deduction_amount"] = float(amount or 0)
+
+        reason_key = f"deduction_reason_{claim_key}"
+        if reason_key not in st.session_state:
+            st.session_state[reason_key] = safe_str(claim.get("deduction_reason", ""))
+        reason = st.text_area("Motivo / comentario de deducción", key=reason_key, height=90)
+        claim["deduction_reason"] = safe_str(reason)
+
+        if selected_type == "none" and claim_deduction_amount(claim) > 0:
+            st.warning("Hay importe de deducción informado, pero el tipo está en 'Sin deducción'.")
+        elif selected_type == "partial" and claim_deduction_amount(claim) <= 0:
+            st.info("Para deducción parcial, informa el importe a deducir.")
+        elif selected_type == "total" and claim_deduction_amount(claim) <= 0:
+            st.info("Deducción total seleccionada. Si conoces el importe de la claim, informa el importe a deducir.")
+
+
 def render_check_editor(claim: Dict[str, Any], checks: List[AuditCheck]):
     claim_key = make_claim_key(claim.get("local_claim_no"), claim.get("hq_claim_no"), claim.get("claim_no"))
     for check in checks:
-        evaluation = claim["evaluations"][check.key]
-        current_option = option_from_key(check, safe_str(evaluation.get("option_key", "pending")))
+        evaluation = claim.setdefault("evaluations", {}).setdefault(check.key, new_evaluation(check))
+        current_option = option_from_key(check, safe_str(evaluation.get("option_key", "ok")))
         labels = option_labels(check, "es")
         current_label = option_display(current_option, "es")
         current_index = labels.index(current_label) if current_label in labels else 0
@@ -1787,11 +2048,6 @@ def render_check_editor(claim: Dict[str, Any], checks: List[AuditCheck]):
                 evaluation["comment"] = st.text_area("Observación del apartado", key=comment_key, height=85)
 
 
-def render_campaign_editor(claim: Dict[str, Any]):
-    st.info("Las campañas son orientativas/informativas. No suman ni restan en el porcentaje de éxito.")
-    render_check_editor(claim, CAMPAIGN_CHECKS)
-
-
 def render_comments_editor(claim: Dict[str, Any]):
     st.caption("El comentario general se genera usando solo las observaciones que hayas escrito en cada apartado. No inventa nada por la nota.")
     claim_key = make_claim_key(claim.get("local_claim_no"), claim.get("hq_claim_no"), claim.get("claim_no"))
@@ -1799,7 +2055,7 @@ def render_comments_editor(claim: Dict[str, Any]):
     if general_key not in st.session_state:
         st.session_state[general_key] = claim.get("general_comment", "")
     if st.button("Generar desde observaciones de apartados", key=f"generate_comment_{claim_key}"):
-        generated = build_general_comment_from_observations(claim, include_campaigns=True, language="es")
+        generated = build_general_comment_from_observations(claim, include_campaigns=False, language="es")
         if generated:
             claim["general_comment"] = generated
             st.session_state[general_key] = generated
@@ -1825,14 +2081,14 @@ def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, de
 def render_claim_paste_loader(dealer: str, show_title: bool = True):
     """
     Muestra una tabla editable tipo Excel para pegar claims directamente en la zona principal.
-    Solo requiere dos identificadores: claim española/dealer y claim HQ/IDMS.
+    Permite pegar claim HQ, claim española y dealer/instalación.
     """
     if show_title:
         st.subheader("Pegar lista de claims")
 
     st.caption(
-        "Copia dos columnas desde Excel y pégalas aquí: "
-        "Claim HQ/IDMS y Claim España/Dealer. Con esos dos identificadores basta."
+        "Copia tres columnas desde Excel y pégalas aquí: "
+        "Claim HQ/IDMS, Claim España/Dealer y Dealer/instalación."
     )
 
     editor_key = f"claims_paste_editor_{st.session_state.claim_paste_editor_version}"
@@ -1850,6 +2106,10 @@ def render_claim_paste_loader(dealer: str, show_title: bool = True):
             "Claim España / Dealer": st.column_config.TextColumn(
                 "Claim España / Dealer",
                 help="Identificador local para boletín al dealer, por ejemplo CO2026...",
+            ),
+            "Dealer": st.column_config.TextColumn(
+                "Dealer",
+                help="Dealer o instalación concreta. Si lo dejas vacío, se usará el dealer general de la barra lateral.",
             ),
         },
     )
@@ -1879,7 +2139,7 @@ def render_claim_paste_loader(dealer: str, show_title: bool = True):
                         st.session_state.claims = loaded_claims
 
                     st.session_state.selected_claim = next(iter(loaded_claims.keys()))
-                    st.success(f"Cargadas {len(loaded_claims)} claims desde la tabla.")
+                    st.success(f"Cargadas {len(loaded_claims)} claims desde la tabla, con dealer por instalación si venía informado.")
                     st.rerun()
             except Exception as exc:
                 st.error(f"No se pudo cargar la tabla: {exc}")
@@ -1890,7 +2150,7 @@ def render_claim_paste_loader(dealer: str, show_title: bool = True):
             st.rerun()
 
     with claim_table_cols[2]:
-        st.caption("Tip: puedes pegar directamente desde Excel con Ctrl+V sobre la primera celda.")
+        st.caption("Tip: pega tres columnas desde Excel: HQ/IDMS · España/Dealer · Dealer/instalación.")
 
 def main():
     st.set_page_config(page_title="Warranty Audit Assistant", page_icon="🧾", layout="wide")
@@ -1905,7 +2165,7 @@ def main():
         dealer_options = get_dealer_options(st.session_state.audit_dealer)
         if st.session_state.audit_dealer not in dealer_options:
             dealer_options.insert(1, st.session_state.audit_dealer)
-        st.session_state.audit_dealer = st.selectbox("Dealer", dealer_options, index=dealer_options.index(st.session_state.audit_dealer) if st.session_state.audit_dealer in dealer_options else 0, format_func=format_dealer_option)
+        st.session_state.audit_dealer = st.selectbox("Dealer general / grupo", dealer_options, index=dealer_options.index(st.session_state.audit_dealer) if st.session_state.audit_dealer in dealer_options else 0, format_func=format_dealer_option)
         st.session_state.audit_auditor = st.text_input("Auditor", value=st.session_state.audit_auditor)
         dealer = safe_str(st.session_state.audit_dealer)
         auditor = safe_str(st.session_state.audit_auditor)
@@ -1933,13 +2193,13 @@ def main():
         st.write(f"Documentación: **{MAX_DOCUMENT_POINTS}**")
         st.write(f"Piezas viejas: **{MAX_OLD_PARTS_POINTS}**")
         st.write(f"Total: **{MAX_TOTAL_POINTS}**")
-        st.caption("No aplica = máximo del apartado. Campañas = informativo.")
+        st.caption("Por defecto: OK / máximo. No aplica = máximo del apartado.")
 
     claims: Dict[str, Dict[str, Any]] = st.session_state.claims
     apply_default_dealer_to_blank_claims(claims, safe_str(st.session_state.audit_dealer))
 
     if not claims:
-        st.info("Pega la lista de claims en la tabla de abajo para empezar.")
+        st.info("Pega la lista de claims, con dealer si aplica, en la tabla de abajo para empezar.")
         render_claim_paste_loader(dealer, show_title=True)
         st.stop()
 
@@ -1960,7 +2220,7 @@ def main():
     with left:
         st.subheader("Claims")
         summary_df = build_summary_dataframe(claims, "es")
-        compact_cols = [TEXT["es"]["claim_no"], TEXT["es"]["other_id"], TEXT["es"]["doc_score"], TEXT["es"]["old_score"], TEXT["es"]["total_score"], TEXT["es"]["result"]]
+        compact_cols = [TEXT["es"]["claim_no"], TEXT["es"]["other_id"], TEXT["es"]["dealer"], TEXT["es"]["deduction_amount"], TEXT["es"]["doc_score"], TEXT["es"]["old_score"], TEXT["es"]["total_score"], TEXT["es"]["result"]]
         st.dataframe(summary_df[[col for col in compact_cols if col in summary_df.columns]], use_container_width=True, hide_index=True)
 
         claim_options = list(claims.keys())
@@ -1980,6 +2240,7 @@ def main():
         score = calculate_claim_score(claim)
         st.subheader(f"Revisión claim {claim_identifier(claim, 'es') or claim_identifier(claim, 'en')}")
         render_claim_quick_card(claim, dealer)
+        render_deduction_editor(claim)
 
         score_cols = st.columns(4)
         score_cols[0].metric("Documentación", f"{score['doc_points']}/{MAX_DOCUMENT_POINTS}")
@@ -1989,7 +2250,7 @@ def main():
         if score["pending"]:
             st.warning("Apartados pendientes: " + ", ".join(score["pending"]))
 
-        section_names = ["I. Documentación", "II. Piezas viejas", "Campañas", "Comentarios", "Informe"]
+        section_names = ["I. Documentación", "II. Piezas viejas", "Comentarios", "Informe"]
         section_tuple = tuple(section_names)
 
         # Guardamos el apartado activo por índice propio, no usando la misma key del widget.
@@ -2020,8 +2281,6 @@ def main():
             render_check_editor(claim, DOCUMENT_CHECKS)
         elif selected_section == "II. Piezas viejas":
             render_check_editor(claim, OLD_PARTS_CHECKS)
-        elif selected_section == "Campañas":
-            render_campaign_editor(claim)
         elif selected_section == "Comentarios":
             render_comments_editor(claim)
         elif selected_section == "Informe":
@@ -2057,7 +2316,7 @@ def main():
                 "← Anterior claim",
                 disabled=current_index == 0,
                 use_container_width=True,
-                on_click=set_selected_claim_and_reset_section,
+                on_click=set_selected_claim_keep_section,
                 args=(claim_options[current_index - 1] if current_index > 0 else st.session_state.selected_claim, section_tuple),
             )
         with nav_claim_cols[1]:
@@ -2065,14 +2324,30 @@ def main():
                 "Siguiente claim →",
                 disabled=current_index >= len(claim_options) - 1,
                 use_container_width=True,
-                on_click=set_selected_claim_and_reset_section,
+                on_click=set_selected_claim_keep_section,
                 args=(claim_options[current_index + 1] if current_index < len(claim_options) - 1 else st.session_state.selected_claim, section_tuple),
             )
         with nav_claim_cols[2]:
-            st.caption(f"Claim {current_index + 1} de {len(claim_options)}")
+            st.caption(
+                f"Claim {current_index + 1} de {len(claim_options)} · "
+                "La navegación mantiene el apartado activo para poder revisar todas las claims por bloque."
+            )
+
+        # Accesos rápidos para el flujo habitual:
+        # 1) revisar toda la documentación claim a claim;
+        # 2) ir al almacén y revisar piezas viejas claim a claim.
+        if section_index == 0 and current_index == len(claim_options) - 1 and len(section_names) > 1:
+            st.button(
+                "He terminado documentación → empezar II. Piezas viejas",
+                type="primary",
+                use_container_width=True,
+                on_click=set_selected_claim_and_section,
+                args=(claim_options[0], 1, section_tuple),
+                key="start_old_parts_after_documents",
+            )
+        elif section_index == 1 and current_index == 0:
+            st.caption("Estás en II. Piezas viejas. El botón 'Siguiente claim' seguirá en piezas viejas para trabajar desde almacén.")
 
 
 if __name__ == "__main__":
     main()
-
-
