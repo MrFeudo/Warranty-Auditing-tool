@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Warranty Audit Portal
-Streamlit app para digitalizar auditorías de garantías.
+Warranty Internal Audit Tool
+Streamlit app interna para digitalizar auditorías de garantías.
 
 Instalación:
     py -m pip install streamlit pandas openpyxl xlsxwriter
@@ -21,6 +21,7 @@ Notas de cálculo:
 - Dealer se selecciona desde listado de dealers activos.
 - Los archivos exportados usan el nombre base Dealer_fecha_auditor.
 - Permite adjuntar fotos de piezas viejas y certificado de destrucción por claim.
+- Incluye dashboard interno para controlar avance, claims críticas, áreas de mejora y auditorías guardadas.
 """
 
 from __future__ import annotations
@@ -1495,6 +1496,8 @@ def init_state():
         st.session_state.audit_dealer = ""
     if "audit_auditor" not in st.session_state:
         st.session_state.audit_auditor = ""
+    if "main_view" not in st.session_state:
+        st.session_state.main_view = "Dashboard"
 
 
 def build_general_comment_from_observations(claim: Dict[str, Any], include_campaigns: bool = True) -> str:
@@ -1769,13 +1772,372 @@ def sync_uploaded_attachments_from_session_state(claims: Dict[str, Dict[str, Any
         claim["attachments"] = attachments
 
 
+# =============================================================================
+# DASHBOARD INTERNO
+# =============================================================================
+
+def count_claim_deviations(claim: Dict[str, Any]) -> int:
+    """Número de apartados puntuables con pérdida de puntos."""
+    return len(calculate_claim_score(claim)["lost_by_area"])
+
+
+def count_claim_pending_items(claim: Dict[str, Any]) -> int:
+    """Número de apartados puntuables pendientes."""
+    return len(calculate_claim_score(claim)["pending"])
+
+
+def claim_risk_label(claim: Dict[str, Any]) -> str:
+    """Etiqueta simple para ordenar trabajo dentro de la auditoría."""
+    score = calculate_claim_score(claim)
+    if score["pending"]:
+        return "Pendiente"
+    if score["total_points"] < 70:
+        return "Crítica"
+    if score["total_points"] < 85:
+        return "Revisar"
+    return "OK"
+
+
+def build_dashboard_claims_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
+    """Tabla de control de claims para el dashboard interno."""
+    rows = []
+    for claim in claims.values():
+        score = calculate_claim_score(claim)
+        attachments = get_claim_attachments(claim)
+        photos_count = len(attachments.get("old_parts_photos", []))
+        certificate = attachments.get("destruction_certificate")
+        rows.append({
+            "Claim No.": claim.get("claim_no", ""),
+            "Dealer": claim.get("dealer", ""),
+            "VIN": claim.get("vin", ""),
+            "Modelo": claim.get("model", ""),
+            "Importe": claim.get("amount", ""),
+            "Documentación /58": score["doc_points"],
+            "Piezas viejas /42": score["old_points"],
+            "Resultado /100": score["total_points"],
+            "Estado": "Completada" if score["completed"] else "Pendiente",
+            "Nivel": claim_risk_label(claim),
+            "Pendientes Nº": len(score["pending"]),
+            "Desviaciones Nº": len(score["lost_by_area"]),
+            "Fotos piezas viejas": photos_count,
+            "Certificado": "Sí" if certificate else "No",
+            "Comentario general": "Sí" if safe_str(claim.get("general_comment", "")) else "No",
+            "Pendientes": " | ".join(score["pending"]),
+            "Comentarios": claim.get("general_comment", ""),
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        level_order = {"Crítica": 0, "Revisar": 1, "Pendiente": 2, "OK": 3}
+        df["_orden_nivel"] = df["Nivel"].map(level_order).fillna(9)
+        df = df.sort_values(["_orden_nivel", "Resultado /100", "Pendientes Nº"], ascending=[True, True, False])
+        df = df.drop(columns=["_orden_nivel"])
+    return df
+
+
+def build_dashboard_area_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
+    """Resumen por apartado para detectar dónde se pierden puntos."""
+    rows = []
+    total_claims = len(claims)
+    if total_claims == 0:
+        return pd.DataFrame()
+
+    for check in ALL_SCORING_CHECKS:
+        obtained = 0
+        pending_count = 0
+        ok_count = 0
+        partial_count = 0
+        nok_count = 0
+        na_count = 0
+        comments_count = 0
+
+        for claim in claims.values():
+            evaluation = claim.get("evaluations", {}).get(check.key, {})
+            points = evaluation.get("points")
+            status = safe_str(evaluation.get("status", ""))
+            if points is None:
+                pending_count += 1
+            else:
+                obtained += int(points)
+
+            if status == "OK":
+                ok_count += 1
+            elif status == "Parcial":
+                partial_count += 1
+            elif status == "NOK":
+                nok_count += 1
+            elif status == "N/A":
+                na_count += 1
+
+            if safe_str(evaluation.get("comment", "")):
+                comments_count += 1
+
+        maximum = total_claims * check.max_points
+        lost = maximum - obtained
+        success = (obtained / maximum * 100) if maximum else 0
+        rows.append({
+            "Bloque": "Documentación" if check in DOCUMENT_CHECKS else "Piezas viejas",
+            "Apartado": check.label,
+            "Puntos obtenidos": obtained,
+            "Máximo": maximum,
+            "Puntos perdidos": lost,
+            "% éxito": round(success, 1),
+            "OK": ok_count,
+            "Parcial": partial_count,
+            "NOK": nok_count,
+            "N/A": na_count,
+            "Pendientes": pending_count,
+            "Comentarios": comments_count,
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["Puntos perdidos", "Pendientes", "% éxito"], ascending=[False, False, True])
+    return df
+
+
+def build_dashboard_attachment_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
+    """Control rápido de adjuntos de piezas viejas."""
+    rows = []
+    for claim in claims.values():
+        attachments = get_claim_attachments(claim)
+        photos_count = len(attachments.get("old_parts_photos", []))
+        certificate = attachments.get("destruction_certificate")
+        rows.append({
+            "Claim No.": claim.get("claim_no", ""),
+            "Fotos piezas viejas": photos_count,
+            "Mínimo 3 fotos": "OK" if photos_count >= 3 else "Revisar",
+            "Certificado": "Sí" if certificate else "No",
+            "Archivo certificado": safe_str(certificate.get("name", "")) if certificate else "",
+        })
+    return pd.DataFrame(rows)
+
+
+def summarize_audit_for_dashboard(
+    claims: Dict[str, Dict[str, Any]],
+    audit_name: str,
+    dealer: str,
+    auditor: str,
+    saved_at: str = "",
+    source_file: str = "",
+) -> Dict[str, Any]:
+    """Fila de resumen para comparar varias auditorías guardadas."""
+    score = calculate_audit_score(claims)
+    doc_max = score["claims"] * MAX_DOCUMENT_POINTS
+    old_max = score["claims"] * MAX_OLD_PARTS_POINTS
+    doc_percent = (score["doc_points"] / doc_max * 100) if doc_max else 0
+    old_percent = (score["old_points"] / old_max * 100) if old_max else 0
+    pending = score["claims"] - score["completed_claims"]
+    return {
+        "Auditoría": audit_name or "Sin nombre",
+        "Dealer": dealer or "No informado",
+        "Auditor": auditor or "No informado",
+        "Guardado": saved_at,
+        "Archivo": source_file,
+        "Claims": score["claims"],
+        "Completadas": score["completed_claims"],
+        "Pendientes": pending,
+        "Resultado /100": round(score["success_percent"], 1),
+        "Documentación %": round(doc_percent, 1),
+        "Piezas viejas %": round(old_percent, 1),
+        "Puntos": f"{score['total_points']}/{score['max_points']}",
+    }
+
+
+def read_audit_json_metadata(uploaded_file) -> Tuple[Dict[str, Dict[str, Any]], str, str, str, str]:
+    """Lee un JSON guardado y devuelve también la fecha saved_at."""
+    content = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+    if isinstance(content, bytes):
+        content_text = content.decode("utf-8")
+    else:
+        content_text = str(content)
+
+    payload = json.loads(content_text)
+    saved_at = safe_str(payload.get("saved_at", "")) if isinstance(payload, dict) else ""
+
+    class MemoryUploadedFile:
+        def __init__(self, data: bytes):
+            self._data = data
+        def getvalue(self):
+            return self._data
+
+    claims, audit_name, dealer, auditor = load_audit_workfile(MemoryUploadedFile(content_text.encode("utf-8")))
+    return claims, audit_name, dealer, auditor, saved_at
+
+
+def render_current_audit_dashboard(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str):
+    """Dashboard de la auditoría cargada actualmente."""
+    audit_score = calculate_audit_score(claims)
+    summary_df = build_dashboard_claims_dataframe(claims)
+    area_df = build_dashboard_area_dataframe(claims)
+    attachment_df = build_dashboard_attachment_dataframe(claims)
+
+    st.subheader("Dashboard de la auditoría actual")
+    st.caption("Vista de control para saber qué queda pendiente, qué claims son peores y dónde se están perdiendo puntos.")
+
+    progress = (audit_score["completed_claims"] / audit_score["claims"]) if audit_score["claims"] else 0
+    st.progress(progress, text=f"Avance: {audit_score['completed_claims']} de {audit_score['claims']} claims completadas")
+
+    dash_cols = st.columns(4)
+    dash_cols[0].metric("Resultado global", f"{audit_score['success_percent']:.1f}%")
+    dash_cols[1].metric("Claims pendientes", audit_score["claims"] - audit_score["completed_claims"])
+    dash_cols[2].metric("Puntos perdidos", audit_score["max_points"] - audit_score["total_points"])
+    dash_cols[3].metric("Dealer", dealer or "No informado")
+
+    tab_overview, tab_claims, tab_areas, tab_attachments, tab_history = st.tabs([
+        "Resumen",
+        "Control de claims",
+        "Áreas de mejora",
+        "Adjuntos",
+        "Histórico JSON",
+    ])
+
+    with tab_overview:
+        chart_cols = st.columns(2)
+        with chart_cols[0]:
+            block_df = pd.DataFrame({
+                "Bloque": ["Documentación", "Piezas viejas"],
+                "% éxito": [
+                    (audit_score["doc_points"] / (audit_score["claims"] * MAX_DOCUMENT_POINTS) * 100) if audit_score["claims"] else 0,
+                    (audit_score["old_points"] / (audit_score["claims"] * MAX_OLD_PARTS_POINTS) * 100) if audit_score["claims"] else 0,
+                ],
+            }).set_index("Bloque")
+            st.markdown("**Resultado por bloque**")
+            st.bar_chart(block_df, use_container_width=True)
+
+        with chart_cols[1]:
+            st.markdown("**Distribución de claims**")
+            level_df = summary_df.groupby("Nivel", as_index=False).size().rename(columns={"size": "Claims"})
+            if not level_df.empty:
+                st.bar_chart(level_df.set_index("Nivel"), use_container_width=True)
+            else:
+                st.info("Todavía no hay datos para mostrar.")
+
+        st.markdown("**Claims con menor puntuación**")
+        critical_df = summary_df.sort_values(["Resultado /100", "Pendientes Nº"], ascending=[True, False]).head(10)
+        st.dataframe(
+            critical_df[["Claim No.", "Resultado /100", "Estado", "Nivel", "Pendientes Nº", "Desviaciones Nº", "Comentarios"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("**Ir rápido a una claim**")
+        claim_options = list(claims.keys())
+        target_claim = st.selectbox("Claim", claim_options, key="dashboard_target_claim")
+        if st.button("Abrir claim seleccionada", type="primary", key="open_claim_from_dashboard"):
+            st.session_state.selected_claim = target_claim
+            st.session_state.active_audit_section = "I. Documentación"
+            st.session_state.main_view = "Revisión claim"
+            st.rerun()
+
+    with tab_claims:
+        filters = st.columns(3)
+        with filters[0]:
+            status_options = sorted(summary_df["Estado"].dropna().unique().tolist())
+            selected_statuses = st.multiselect("Estado", status_options, default=status_options, key="dashboard_status_filter")
+        with filters[1]:
+            level_options = sorted(summary_df["Nivel"].dropna().unique().tolist())
+            selected_levels = st.multiselect("Nivel", level_options, default=level_options, key="dashboard_level_filter")
+        with filters[2]:
+            max_score = st.slider("Mostrar claims con resultado hasta", 0, 100, 100, key="dashboard_score_filter")
+
+        filtered_df = summary_df.copy()
+        if selected_statuses:
+            filtered_df = filtered_df[filtered_df["Estado"].isin(selected_statuses)]
+        if selected_levels:
+            filtered_df = filtered_df[filtered_df["Nivel"].isin(selected_levels)]
+        filtered_df = filtered_df[filtered_df["Resultado /100"] <= max_score]
+
+        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+
+    with tab_areas:
+        if area_df.empty:
+            st.info("Todavía no hay áreas evaluadas.")
+        else:
+            st.markdown("**Top áreas por puntos perdidos**")
+            top_area_df = area_df.head(10).set_index("Apartado")[["Puntos perdidos"]]
+            st.bar_chart(top_area_df, use_container_width=True)
+            st.dataframe(area_df, use_container_width=True, hide_index=True)
+
+    with tab_attachments:
+        st.caption("Control rápido de fotos y certificado de destrucción por claim.")
+        if attachment_df.empty:
+            st.info("Todavía no hay claims para revisar adjuntos.")
+        else:
+            st.dataframe(attachment_df, use_container_width=True, hide_index=True)
+
+    with tab_history:
+        render_history_json_dashboard(current_claims=claims, audit_name=audit_name, dealer=dealer, auditor=auditor)
+
+
+def render_history_json_dashboard(current_claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str):
+    """Comparador manual de auditorías guardadas en JSON."""
+    st.caption(
+        "De momento no hay base de datos. Para controlar varias auditorías, sube aquí varios JSON guardados "
+        "y la app te monta un panel comparativo temporal."
+    )
+    history_files = st.file_uploader(
+        "Cargar varios JSON de auditorías guardadas",
+        type=["json"],
+        accept_multiple_files=True,
+        key="dashboard_history_workfiles",
+    )
+
+    rows = [summarize_audit_for_dashboard(current_claims, audit_name, dealer, auditor, "Sesión actual", "Auditoría actual")]
+
+    if history_files:
+        for file in history_files:
+            try:
+                loaded_claims, loaded_audit_name, loaded_dealer, loaded_auditor, saved_at = read_audit_json_metadata(file)
+                rows.append(
+                    summarize_audit_for_dashboard(
+                        loaded_claims,
+                        loaded_audit_name,
+                        loaded_dealer,
+                        loaded_auditor,
+                        saved_at,
+                        safe_str(getattr(file, "name", "")),
+                    )
+                )
+            except Exception as exc:
+                st.warning(f"No se pudo leer {safe_str(getattr(file, 'name', 'archivo'))}: {exc}")
+
+    registry_df = pd.DataFrame(rows)
+    st.dataframe(registry_df, use_container_width=True, hide_index=True)
+
+    if len(registry_df) > 1:
+        chart_source_df = registry_df.copy()
+        chart_source_df["Etiqueta"] = chart_source_df["Dealer"].astype(str) + " · " + chart_source_df["Auditoría"].astype(str)
+        chart_df = chart_source_df.set_index("Etiqueta")[["Resultado /100", "Documentación %", "Piezas viejas %"]]
+        st.markdown("**Comparativa de auditorías cargadas**")
+        st.bar_chart(chart_df, use_container_width=True)
+
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            registry_df.to_excel(writer, index=False, sheet_name="Dashboard auditorías")
+            workbook = writer.book
+            worksheet = writer.sheets["Dashboard auditorías"]
+            header_fmt = workbook.add_format({"bold": True, "bg_color": "#D9EAF7", "border": 1})
+            for col_num, value in enumerate(registry_df.columns):
+                worksheet.write(0, col_num, value, header_fmt)
+                worksheet.set_column(col_num, col_num, min(max(len(str(value)) + 4, 14), 34))
+            worksheet.autofilter(0, 0, len(registry_df), len(registry_df.columns) - 1)
+            worksheet.freeze_panes(1, 0)
+        st.download_button(
+            "Exportar dashboard de auditorías a Excel",
+            data=output.getvalue(),
+            file_name="dashboard_auditorias.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
 def main():
-    st.set_page_config(page_title="Warranty Audit Portal", layout="wide")
+    st.set_page_config(page_title="Warranty Internal Audit Tool", layout="wide")
     init_state()
     sync_uploaded_attachments_from_session_state(st.session_state.claims)
 
-    st.title("Warranty Audit Portal")
-    st.caption("Auditoría online de garantías: documentación + piezas viejas = 100 puntos. Campañas solo informativo. Ficha por claim y adjuntos de piezas viejas.")
+    st.title("Warranty Internal Audit Tool")
+    st.caption("Herramienta interna de auditoría de garantías: documentación + piezas viejas = 100 puntos. Campañas solo informativo. Incluye dashboard de control, ficha por claim y adjuntos de piezas viejas.")
 
     with st.sidebar:
         st.header("Auditoría")
@@ -1890,6 +2252,20 @@ def main():
     kpi_cols[2].metric("Documentación", f"{audit_score['doc_points']}/{audit_score['claims'] * MAX_DOCUMENT_POINTS}")
     kpi_cols[3].metric("Piezas viejas", f"{audit_score['old_points']}/{audit_score['claims'] * MAX_OLD_PARTS_POINTS}")
     kpi_cols[4].metric("Éxito global", f"{audit_score['success_percent']:.1f}%")
+
+    st.divider()
+
+    st.radio(
+        "Vista principal",
+        ["Dashboard", "Revisión claim"],
+        horizontal=True,
+        key="main_view",
+        label_visibility="collapsed",
+    )
+
+    if st.session_state.main_view == "Dashboard":
+        render_current_audit_dashboard(claims, audit_name, dealer, auditor)
+        st.stop()
 
     st.divider()
 
@@ -2085,5 +2461,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
