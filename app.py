@@ -1,36 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-Warranty Internal Audit Tool
-Streamlit app interna para digitalizar auditorías de garantías.
+Warranty Audit Assistant - versión interna bilingüe
 
 Instalación:
     py -m pip install streamlit pandas openpyxl xlsxwriter
 
 Ejecución:
-    streamlit run warranty_audit_portal.py
+    streamlit run app.py
 
-Notas de cálculo:
-- Claim document checklist I suma 58 puntos.
-- Claim old parts checklist II suma 42 puntos.
-- Total auditoría = 100 puntos.
-- No aplica = máxima puntuación del apartado.
-- Campañas son informativas y no suman ni restan.
-- Permite guardar y recargar auditorías de trabajo en JSON.
-- El comentario general puede generarse desde las observaciones de cada apartado.
-- Permite completar ficha por claim: dealer, VIN, modelo e importe.
-- Dealer se selecciona desde listado de dealers activos.
-- Los archivos exportados usan el nombre base Dealer_fecha_auditor.
-- Permite adjuntar fotos de piezas viejas y certificado de destrucción por claim.
-- Añade estado de trabajo por claim y validación de cierre antes de exportar.
+Qué hace:
+- Carga una checklist oficial o una lista simple de claims.
+- Permite trabajar claim por claim.
+- Calcula automáticamente la puntuación:
+    Claim document checklist I = 58 puntos
+    Claim old parts checklist II = 42 puntos
+    Total = 100 puntos
+- No aplica = puntuación máxima del apartado.
+- Campañas = informativo, no suma ni resta.
+- Genera comentario general desde observaciones por apartado.
+- Exporta boletín en español para dealer usando claim local CO...
+- Exporta scorecard en inglés para HQ usando identificador HQ/IDMS/TAC/2810...
+- Rellena la hoja/page 3 "Improvement of claim issues III" con las observaciones de los campos.
 """
 
 from __future__ import annotations
 
-import base64
-import copy
 import json
 import re
 import zipfile
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
@@ -46,368 +44,420 @@ import streamlit as st
 
 @dataclass(frozen=True)
 class AuditOption:
-    label: str
+    key: str
+    label_es: str
+    label_en: str
     points: Optional[int]
     status: str
 
 
 @dataclass(frozen=True)
 class AuditCheck:
-    block: str
+    block_key: str
     key: str
-    label: str
+    label_es: str
+    label_en: str
     max_points: int
     options: Tuple[AuditOption, ...]
-    guidance: str
+    guidance_es: str
+    guidance_en: str
 
 
-PENDING = AuditOption("Pendiente de revisar", None, "Pendiente")
+PENDING = AuditOption("pending", "Pendiente de revisar", "Pending review", None, "Pendiente")
 
 
-def options_0_5_7() -> Tuple[AuditOption, ...]:
+def options_0_5_7(max_points: int = 7) -> Tuple[AuditOption, ...]:
     return (
         PENDING,
-        AuditOption("OK / conforme", 7, "OK"),
-        AuditOption("Parcial / incompleto", 5, "Parcial"),
-        AuditOption("NOK / falta o no conforme", 0, "NOK"),
-        AuditOption("No aplica", 7, "N/A"),
+        AuditOption("ok", "OK / conforme", "OK / compliant", max_points, "OK"),
+        AuditOption("partial", "Parcial / incompleto", "Partial / incomplete", 5, "Parcial"),
+        AuditOption("nok", "NOK / falta o no conforme", "NOK / missing or non-compliant", 0, "NOK"),
+        AuditOption("na", "No aplica", "Not applicable", max_points, "N/A"),
     )
 
 
 def options_0_6() -> Tuple[AuditOption, ...]:
     return (
         PENDING,
-        AuditOption("OK / conforme", 6, "OK"),
-        AuditOption("NOK / no conforme", 0, "NOK"),
-        AuditOption("No aplica", 6, "N/A"),
+        AuditOption("ok", "OK / conforme", "OK / compliant", 6, "OK"),
+        AuditOption("nok", "NOK / no conforme", "NOK / non-compliant", 0, "NOK"),
+        AuditOption("na", "No aplica", "Not applicable", 6, "N/A"),
     )
 
 
 def options_date_0_3_6() -> Tuple[AuditOption, ...]:
     return (
         PENDING,
-        AuditOption("0 a 5 días laborables", 6, "OK"),
-        AuditOption("5 a 15 días laborables", 3, "Parcial"),
-        AuditOption("Más de 15 días laborables", 0, "NOK"),
-        AuditOption("No aplica", 6, "N/A"),
+        AuditOption("ok", "0 a 5 días laborables", "0 to 5 working days", 6, "OK"),
+        AuditOption("partial", "5 a 15 días laborables", "5 to 15 working days", 3, "Parcial"),
+        AuditOption("nok", "Más de 15 días laborables", "More than 15 working days", 0, "NOK"),
+        AuditOption("na", "No aplica", "Not applicable", 6, "N/A"),
     )
 
 
 def options_old_binary_0_7() -> Tuple[AuditOption, ...]:
     return (
         PENDING,
-        AuditOption("OK / correcta", 7, "OK"),
-        AuditOption("NOK / incorrecta", 0, "NOK"),
-        AuditOption("No aplica", 7, "N/A"),
+        AuditOption("ok", "OK / correcta", "OK / correct", 7, "OK"),
+        AuditOption("nok", "NOK / incorrecta", "NOK / incorrect", 0, "NOK"),
+        AuditOption("na", "No aplica", "Not applicable", 7, "N/A"),
     )
 
 
 def options_campaigns() -> Tuple[AuditOption, ...]:
     return (
-        AuditOption("Pendiente de revisar", None, "Pendiente"),
-        AuditOption("OK", None, "OK"),
-        AuditOption("NOK / revisar", None, "NOK"),
-        AuditOption("No aplica", None, "N/A"),
+        AuditOption("pending", "Pendiente de revisar", "Pending review", None, "Pendiente"),
+        AuditOption("ok", "OK", "OK", None, "OK"),
+        AuditOption("nok", "NOK / revisar", "NOK / review required", None, "NOK"),
+        AuditOption("na", "No aplica", "Not applicable", None, "N/A"),
     )
 
 
 DOCUMENT_CHECKS: List[AuditCheck] = [
     AuditCheck(
-        "Claim document checklist I", "doc_or", "OR", 7, options_0_5_7(),
+        "document", "doc_or", "OR", "Repair order", 7, options_0_5_7(),
         "Comprobar si existe la orden de reparación/reclamación, si la documentación es completa y si la firma está correcta.",
+        "Check whether the repair/warranty order exists, whether the relevant documentation is complete and whether the signature is correct.",
     ),
     AuditCheck(
-        "Claim document checklist I", "doc_parts_order", "Pedido piezas / albarán", 7, options_0_5_7(),
+        "document", "doc_parts_order", "Pedido piezas / albarán", "Parts order / delivery note", 7, options_0_5_7(),
         "Comprobar pedido/albarán de piezas y que la documentación sea completa, razonable y conforme.",
+        "Check whether the parts order/delivery note exists and whether the documentation is complete, reasonable and compliant.",
     ),
     AuditCheck(
-        "Claim document checklist I", "doc_previous_or", "OR previa", 7, options_0_5_7(),
+        "document", "doc_previous_or", "OR previa", "Previous repair order", 7, options_0_5_7(),
         "Solo para reclamaciones de repuestos o reparaciones anteriores. Si no procede, marcar No aplica.",
+        "Only for parts claims or previous repairs. If not applicable, mark as Not applicable.",
     ),
     AuditCheck(
-        "Claim document checklist I", "doc_evidence", "Evidencias", 7, options_0_5_7(),
+        "document", "doc_evidence", "Evidencias", "Evidence", 7, options_0_5_7(),
         "Comprobar si faltan evidencias adjuntas o si las evidencias no son correctas/suficientes.",
+        "Check whether evidence is missing or whether the evidence provided is not correct/sufficient.",
     ),
     AuditCheck(
-        "Claim document checklist I", "doc_causal_part", "Pieza causa correcta", 6, options_0_6(),
+        "document", "doc_causal_part", "Pieza causa correcta", "Correct causal part", 6, options_0_6(),
         "Comprobar si la pieza principal dañada es correcta, razonable y coherente con la avería.",
+        "Check whether the main damaged part is correct, reasonable and consistent with the failure.",
     ),
     AuditCheck(
-        "Claim document checklist I", "doc_labor", "Mano de obra", 6, options_0_6(),
+        "document", "doc_labor", "Mano de obra", "Labour", 6, options_0_6(),
         "Comprobar si los tiempos de mano de obra son correctos, no repetitivos y ajustados al estándar.",
+        "Check whether labour times are correct, not duplicated and aligned with the standard labour time.",
     ),
     AuditCheck(
-        "Claim document checklist I", "doc_aux_material", "Material auxiliar", 6, options_0_6(),
+        "document", "doc_aux_material", "Material auxiliar", "Auxiliary material", 6, options_0_6(),
         "Comprobar que el material auxiliar/consumible cumpla normativa, campo correcto y cantidad razonable.",
+        "Check whether auxiliary/consumable material complies with the policy, is entered in the correct field and has a reasonable quantity.",
     ),
     AuditCheck(
-        "Claim document checklist I", "doc_dates", "Fecha/hora envío Claim", 6, options_date_0_3_6(),
+        "document", "doc_dates", "Fecha/hora envío Claim", "Claim submission and repair date", 6, options_date_0_3_6(),
         "La claim debe enviarse dentro de plazo tras completar la reparación.",
+        "The claim must be submitted within the allowed period after the repair is completed.",
     ),
     AuditCheck(
-        "Claim document checklist I", "doc_vin", "VIN", 6, options_0_6(),
+        "document", "doc_vin", "VIN", "VIN", 6, options_0_6(),
         "Comprobar que VIN, kilometraje, fecha de reparación, tipo de reclamación y datos del vehículo sean correctos.",
+        "Check that VIN, mileage, repair date, claim type and vehicle data are correct.",
     ),
 ]
 
 OLD_PARTS_CHECKS: List[AuditCheck] = [
     AuditCheck(
-        "Claim old parts checklist II", "old_management", "Gestión piezas viejas", 7, options_0_5_7(),
+        "old_parts", "old_management", "Gestión piezas viejas", "Old parts management", 7, options_0_5_7(),
         "Las piezas viejas deben estar ordenadas, localizables y disponibles durante la auditoría.",
+        "Old parts must be arranged, traceable and available during the audit.",
     ),
     AuditCheck(
-        "Claim old parts checklist II", "old_label", "Etiquetado pieza vieja", 7, options_0_5_7(),
+        "old_parts", "old_label", "Etiquetado pieza vieja", "Old part labelling", 7, options_0_5_7(),
         "La etiqueta debe incluir datos básicos del vehículo, claim, referencia, causa del daño, etc.",
+        "The label must include basic vehicle data, claim number, part number, damage cause, etc.",
     ),
     AuditCheck(
-        "Claim old parts checklist II", "old_causal_part", "Pieza causa", 7, options_old_binary_0_7(),
+        "old_parts", "old_causal_part", "Pieza causa", "Causal part", 7, options_old_binary_0_7(),
         "Comprobar que la pieza antigua es la causa real, consistente con modelo/vehículo y fecha de producción.",
+        "Check whether the old part is the real causal part and is consistent with the vehicle/model and production date.",
     ),
     AuditCheck(
-        "Claim old parts checklist II", "old_failure_info", "Info tipo fallo pieza causa", 7, options_old_binary_0_7(),
+        "old_parts", "old_failure_info", "Info tipo fallo pieza causa", "Causal part failure information", 7, options_old_binary_0_7(),
         "Comprobar que la información del fallo sea coherente con la pieza y las fotos/evidencias.",
+        "Check whether the failure information is consistent with the part and with the photos/evidence.",
     ),
     AuditCheck(
-        "Claim old parts checklist II", "old_destruction", "Destrucción pieza vieja", 7, options_0_5_7(),
+        "old_parts", "old_destruction", "Destrucción pieza vieja", "Old part destruction", 7, options_0_5_7(),
         "Las piezas viejas deben destruirse siguiendo el proceso y sin posibilidad de reutilización.",
+        "Old parts must be destroyed according to the process and must not be reusable.",
     ),
     AuditCheck(
-        "Claim old parts checklist II", "old_destruction_certificate", "Certificado destrucción piezas viejas", 7, options_0_5_7(),
+        "old_parts", "old_destruction_certificate", "Certificado destrucción piezas viejas", "Old parts destruction certificate", 7, options_0_5_7(),
         "El certificado/informe de destrucción debe existir, subirse y archivarse en plazo.",
+        "The destruction certificate/report must exist and be uploaded/archived within the required period.",
     ),
 ]
 
 CAMPAIGN_CHECKS: List[AuditCheck] = [
     AuditCheck(
-        "Campañas informativas", "info_campaign_check", "Comprobación campañas", 0, options_campaigns(),
+        "campaigns", "info_campaign_check", "Comprobación campañas", "Campaign check", 0, options_campaigns(),
         "Campo informativo. No afecta al porcentaje de éxito.",
+        "Informative field. It does not affect the success percentage.",
     ),
     AuditCheck(
-        "Campañas informativas", "info_pending_campaigns", "Campañas pendientes", 0, options_campaigns(),
+        "campaigns", "info_pending_campaigns", "Campañas pendientes", "Pending campaigns", 0, options_campaigns(),
         "Campo informativo. Indicar si existen campañas pendientes o si se ha revisado correctamente.",
+        "Informative field. Indicate whether there are pending campaigns or whether the check has been completed correctly.",
     ),
 ]
 
 ALL_SCORING_CHECKS = DOCUMENT_CHECKS + OLD_PARTS_CHECKS
 ALL_CHECKS = DOCUMENT_CHECKS + OLD_PARTS_CHECKS + CAMPAIGN_CHECKS
-MAX_DOCUMENT_POINTS = sum(check.max_points for check in DOCUMENT_CHECKS)  # 58
-MAX_OLD_PARTS_POINTS = sum(check.max_points for check in OLD_PARTS_CHECKS)  # 42
-MAX_TOTAL_POINTS = MAX_DOCUMENT_POINTS + MAX_OLD_PARTS_POINTS  # 100
-
-OLD_PART_PHOTO_FILE_TYPES = ["jpg", "jpeg", "png", "webp"]
-DESTRUCTION_CERTIFICATE_FILE_TYPES = ["jpg", "jpeg", "png", "webp", "pdf"]
-
-CLAIM_WORKFLOW_STATUSES: List[str] = [
-    "Pendiente",
-    "En revisión",
-    "Completada",
-    "Requiere aclaración",
-    "Cerrada",
-]
-
-AUDIT_MODE_NSC = "NSC / Supervisor"
-AUDIT_MODE_DEALER = "Dealer / Autoauditoría"
-
-AUDIT_MODES: List[str] = [
-    AUDIT_MODE_NSC,
-    AUDIT_MODE_DEALER,
-]
+CHECK_BY_KEY = {check.key: check for check in ALL_CHECKS}
+MAX_DOCUMENT_POINTS = sum(check.max_points for check in DOCUMENT_CHECKS)
+MAX_OLD_PARTS_POINTS = sum(check.max_points for check in OLD_PARTS_CHECKS)
+MAX_TOTAL_POINTS = MAX_DOCUMENT_POINTS + MAX_OLD_PARTS_POINTS
 
 ACTIVE_DEALERS: List[str] = [
-    "ACAI MOTOR MÁLAGA",
-    "ALFAVISA BILBAO",
-    "ALIMOTOR ELCHE",
-    "ANFERPA SEGOVIA",
-    "AUTO YALDE CALAHORRA",
-    "AUTO YALDE LOGROÑO",
-    "AUTOCAM MOTOR VILAFRANCA",
-    "AUTOCAM VILANOVA",
-    "AUTOCYL PALENCIA",
-    "AUTOCYL VALLADOLID",
-    "AUTOVIDAL PALMA DE MALLORCA",
-    "AVANTI GRANADA",
-    "AXIS MOTORS",
-    "BLENDIO LAREDO",
-    "BLENDIO LUGO",
-    "BLENDIO OURENSE",
-    "BLENDIO OVIEDO",
-    "BLENDIO SANTANDER",
-    "BLENDIO TORRELAVEGA",
-    "BORJAMOTOR ALICANTE",
-    "CERVERA AVILA",
-    "CERVERA SALAMANCA",
-    "CHINARES GUADALAJARA",
-    "DILOAUTOJAEN",
-    "DUMOSA BENAVENTE",
-    "ESLAUTO LEON",
-    "FIMALAGA MÁLAGA",
-    "FIMALAGA MARBELLA",
-    "GRUP BASOLS IGUALADA",
-    "GRUPO JULIAN BURGOS",
-    "GRUPO NIETO MÁLAGA",
-    "GRUPO NIETO MARBELLA",
-    "HIMASA SEDAVÍ",
-    "JEMOYA SORIA",
-    "JOVERAUTO MELILLA",
-    "LASACAR MIRANDA DE EBRO",
-    "LASACAR VITORIA",
-    "LEPAS AUTOCAM VILANOVA",
-    "LEPAS AUTOVIVO SANT BOI",
-    "LEPAS BASOLS IGUALADA",
-    "LEPAS BASOLS VIC",
-    "LEPAS GAMBOA MAJADAHONDA",
-    "LEPAS JULIÁN BURGOS",
-    "LEPAS MONECAR SAGUNTO",
-    "LEPAS PREMIER VITORIA",
-    "LEPAS RAFAEL AFONSO LAS PALMAS",
-    "LEPAS RESNOVA CORUÑA",
-    "LEPAS RESNOVA VIGO",
-    "LEPAS TECNOTARRACO TARRAGONA",
-    "LEPAS TUMASA HUESCA",
-    "LEPAS VALLESCAR SABADELL",
-    "LEPAS VALLESCAR TERRASSA",
-    "LEPAS ZEN MOTOR GIPUZKOA",
-    "LEPAS ZEN MOTOR ZARAGOZA",
-    "M AUTOMOCIÓN ALCALÁ",
-    "M AUTOMOCIÓN BCN (GRAN VÍA)",
-    "M AUTOMOCIÓN BCN GUAYAQUIL",
-    "M AUTOMOCIÓN CASTELLÓN",
-    "M AUTOMOCIÓN GERONA",
-    "M AUTOMOCIÓN MATARÓ",
-    "M TECNIK ALCALÁ DE HENARES",
-    "M TECNIK BARCELONA MAQUINISTA",
-    "M TECNIK CASTELLÓN",
-    "M TECNIK FIGUERES",
-    "M TECNIK GERONA",
-    "M TECNIK MATARÓ",
-    "M TECNIK VINAROZ",
-    "MARTIN LIZAGA TERUEL",
-    "MAS AUTO LEGANÉS",
-    "MAVEN BADAJOZ",
-    "MAVEN CÁCERES",
-    "MAVEN DON BENITO",
-    "MAVEN MÉRIDA",
-    "MAVEN PLASENCIA",
-    "MOLL MOTOR DENIA",
-    "MOLL MOTOR GANDIA",
-    "MOLL VALENCIA",
-    "MONECAR CUENCA",
-    "MOTOR NACIENTE LEGANÉS",
-    "MOVINSUR GRANADA",
-    "MOVINSUR JAÉN",
-    "MOVINSUR MOTRIL",
-    "MY CARS CÓRDOBA",
-    "NOVACAR BCN SANT BOI",
-    "PALAUSA ZAMORA",
-    "PROCHERY ALBACETE",
-    "PROCHERY CARTAGENA",
-    "PROCHERY MURCIA",
-    "PRUNA CAR GO GRANOLLERS",
-    "RAFAEL AFONSO AGUIMES",
-    "RAFAEL AFONSO LANZAROTE",
-    "RAFAEL AFONSO LAS PALMAS",
-    "RAFAEL AFONSO TENERIFE",
-    "RESNOVA MOTOR CORUÑA",
-    "RESNOVA MOTOR GIJÓN",
-    "RESNOVA MOTOR NARÓN",
-    "RESNOVA MOTOR OVIEDO",
-    "RESNOVA MOTOR SANTIAGO",
-    "RESNOVA MOTOR VIGO",
-    "SEGRE LLEIDA",
-    "SEGRE MOTORS LERIDA",
-    "SERTECAUTO PONFERRADA",
-    "SYRSA ALGECIRAS",
-    "SYRSA ALMERIA",
-    "SYRSA EJIDO",
-    "SYRSA HUELVA",
-    "SYRSA SEVILLA",
-    "TALAUTO CAZALEGAS",
-    "TALAUTO TOLEDO",
-    "TALLERES CHINARES",
-    "TECNOTARRACO TARRAGONA",
-    "TERRY MOBILITY JERÉZ",
-    "TRADECAR GAMBOA ALCORCÓN",
-    "TRADECAR GAMBOA MADRID",
-    "TRADECAR GAMBOA MAJADAHONDA",
-    "TRADECAR GAMBOA RIVAS",
-    "TUMASA HUESCA",
-    "TUMASA MONZÓN",
-    "UNIONE ALCAZAR DE SAN JUAN",
-    "UNIONE CIUDAD REAL",
-    "VALLESCAR SABADELL",
-    "VALLESCAR TERRASSA",
-    "VIAN ALCORCÓN",
-    "VIAN AUTOMOBILE VILLALBA",
-    "VIAN MÓSTOLES",
-    "VIAN NAVARRA",
-    "ZEN MOTOR OLABERRIA",
-    "ZEN MOTOR PAMPLONA",
-    "ZEN MOTOR SAN SEBASTIÁN",
-    "ZEN MOTOR ZARAGOZA",
+    "ACAI MOTOR MÁLAGA", "ALFAVISA BILBAO", "ALIMOTOR ELCHE", "ANFERPA SEGOVIA",
+    "AUTO YALDE CALAHORRA", "AUTO YALDE LOGROÑO", "AUTOCAM MOTOR VILAFRANCA",
+    "AUTOCAM VILANOVA", "AUTOCYL PALENCIA", "AUTOCYL VALLADOLID", "AUTOVIDAL PALMA DE MALLORCA",
+    "AVANTI GRANADA", "AXIS MOTORS", "BLENDIO LAREDO", "BLENDIO LUGO", "BLENDIO OURENSE",
+    "BLENDIO OVIEDO", "BLENDIO SANTANDER", "BLENDIO TORRELAVEGA", "BORJAMOTOR ALICANTE",
+    "CERVERA AVILA", "CERVERA SALAMANCA", "CHINARES GUADALAJARA", "DILOAUTOJAEN",
+    "DUMOSA BENAVENTE", "ESLAUTO LEON", "FIMALAGA MÁLAGA", "FIMALAGA MARBELLA",
+    "GRUP BASOLS IGUALADA", "GRUPO JULIAN BURGOS", "GRUPO NIETO MÁLAGA", "GRUPO NIETO MARBELLA",
+    "HIMASA SEDAVÍ", "JEMOYA SORIA", "JOVERAUTO MELILLA", "LASACAR MIRANDA DE EBRO",
+    "LASACAR VITORIA", "LEPAS AUTOCAM VILANOVA", "LEPAS AUTOVIVO SANT BOI",
+    "LEPAS BASOLS IGUALADA", "LEPAS BASOLS VIC", "LEPAS GAMBOA MAJADAHONDA",
+    "LEPAS JULIÁN BURGOS", "LEPAS MONECAR SAGUNTO", "LEPAS PREMIER VITORIA",
+    "LEPAS RAFAEL AFONSO LAS PALMAS", "LEPAS RESNOVA CORUÑA", "LEPAS RESNOVA VIGO",
+    "LEPAS TECNOTARRACO TARRAGONA", "LEPAS TUMASA HUESCA", "LEPAS VALLESCAR SABADELL",
+    "LEPAS VALLESCAR TERRASSA", "LEPAS ZEN MOTOR GIPUZKOA", "LEPAS ZEN MOTOR ZARAGOZA",
+    "M AUTOMOCIÓN ALCALÁ", "M AUTOMOCIÓN BCN (GRAN VÍA)", "M AUTOMOCIÓN BCN GUAYAQUIL",
+    "M AUTOMOCIÓN CASTELLÓN", "M AUTOMOCIÓN GERONA", "M AUTOMOCIÓN MATARÓ",
+    "M TECNIK ALCALÁ DE HENARES", "M TECNIK BARCELONA MAQUINISTA", "M TECNIK CASTELLÓN",
+    "M TECNIK FIGUERES", "M TECNIK GERONA", "M TECNIK MATARÓ", "M TECNIK VINAROZ",
+    "MARTIN LIZAGA TERUEL", "MAS AUTO LEGANÉS", "MAVEN BADAJOZ", "MAVEN CÁCERES",
+    "MAVEN DON BENITO", "MAVEN MÉRIDA", "MAVEN PLASENCIA", "MOLL MOTOR DENIA",
+    "MOLL MOTOR GANDIA", "MOLL VALENCIA", "MONECAR CUENCA", "MOTOR NACIENTE LEGANÉS",
+    "MOVINSUR GRANADA", "MOVINSUR JAÉN", "MOVINSUR MOTRIL", "MY CARS CÓRDOBA",
+    "NOVACAR BCN SANT BOI", "PALAUSA ZAMORA", "PROCHERY ALBACETE", "PROCHERY CARTAGENA",
+    "PROCHERY MURCIA", "PRUNA CAR GO GRANOLLERS", "RAFAEL AFONSO AGUIMES",
+    "RAFAEL AFONSO LANZAROTE", "RAFAEL AFONSO LAS PALMAS", "RAFAEL AFONSO TENERIFE",
+    "RESNOVA MOTOR CORUÑA", "RESNOVA MOTOR GIJÓN", "RESNOVA MOTOR NARÓN",
+    "RESNOVA MOTOR OVIEDO", "RESNOVA MOTOR SANTIAGO", "RESNOVA MOTOR VIGO", "SEGRE LLEIDA",
+    "SEGRE MOTORS LERIDA", "SERTECAUTO PONFERRADA", "SYRSA ALGECIRAS", "SYRSA ALMERIA",
+    "SYRSA EJIDO", "SYRSA HUELVA", "SYRSA SEVILLA", "TALAUTO CAZALEGAS", "TALAUTO TOLEDO",
+    "TALLERES CHINARES", "TECNOTARRACO TARRAGONA", "TERRY MOBILITY JERÉZ",
+    "TRADECAR GAMBOA ALCORCÓN", "TRADECAR GAMBOA MADRID", "TRADECAR GAMBOA MAJADAHONDA",
+    "TRADECAR GAMBOA RIVAS", "TUMASA HUESCA", "TUMASA MONZÓN", "UNIONE ALCAZAR DE SAN JUAN",
+    "UNIONE CIUDAD REAL", "VALLESCAR SABADELL", "VALLESCAR TERRASSA", "VIAN ALCORCÓN",
+    "VIAN AUTOMOBILE VILLALBA", "VIAN MÓSTOLES", "VIAN NAVARRA", "ZEN MOTOR OLABERRIA",
+    "ZEN MOTOR PAMPLONA", "ZEN MOTOR SAN SEBASTIÁN", "ZEN MOTOR ZARAGOZA",
 ]
+
+
+# =============================================================================
+# TEXTOS / TRADUCCIONES
+# =============================================================================
+
+TEXT = {
+    "es": {
+        "app_title": "Warranty Audit Assistant",
+        "claim_id": "Claim dealer / España",
+        "other_id": "Identificador HQ / IDMS",
+        "scorecard": "Boletín de notas",
+        "document_section": "Claim document checklist I",
+        "old_parts_section": "Claim old parts checklist II",
+        "improvement_sheet": "Improvement of claim issues III",
+        "evaluation_content": "Evaluation content",
+        "claim_no": "Claim No.",
+        "local_claim": "Claim España / Dealer",
+        "hq_claim": "Claim HQ / IDMS",
+        "dealer": "Dealer",
+        "vin": "VIN",
+        "model": "Modelo",
+        "amount": "Importe",
+        "doc_score": "Documentación /58",
+        "old_score": "Piezas viejas /42",
+        "total_score": "Total /100",
+        "success": "% éxito",
+        "result": "Resultado",
+        "pending": "Pendientes",
+        "comments": "Comentarios",
+        "campaign_check": "Comprobación campañas",
+        "pending_campaigns": "Campañas pendientes",
+        "action_plan_title": "Plan de mejora",
+        "auditable_list": "Lista de parámetros auditables",
+        "exception_comments": "Excepciones/comentarios",
+        "observations": "Observaciones",
+        "countermeasure": "Contramedida",
+        "no_deviations": "Sin desviaciones puntuables ni observaciones registradas",
+        "generic_countermeasure": "Reforzar el cumplimiento del criterio y revisar la documentación antes del envío de la claim.",
+        "excellent": "Excelente",
+        "correct": "Correcto",
+        "improvable": "Mejorable",
+        "critical": "Crítico",
+        "report_title": "Informe de auditoría",
+        "executive_summary": "Resumen ejecutivo",
+        "block_result": "Resultado por bloque",
+        "improvement_areas": "Principales áreas de mejora",
+        "lowest_claims": "Claims con menor puntuación",
+        "conclusion": "Conclusión",
+        "campaign_info": "Campañas: revisión informativa, sin impacto en puntuación.",
+        "not_translated_note": "Nota: las observaciones manuales se incluyen tal como se han escrito.",
+    },
+    "en": {
+        "app_title": "Warranty Audit Assistant",
+        "claim_id": "HQ / IDMS claim ID",
+        "other_id": "Dealer / Spanish claim ID",
+        "scorecard": "Scorecard",
+        "document_section": "Claim document checklist I",
+        "old_parts_section": "Claim old parts checklist II",
+        "improvement_sheet": "Improvement of claim issues III",
+        "evaluation_content": "Evaluation content",
+        "claim_no": "Claim No.",
+        "local_claim": "Spanish / dealer claim",
+        "hq_claim": "HQ / IDMS claim",
+        "dealer": "Dealer",
+        "vin": "VIN",
+        "model": "Model",
+        "amount": "Amount",
+        "doc_score": "Document checklist /58",
+        "old_score": "Old parts checklist /42",
+        "total_score": "Total /100",
+        "success": "Success %",
+        "result": "Result",
+        "pending": "Pending items",
+        "comments": "Comments",
+        "campaign_check": "Campaign check",
+        "pending_campaigns": "Pending campaigns",
+        "action_plan_title": "Improvement plan",
+        "auditable_list": "Auditable parameter list",
+        "exception_comments": "Exceptions/comments",
+        "observations": "Observations",
+        "countermeasure": "Countermeasure",
+        "no_deviations": "No score deviations or observations recorded",
+        "generic_countermeasure": "Reinforce compliance with the criterion and review the documentation before claim submission.",
+        "excellent": "Excellent",
+        "correct": "Correct",
+        "improvable": "Needs improvement",
+        "critical": "Critical",
+        "report_title": "Audit report",
+        "executive_summary": "Executive summary",
+        "block_result": "Result by section",
+        "improvement_areas": "Main improvement areas",
+        "lowest_claims": "Lowest scoring claims",
+        "conclusion": "Conclusion",
+        "campaign_info": "Campaigns: informative review only, with no impact on scoring.",
+        "not_translated_note": "Note: manual observations are included exactly as written.",
+    },
+}
+
+COUNTERMEASURES = {
+    "doc_or": {
+        "es": "Asegurar que la OR esté disponible, completa, firmada y trazable antes del envío de la claim.",
+        "en": "Ensure the repair order is available, complete, signed and traceable before claim submission.",
+    },
+    "doc_parts_order": {
+        "es": "Adjuntar y verificar el pedido de piezas/albarán correspondiente, asegurando coherencia con la reparación.",
+        "en": "Attach and verify the corresponding parts order/delivery note, ensuring consistency with the repair.",
+    },
+    "doc_previous_or": {
+        "es": "Verificar la reparación previa cuando aplique y adjuntar la OR/documentación soporte correspondiente.",
+        "en": "Verify the previous repair when applicable and attach the related repair order/supporting documentation.",
+    },
+    "doc_evidence": {
+        "es": "Reforzar la calidad de las evidencias adjuntas para demostrar diagnóstico, avería y reparación realizada.",
+        "en": "Improve the quality of attached evidence to support diagnosis, failure and performed repair.",
+    },
+    "doc_causal_part": {
+        "es": "Revisar que la pieza causa reclamada sea correcta y coherente con el diagnóstico y la reparación.",
+        "en": "Check that the claimed causal part is correct and consistent with the diagnosis and repair.",
+    },
+    "doc_labor": {
+        "es": "Ajustar la mano de obra al baremo y justificar cualquier tiempo adicional con desglose y evidencias.",
+        "en": "Align labour with the standard time and justify any additional time with breakdown and evidence.",
+    },
+    "doc_aux_material": {
+        "es": "Registrar el material auxiliar en el campo correcto, con desglose y justificación suficiente.",
+        "en": "Enter auxiliary material in the correct field, with sufficient breakdown and justification.",
+    },
+    "doc_dates": {
+        "es": "Controlar los plazos entre reparación y envío de la claim para evitar envíos fuera de plazo.",
+        "en": "Monitor the period between repair completion and claim submission to avoid late submissions.",
+    },
+    "doc_vin": {
+        "es": "Verificar VIN, kilometraje, fechas y datos del vehículo antes de enviar la claim.",
+        "en": "Verify VIN, mileage, dates and vehicle data before claim submission.",
+    },
+    "old_management": {
+        "es": "Mantener las piezas viejas ordenadas, localizables y disponibles durante el periodo de auditoría.",
+        "en": "Keep old parts arranged, traceable and available during the audit period.",
+    },
+    "old_label": {
+        "es": "Completar correctamente las etiquetas de piezas viejas con los datos requeridos de vehículo, claim y pieza.",
+        "en": "Correctly complete old part labels with the required vehicle, claim and part data.",
+    },
+    "old_causal_part": {
+        "es": "Conservar y presentar la pieza causa correcta, coherente con el vehículo y la avería reclamada.",
+        "en": "Store and present the correct causal part, consistent with the vehicle and the claimed failure.",
+    },
+    "old_failure_info": {
+        "es": "Documentar correctamente el tipo de fallo de la pieza causa y su coherencia con la evidencia.",
+        "en": "Correctly document the causal part failure type and its consistency with the evidence.",
+    },
+    "old_destruction": {
+        "es": "Seguir el proceso de destrucción de piezas viejas y evitar cualquier posibilidad de reutilización.",
+        "en": "Follow the old parts destruction process and avoid any possibility of reuse.",
+    },
+    "old_destruction_certificate": {
+        "es": "Archivar y presentar el certificado de destrucción dentro del periodo correspondiente.",
+        "en": "Archive and provide the destruction certificate within the required period.",
+    },
+}
 
 
 # =============================================================================
 # UTILIDADES
 # =============================================================================
 
-def option_labels(check: AuditCheck) -> List[str]:
-    labels = []
-    for option in check.options:
-        if option.points is None:
-            labels.append(option.label)
-        else:
-            labels.append(f"{option.label} ({option.points}/{check.max_points})")
-    return labels
-
-
-def option_from_label(check: AuditCheck, selected_label: str) -> AuditOption:
-    for option in check.options:
-        prefix = option.label
-        if selected_label == prefix or selected_label.startswith(prefix + " ("):
-            return option
-    return PENDING
-
-
-def option_from_points(check: AuditCheck, points: Any) -> AuditOption:
-    """Prefill desde un Excel existente, si trae puntuaciones numéricas."""
-    try:
-        if pd.isna(points) or str(points).strip() == "":
-            return PENDING
-        numeric_points = int(float(points))
-    except Exception:
-        return PENDING
-
-    candidates = [option for option in check.options if option.points == numeric_points]
-    if candidates:
-        return candidates[0]
-    return PENDING
-
 
 def safe_str(value: Any) -> str:
     if value is None:
         return ""
-    if isinstance(value, float) and pd.isna(value):
-        return ""
+    try:
+        if isinstance(value, float) and pd.isna(value):
+            return ""
+    except Exception:
+        pass
     return str(value).strip()
 
 
+def normalize_text(value: Any) -> str:
+    text = safe_str(value).lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def sanitize_for_filename(value: Any, fallback: str = "item") -> str:
-    """Limpia nombres para usarlos en ZIP/descargas sin romper rutas."""
     text = safe_str(value) or fallback
-    text = re.sub(r"[^\w\-. ]+", "_", text, flags=re.UNICODE).strip()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^A-Za-z0-9_. -]+", "_", text).strip()
     text = re.sub(r"\s+", "_", text)
     return text or fallback
 
 
+def build_audit_file_basename(dealer: str, auditor: str, when: Optional[datetime] = None) -> str:
+    when = when or datetime.now()
+    return f"{sanitize_for_filename(dealer, 'Dealer')}_{when.strftime('%Y%m%d')}_{sanitize_for_filename(auditor, 'Auditor')}"
+
+
 def get_dealer_options(current_value: str = "") -> List[str]:
-    """Lista de dealers para selectbox, conservando valores cargados de JSON antiguos."""
     current_value = safe_str(current_value)
     options = [""] + ACTIVE_DEALERS.copy()
-
     if current_value and current_value not in options:
         options.insert(1, current_value)
-
     return options
 
 
@@ -415,1038 +465,604 @@ def format_dealer_option(value: str) -> str:
     return "Selecciona dealer" if not safe_str(value) else value
 
 
-def build_audit_file_basename(dealer: str, auditor: str, when: Optional[datetime] = None) -> str:
-    """Base común para todos los archivos exportados: Dealer_fecha_auditor."""
-    when = when or datetime.now()
-    dealer_part = sanitize_for_filename(dealer, "Dealer")
-    date_part = when.strftime("%Y%m%d")
-    auditor_part = sanitize_for_filename(auditor, "Auditor")
-    return f"{dealer_part}_{date_part}_{auditor_part}"
+def option_labels(check: AuditCheck, language: str = "es") -> List[str]:
+    return [option.label_es if language == "es" else option.label_en for option in check.options]
 
 
-def apply_default_dealer_to_blank_claims(claims: Dict[str, Dict[str, Any]], dealer: str) -> None:
-    """Aplica el dealer general a claims sin dealer propio, sin pisar valores ya informados."""
-    dealer = safe_str(dealer)
-    if not dealer:
-        return
-
-    for claim in claims.values():
-        if not safe_str(claim.get("dealer", "")):
-            claim["dealer"] = dealer
+def option_display(option: AuditOption, language: str = "es") -> str:
+    return option.label_es if language == "es" else option.label_en
 
 
-def normalize_workflow_status(value: Any) -> str:
-    """Normaliza el estado manual de trabajo de una claim."""
-    status = safe_str(value)
-    return status if status in CLAIM_WORKFLOW_STATUSES else "Pendiente"
+def check_label(check: AuditCheck, language: str = "es") -> str:
+    return check.label_es if language == "es" else check.label_en
 
 
-def get_claim_workflow_status(claim: Dict[str, Any]) -> str:
-    """Estado visible de la claim: manual si existe, si no derivado de la puntuación."""
-    manual_status = normalize_workflow_status(claim.get("workflow_status", "Pendiente"))
-
-    # Si el usuario no ha marcado nada manualmente y la claim está completa, mostramos Completada.
-    if manual_status == "Pendiente":
-        try:
-            if calculate_claim_score(claim).get("completed"):
-                return "Completada"
-        except Exception:
-            pass
-
-    return manual_status
+def check_guidance(check: AuditCheck, language: str = "es") -> str:
+    return check.guidance_es if language == "es" else check.guidance_en
 
 
-def set_claim_workflow_status(claim: Dict[str, Any], status: str) -> None:
-    """Actualiza el estado manual de la claim."""
-    claim["workflow_status"] = normalize_workflow_status(status)
+def block_label(block_key: str, language: str = "es") -> str:
+    if block_key == "document":
+        return TEXT[language]["document_section"]
+    if block_key == "old_parts":
+        return TEXT[language]["old_parts_section"]
+    return "Campañas informativas" if language == "es" else "Informative campaigns"
 
 
-def get_active_audit_mode() -> str:
-    """Modo activo de la app, con fallback seguro."""
+def option_from_label(check: AuditCheck, label: str) -> AuditOption:
+    for option in check.options:
+        if label in (option.label_es, option.label_en):
+            return option
+    return PENDING
+
+
+def option_from_key(check: AuditCheck, key: str) -> AuditOption:
+    for option in check.options:
+        if option.key == key:
+            return option
+    return PENDING
+
+
+def option_from_points(check: AuditCheck, raw_points: Any) -> AuditOption:
+    if raw_points is None or safe_str(raw_points) == "":
+        return PENDING
     try:
-        mode = safe_str(st.session_state.get("audit_mode", AUDIT_MODE_NSC))
+        numeric = int(float(str(raw_points).replace(",", ".")))
     except Exception:
-        mode = AUDIT_MODE_NSC
-    return mode if mode in AUDIT_MODES else AUDIT_MODE_NSC
+        return PENDING
+    for option in check.options:
+        if option.points == numeric:
+            return option
+    return PENDING
 
 
-def is_dealer_mode(mode: Optional[str] = None) -> bool:
-    mode = mode or get_active_audit_mode()
-    return mode == AUDIT_MODE_DEALER
+def infer_claim_ids(value: Any) -> Tuple[str, str]:
+    value = safe_str(value)
+    if not value:
+        return "", ""
+    normalized = value.upper().replace(" ", "")
+    if normalized.startswith("CO"):
+        return value, ""
+    return "", value
 
 
-def is_nsc_mode(mode: Optional[str] = None) -> bool:
-    mode = mode or get_active_audit_mode()
-    return mode == AUDIT_MODE_NSC
+def claim_identifier(claim: Dict[str, Any], language: str = "es") -> str:
+    if language == "es":
+        return safe_str(claim.get("local_claim_no")) or safe_str(claim.get("claim_no")) or safe_str(claim.get("hq_claim_no"))
+    return safe_str(claim.get("hq_claim_no")) or safe_str(claim.get("claim_no")) or safe_str(claim.get("local_claim_no"))
 
 
-def get_active_review_role(mode: Optional[str] = None) -> str:
-    """Rol que se está editando en la checklist: dealer o nsc."""
-    return "dealer" if is_dealer_mode(mode) else "nsc"
+def claim_other_identifier(claim: Dict[str, Any], language: str = "es") -> str:
+    if language == "es":
+        return safe_str(claim.get("hq_claim_no"))
+    return safe_str(claim.get("local_claim_no"))
 
 
-def get_active_evaluations_field(mode: Optional[str] = None) -> str:
-    return f"{get_active_review_role(mode)}_evaluations"
+def make_claim_key(local_claim_no: str, hq_claim_no: str, fallback: str = "") -> str:
+    local = safe_str(local_claim_no)
+    hq = safe_str(hq_claim_no)
+    fallback = safe_str(fallback)
+    if local and hq:
+        return f"{local}__{hq}"
+    return local or hq or fallback
 
 
-def get_active_general_comment_field(mode: Optional[str] = None) -> str:
-    return f"{get_active_review_role(mode)}_general_comment"
-
-
-def clone_jsonable(value: Any) -> Any:
-    """Copia profunda segura para estructuras de dict/list simples."""
+def result_label(points: Any, language: str = "es") -> str:
+    t = TEXT[language]
     try:
-        return copy.deepcopy(value)
+        p = float(points)
     except Exception:
-        return json.loads(json.dumps(value, ensure_ascii=False))
-
-
-def normalize_evaluations_dict(raw_evaluations: Any) -> Dict[str, Dict[str, Any]]:
-    """Normaliza un diccionario de evaluaciones y rellena apartados que falten."""
-    source = raw_evaluations if isinstance(raw_evaluations, dict) else {}
-    normalized: Dict[str, Dict[str, Any]] = {}
-
-    for check in ALL_CHECKS:
-        raw_item = source.get(check.key, {}) if isinstance(source, dict) else {}
-        if isinstance(raw_item, dict):
-            normalized[check.key] = normalize_loaded_evaluation(check, raw_item)
-        else:
-            normalized[check.key] = new_evaluation(check)
-
-    return normalized
-
-
-def ensure_claim_review_layers(claim: Dict[str, Any]) -> None:
-    """Garantiza doble capa de revisión: autoauditoría dealer y revisión NSC.
-
-    - Dealer: lo que rellena el concesionario / autoauditoría.
-    - NSC: lo que revisa o corrige el supervisor.
-
-    Se mantiene claim['evaluations'] como alias activo para que el resto de la app
-    siga funcionando sin duplicar toda la lógica.
-    """
-    base_evaluations = normalize_evaluations_dict(claim.get("evaluations", {}))
-
-    if "dealer_evaluations" not in claim or not isinstance(claim.get("dealer_evaluations"), dict):
-        claim["dealer_evaluations"] = clone_jsonable(base_evaluations)
-    else:
-        claim["dealer_evaluations"] = normalize_evaluations_dict(claim.get("dealer_evaluations"))
-
-    if "nsc_evaluations" not in claim or not isinstance(claim.get("nsc_evaluations"), dict):
-        # Cuando NSC carga una entrega del dealer, parte de su evaluación para corregirla,
-        # no de cero. Así la comparación empieza en 0 de diferencia y cambia solo si NSC corrige.
-        claim["nsc_evaluations"] = clone_jsonable(claim["dealer_evaluations"])
-    else:
-        claim["nsc_evaluations"] = normalize_evaluations_dict(claim.get("nsc_evaluations"))
-
-    claim.setdefault("dealer_general_comment", safe_str(claim.get("general_comment", "")))
-    claim.setdefault("nsc_general_comment", safe_str(claim.get("general_comment", "")))
-    claim.setdefault("nsc_review_comment", "")
-    claim.setdefault("submission_status", "Borrador")
-
-
-def ensure_review_layers_for_claims(claims: Dict[str, Dict[str, Any]]) -> None:
-    for claim in claims.values():
-        ensure_claim_review_layers(claim)
-
-
-def activate_review_layer_for_claims(claims: Dict[str, Dict[str, Any]], mode: Optional[str] = None) -> None:
-    """Hace que claim['evaluations'] apunte a la capa activa para cálculo/export/UI."""
-    mode = mode or get_active_audit_mode()
-    evaluations_field = get_active_evaluations_field(mode)
-    general_comment_field = get_active_general_comment_field(mode)
-
-    for claim in claims.values():
-        ensure_claim_review_layers(claim)
-        claim["evaluations"] = claim[evaluations_field]
-        claim["general_comment"] = safe_str(claim.get(general_comment_field, ""))
-
-
-def calculate_claim_score_with_evaluations(claim: Dict[str, Any], evaluations: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """Calcula puntuación usando una capa concreta de evaluaciones."""
-    doc_points = 0
-    old_points = 0
-    pending = []
-    lost_by_area = []
-
-    for check in DOCUMENT_CHECKS:
-        evaluation = evaluations.get(check.key, {})
-        points = evaluation.get("points")
-        if points is None:
-            pending.append(check.label)
-            continue
-        doc_points += int(points)
-        lost = check.max_points - int(points)
-        if lost > 0:
-            lost_by_area.append((check.block, check.label, lost, check.max_points, evaluation.get("status", "")))
-
-    for check in OLD_PARTS_CHECKS:
-        evaluation = evaluations.get(check.key, {})
-        points = evaluation.get("points")
-        if points is None:
-            pending.append(check.label)
-            continue
-        old_points += int(points)
-        lost = check.max_points - int(points)
-        if lost > 0:
-            lost_by_area.append((check.block, check.label, lost, check.max_points, evaluation.get("status", "")))
-
-    total_points = doc_points + old_points
-    completed = len(pending) == 0
-
-    return {
-        "doc_points": doc_points,
-        "old_points": old_points,
-        "total_points": total_points,
-        "success_percent": total_points,
-        "pending": pending,
-        "completed": completed,
-        "lost_by_area": lost_by_area,
-    }
-
-
-def calculate_claim_score_for_role(claim: Dict[str, Any], role: str) -> Dict[str, Any]:
-    ensure_claim_review_layers(claim)
-    field = "dealer_evaluations" if role == "dealer" else "nsc_evaluations"
-    return calculate_claim_score_with_evaluations(claim, claim.get(field, {}))
-
-
-def build_dealer_nsc_comparison_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
-    """Panel offline Fase 2: compara autoauditoría dealer vs revisión NSC."""
-    rows = []
-    for claim in claims.values():
-        ensure_claim_review_layers(claim)
-        dealer_score = calculate_claim_score_for_role(claim, "dealer")
-        nsc_score = calculate_claim_score_for_role(claim, "nsc")
-        rows.append({
-            "Claim No.": claim.get("claim_no", ""),
-            "Dealer": claim.get("dealer", ""),
-            "Autoauditoría dealer /100": dealer_score["total_points"],
-            "Revisión NSC /100": nsc_score["total_points"],
-            "Diferencia NSC - Dealer": nsc_score["total_points"] - dealer_score["total_points"],
-            "Estado claim": get_claim_workflow_status(claim),
-            "Estado entrega": safe_str(claim.get("submission_status", "Borrador")),
-            "Comentario dealer": safe_str(claim.get("dealer_general_comment", "")),
-            "Comentario NSC": safe_str(claim.get("nsc_general_comment", "")),
-        })
-    return pd.DataFrame(rows)
-
-
-def build_supervisor_overview_row(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, source_name: str = "") -> Dict[str, Any]:
-    """Resumen de una auditoría recibida para el panel NSC offline."""
-    ensure_review_layers_for_claims(claims)
-    # En el panel supervisor miramos la capa NSC si existe, pero mantenemos también dealer.
-    current_mode = get_active_audit_mode() if "st" in globals() else AUDIT_MODE_NSC
-    activate_review_layer_for_claims(claims, AUDIT_MODE_NSC)
-    score = calculate_audit_score(claims)
-    comparison_df = build_dealer_nsc_comparison_dataframe(claims)
-    avg_difference = 0.0
-    if not comparison_df.empty:
-        avg_difference = float(pd.to_numeric(comparison_df["Diferencia NSC - Dealer"], errors="coerce").fillna(0).mean())
-    activate_review_layer_for_claims(claims, current_mode)
-    return {
-        "audit_name": audit_name,
-        "dealer": dealer,
-        "auditor": auditor,
-        "source_name": source_name,
-        "claims_count": score["claims"],
-        "completed_claims": score["completed_claims"],
-        "nsc_success_percent": score["success_percent"],
-        "avg_difference": avg_difference,
-        "claims": clone_jsonable(claims),
-    }
-
-
-def load_audit_workfile_from_bytes(raw_bytes: bytes, source_name: str = "") -> Tuple[Dict[str, Dict[str, Any]], str, str, str, str]:
-    """Carga JSON directo o ZIP con JSON dentro."""
-    if zipfile.is_zipfile(BytesIO(raw_bytes)):
-        with zipfile.ZipFile(BytesIO(raw_bytes), "r") as zip_file:
-            json_names = [name for name in zip_file.namelist() if name.lower().endswith(".json")]
-            if not json_names:
-                raise ValueError("El ZIP no contiene ningún JSON de auditoría.")
-            # Preferimos el JSON principal si existe.
-            json_name = next((name for name in json_names if "audit" in name.lower() or "auditoria" in name.lower()), json_names[0])
-            content = zip_file.read(json_name).decode("utf-8")
-    else:
-        content = raw_bytes.decode("utf-8")
-
-    payload = json.loads(content)
-
-    if not isinstance(payload, dict) or payload.get("file_type") != "warranty_audit_workfile":
-        raise ValueError("El archivo no parece una auditoría de trabajo generada por esta app.")
-
-    audit = payload.get("audit", {}) if isinstance(payload.get("audit", {}), dict) else {}
-    raw_claims = payload.get("claims", {})
-
-    claims: Dict[str, Dict[str, Any]] = {}
-
-    if isinstance(raw_claims, dict):
-        iterable = raw_claims.items()
-    elif isinstance(raw_claims, list):
-        iterable = ((safe_str(item.get("claim_no", "")) if isinstance(item, dict) else "", item) for item in raw_claims)
-    else:
-        iterable = []
-
-    for fallback_claim_no, raw_claim in iterable:
-        claim = normalize_loaded_claim(raw_claim, fallback_claim_no)
-        if claim is not None:
-            ensure_claim_review_layers(claim)
-            claims[claim["claim_no"]] = claim
-
-    if not claims:
-        raise ValueError("El archivo se pudo abrir, pero no contiene claims válidas.")
-
-    loaded_mode = safe_str(audit.get("audit_mode", AUDIT_MODE_NSC)) or AUDIT_MODE_NSC
-    if loaded_mode not in AUDIT_MODES:
-        loaded_mode = AUDIT_MODE_NSC
-
-    return (
-        claims,
-        safe_str(audit.get("audit_name", "Auditoría garantías")) or "Auditoría garantías",
-        safe_str(audit.get("dealer", "")),
-        safe_str(audit.get("auditor", "")),
-        loaded_mode,
-    )
-
-
-def uploaded_file_to_attachment(uploaded_file) -> Dict[str, Any]:
-    """Convierte un UploadedFile de Streamlit en un registro serializable en JSON."""
-    data = uploaded_file.getvalue()
-    return {
-        "name": safe_str(getattr(uploaded_file, "name", "archivo")) or "archivo",
-        "type": safe_str(getattr(uploaded_file, "type", "")),
-        "size": len(data),
-        "uploaded_at": datetime.now().isoformat(timespec="seconds"),
-        "data_base64": base64.b64encode(data).decode("ascii"),
-    }
-
-
-def normalize_loaded_attachment(raw_attachment: Any) -> Optional[Dict[str, Any]]:
-    """Normaliza adjuntos cargados desde JSON y evita registros corruptos."""
-    if not isinstance(raw_attachment, dict):
-        return None
-
-    name = safe_str(raw_attachment.get("name", ""))
-    data_base64 = safe_str(raw_attachment.get("data_base64", ""))
-
-    if not name and not data_base64:
-        return None
-
-    try:
-        size = int(raw_attachment.get("size", 0) or 0)
-    except Exception:
-        size = 0
-
-    return {
-        "name": name or "archivo",
-        "type": safe_str(raw_attachment.get("type", "")),
-        "size": size,
-        "uploaded_at": safe_str(raw_attachment.get("uploaded_at", "")),
-        "data_base64": data_base64,
-    }
-
-
-def normalize_claim_attachments(raw_attachments: Any) -> Dict[str, Any]:
-    """Estructura estable de adjuntos por claim."""
-    attachments = {
-        "old_parts_photos": [],
-        "destruction_certificate": None,
-    }
-
-    if not isinstance(raw_attachments, dict):
-        return attachments
-
-    raw_photos = raw_attachments.get("old_parts_photos", [])
-    if isinstance(raw_photos, list):
-        attachments["old_parts_photos"] = [
-            item for item in (normalize_loaded_attachment(photo) for photo in raw_photos)
-            if item is not None
-        ]
-
-    certificate = normalize_loaded_attachment(raw_attachments.get("destruction_certificate"))
-    attachments["destruction_certificate"] = certificate
-
-    return attachments
-
-
-def get_claim_attachments(claim: Dict[str, Any]) -> Dict[str, Any]:
-    """Garantiza que la claim tenga estructura de adjuntos aunque venga de versiones antiguas."""
-    claim["attachments"] = normalize_claim_attachments(claim.get("attachments", {}))
-    return claim["attachments"]
-
-
-def attachment_bytes(attachment: Dict[str, Any]) -> bytes:
-    data_base64 = safe_str(attachment.get("data_base64", ""))
-    if not data_base64:
-        return b""
-
-    try:
-        return base64.b64decode(data_base64.encode("ascii"))
-    except Exception:
-        return b""
-
-
-def attachment_names_summary(attachments: List[Dict[str, Any]]) -> str:
-    if not attachments:
-        return ""
-    names = [safe_str(item.get("name", "archivo")) or "archivo" for item in attachments]
-    return f"{len(names)} archivo(s): " + " | ".join(names)
-
-
-def old_parts_photos_summary(claim: Dict[str, Any]) -> str:
-    attachments = get_claim_attachments(claim)
-    return attachment_names_summary(attachments.get("old_parts_photos", []))
-
-
-def destruction_certificate_summary(claim: Dict[str, Any]) -> str:
-    attachments = get_claim_attachments(claim)
-    certificate = attachments.get("destruction_certificate")
-    if not certificate:
-        return ""
-    return safe_str(certificate.get("name", "Certificado adjunto")) or "Certificado adjunto"
-
-
-def build_attachments_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
-    rows = []
-    for claim in claims.values():
-        attachments = get_claim_attachments(claim)
-        for index, photo in enumerate(attachments.get("old_parts_photos", []), start=1):
-            rows.append({
-                "Claim No.": claim.get("claim_no", ""),
-                "Tipo adjunto": "Foto pieza vieja",
-                "Nº": index,
-                "Archivo": safe_str(photo.get("name", "")),
-                "Formato": safe_str(photo.get("type", "")),
-                "Tamaño bytes": photo.get("size", 0),
-                "Subido en": safe_str(photo.get("uploaded_at", "")),
-            })
-        certificate = attachments.get("destruction_certificate")
-        if certificate:
-            rows.append({
-                "Claim No.": claim.get("claim_no", ""),
-                "Tipo adjunto": "Certificado destrucción",
-                "Nº": 1,
-                "Archivo": safe_str(certificate.get("name", "")),
-                "Formato": safe_str(certificate.get("type", "")),
-                "Tamaño bytes": certificate.get("size", 0),
-                "Subido en": safe_str(certificate.get("uploaded_at", "")),
-            })
-    return pd.DataFrame(rows)
+        return "Pendiente" if language == "es" else "Pending"
+    if p >= 90:
+        return t["excellent"]
+    if p >= 80:
+        return t["correct"]
+    if p >= 60:
+        return t["improvable"]
+    return t["critical"]
+
+
+# =============================================================================
+# MODELO DE DATOS
+# =============================================================================
 
 
 def new_evaluation(check: AuditCheck, prefill_points: Any = None) -> Dict[str, Any]:
     option = option_from_points(check, prefill_points)
     return {
+        "option_key": option.key,
         "status": option.status,
-        "label": option.label,
         "points": option.points,
         "max_points": check.max_points,
         "comment": "",
     }
 
 
-def empty_claim_record(claim_no: str) -> Dict[str, Any]:
+def empty_claim_record(claim_no: str = "", local_claim_no: str = "", hq_claim_no: str = "") -> Dict[str, Any]:
+    inferred_local, inferred_hq = infer_claim_ids(claim_no)
+    local = safe_str(local_claim_no) or inferred_local
+    hq = safe_str(hq_claim_no) or inferred_hq
+    internal_claim_no = safe_str(claim_no) or local or hq
     return {
-        "claim_no": claim_no,
+        "claim_no": internal_claim_no,
+        "local_claim_no": local,
+        "hq_claim_no": hq,
         "dealer": "",
         "vin": "",
         "model": "",
         "amount": "",
         "repair_date": "",
         "submission_date": "",
-        "workflow_status": "Pendiente",
-        "nsc_comment": "",
         "general_comment": "",
+        "internal_comment": "",
         "evaluations": {check.key: new_evaluation(check) for check in ALL_CHECKS},
-        "attachments": {
-            "old_parts_photos": [],
-            "destruction_certificate": None,
-        },
     }
 
 
 def calculate_claim_score(claim: Dict[str, Any]) -> Dict[str, Any]:
-    """Calcula la puntuación de la capa activa de la claim."""
-    ensure_claim_review_layers(claim)
-    evaluations = claim.get("evaluations", {})
-    return calculate_claim_score_with_evaluations(claim, evaluations)
+    doc_points = 0
+    old_points = 0
+    pending = []
+    lost_by_area = []
+
+    for check in DOCUMENT_CHECKS:
+        evaluation = claim["evaluations"].get(check.key, {})
+        points = evaluation.get("points")
+        if points is None:
+            pending.append(check.label_es)
+            continue
+        doc_points += int(points)
+        lost = check.max_points - int(points)
+        if lost > 0:
+            lost_by_area.append((check, lost, evaluation.get("status", "")))
+
+    for check in OLD_PARTS_CHECKS:
+        evaluation = claim["evaluations"].get(check.key, {})
+        points = evaluation.get("points")
+        if points is None:
+            pending.append(check.label_es)
+            continue
+        old_points += int(points)
+        lost = check.max_points - int(points)
+        if lost > 0:
+            lost_by_area.append((check, lost, evaluation.get("status", "")))
+
+    total_points = doc_points + old_points
+    return {
+        "doc_points": doc_points,
+        "old_points": old_points,
+        "total_points": total_points,
+        "success_percent": total_points,
+        "pending": pending,
+        "completed": len(pending) == 0,
+        "lost_by_area": lost_by_area,
+    }
 
 
 def calculate_audit_score(claims: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     if not claims:
-        return {
-            "claims": 0,
-            "completed_claims": 0,
-            "doc_points": 0,
-            "old_points": 0,
-            "total_points": 0,
-            "max_points": 0,
-            "success_percent": 0,
-        }
-
-    completed_claims = 0
-    doc_points = 0
-    old_points = 0
-    total_points = 0
-
+        return {"claims": 0, "completed_claims": 0, "doc_points": 0, "old_points": 0, "total_points": 0, "max_points": 0, "success_percent": 0}
+    doc_points = old_points = total_points = completed = 0
     for claim in claims.values():
         score = calculate_claim_score(claim)
-        if score["completed"]:
-            completed_claims += 1
         doc_points += score["doc_points"]
         old_points += score["old_points"]
         total_points += score["total_points"]
-
+        completed += int(bool(score["completed"]))
     max_points = len(claims) * MAX_TOTAL_POINTS
-    percent = (total_points / max_points * 100) if max_points else 0
-
     return {
         "claims": len(claims),
-        "completed_claims": completed_claims,
+        "completed_claims": completed,
         "doc_points": doc_points,
         "old_points": old_points,
         "total_points": total_points,
         "max_points": max_points,
-        "success_percent": percent,
+        "success_percent": (total_points / max_points * 100) if max_points else 0,
     }
 
 
-
-# =============================================================================
-# GUARDAR / CARGAR AUDITORÍA DE TRABAJO
-# =============================================================================
-
-def normalize_loaded_evaluation(check: AuditCheck, raw_evaluation: Any) -> Dict[str, Any]:
-    """Normaliza una evaluación cargada desde JSON para que siempre sea compatible."""
+def normalize_loaded_evaluation(check: AuditCheck, raw: Any) -> Dict[str, Any]:
     base = new_evaluation(check)
-
-    if not isinstance(raw_evaluation, dict):
+    if not isinstance(raw, dict):
         return base
-
-    label = safe_str(raw_evaluation.get("label", ""))
-    status = safe_str(raw_evaluation.get("status", ""))
-    raw_points = raw_evaluation.get("points", None)
-
-    option = None
-    if label:
-        option = option_from_label(check, label)
-    elif raw_points is not None:
-        option = option_from_points(check, raw_points)
-
-    if option is None:
+    option_key = safe_str(raw.get("option_key", ""))
+    status = safe_str(raw.get("status", ""))
+    points = raw.get("points", None)
+    if option_key:
+        option = option_from_key(check, option_key)
+    elif points is not None:
+        option = option_from_points(check, points)
+    else:
         option = PENDING
-
-    # Si venía como Pendiente con points None, respetamos pendiente.
-    points = option.points
-    if raw_points is None and status.lower() == "pendiente":
-        points = None
-
+    # Mantener pendiente si venía explícitamente pendiente.
+    final_points = None if status.lower().startswith("pend") and points is None else option.points
     return {
+        "option_key": option.key,
         "status": status or option.status,
-        "label": label or option.label,
-        "points": points,
+        "points": final_points,
         "max_points": check.max_points,
-        "comment": safe_str(raw_evaluation.get("comment", "")),
+        "comment": safe_str(raw.get("comment", "")),
     }
 
 
-def normalize_loaded_claim(raw_claim: Any, fallback_claim_no: str = "") -> Optional[Dict[str, Any]]:
-    """Convierte una claim guardada en JSON a la estructura interna actual."""
+def normalize_loaded_claim(raw_claim: Any, fallback: str = "") -> Optional[Dict[str, Any]]:
     if not isinstance(raw_claim, dict):
         return None
-
-    claim_no = safe_str(raw_claim.get("claim_no", fallback_claim_no))
-    if not claim_no:
+    claim_no = safe_str(raw_claim.get("claim_no", fallback))
+    local = safe_str(raw_claim.get("local_claim_no", ""))
+    hq = safe_str(raw_claim.get("hq_claim_no", ""))
+    if not any([claim_no, local, hq]):
         return None
-
-    claim = empty_claim_record(claim_no)
-
-    for field in [
-        "dealer",
-        "vin",
-        "model",
-        "amount",
-        "repair_date",
-        "submission_date",
-        "nsc_comment",
-        "general_comment",
-        "dealer_general_comment",
-        "nsc_general_comment",
-        "nsc_review_comment",
-        "submission_status",
-    ]:
-        if field in raw_claim:
-            claim[field] = safe_str(raw_claim.get(field, claim.get(field, "")))
-
-    claim["workflow_status"] = normalize_workflow_status(raw_claim.get("workflow_status", claim.get("workflow_status", "Pendiente")))
-
+    claim = empty_claim_record(claim_no, local, hq)
+    for field in ["dealer", "vin", "model", "amount", "repair_date", "submission_date", "general_comment", "internal_comment"]:
+        claim[field] = safe_str(raw_claim.get(field, claim.get(field, "")))
     raw_evaluations = raw_claim.get("evaluations", {})
     if isinstance(raw_evaluations, dict):
         for check in ALL_CHECKS:
             if check.key in raw_evaluations:
                 claim["evaluations"][check.key] = normalize_loaded_evaluation(check, raw_evaluations[check.key])
-
-    if isinstance(raw_claim.get("dealer_evaluations"), dict):
-        claim["dealer_evaluations"] = normalize_evaluations_dict(raw_claim.get("dealer_evaluations"))
-
-    if isinstance(raw_claim.get("nsc_evaluations"), dict):
-        claim["nsc_evaluations"] = normalize_evaluations_dict(raw_claim.get("nsc_evaluations"))
-
-    claim["attachments"] = normalize_claim_attachments(raw_claim.get("attachments", {}))
-    ensure_claim_review_layers(claim)
-
     return claim
 
 
-def serialize_audit_workfile(
-    claims: Dict[str, Dict[str, Any]],
-    audit_name: str,
-    dealer: str,
-    auditor: str,
-    audit_mode: str = "",
-) -> bytes:
-    """Genera un archivo JSON descargable para poder continuar la auditoría otro día."""
-    ensure_review_layers_for_claims(claims)
-    activate_review_layer_for_claims(claims, audit_mode or get_active_audit_mode())
+def serialize_audit_workfile(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> bytes:
     payload = {
         "file_type": "warranty_audit_workfile",
         "version": 2,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
-        "audit": {
-            "audit_name": audit_name or "",
-            "dealer": dealer or "",
-            "auditor": auditor or "",
-            "audit_mode": (audit_mode or (st.session_state.get("audit_mode", AUDIT_MODES[0]) if "st" in globals() else AUDIT_MODES[0])),
-        },
+        "audit": {"audit_name": audit_name or "", "dealer": dealer or "", "auditor": auditor or ""},
         "claims": claims,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
 
-def load_audit_workfile(uploaded_file) -> Tuple[Dict[str, Dict[str, Any]], str, str, str, str]:
-    """Carga una auditoría guardada previamente como JSON o ZIP con JSON interno."""
-    raw_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
-    source_name = safe_str(getattr(uploaded_file, "name", ""))
-    return load_audit_workfile_from_bytes(raw_bytes, source_name)
+def load_audit_workfile(uploaded_file) -> Tuple[Dict[str, Dict[str, Any]], str, str, str]:
+    content = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+    if isinstance(content, bytes):
+        content = content.decode("utf-8")
+    payload = json.loads(content)
+    if not isinstance(payload, dict) or payload.get("file_type") != "warranty_audit_workfile":
+        raise ValueError("El archivo no parece una auditoría de trabajo generada por esta app.")
+    audit = payload.get("audit", {}) if isinstance(payload.get("audit", {}), dict) else {}
+    raw_claims = payload.get("claims", {})
+    claims: Dict[str, Dict[str, Any]] = {}
+    iterable = raw_claims.items() if isinstance(raw_claims, dict) else []
+    for fallback_key, raw_claim in iterable:
+        claim = normalize_loaded_claim(raw_claim, fallback_key)
+        if claim:
+            claims[make_claim_key(claim.get("local_claim_no"), claim.get("hq_claim_no"), claim.get("claim_no"))] = claim
+    if not claims:
+        raise ValueError("El archivo se pudo abrir, pero no contiene claims válidas.")
+    return (
+        claims,
+        safe_str(audit.get("audit_name", "Auditoría garantías")) or "Auditoría garantías",
+        safe_str(audit.get("dealer", "")),
+        safe_str(audit.get("auditor", "")),
+    )
 
 
 # =============================================================================
 # IMPORTACIÓN DE EXCEL
 # =============================================================================
 
-def read_claims_from_uploaded_excel(uploaded_file) -> Dict[str, Dict[str, Any]]:
-    """
-    Lee la checklist oficial si encuentra las hojas:
-    - Claim document checklist I
-    - Claim old parts checklist II
 
-    También soporta un Excel simple con una columna Claim No. / Claim / claim_number.
-    """
+def find_column(normalized_cols: Dict[str, Any], candidates: List[str]) -> Optional[Any]:
+    normalized_candidates = [normalize_text(item) for item in candidates]
+    for candidate in normalized_candidates:
+        if candidate in normalized_cols:
+            return normalized_cols[candidate]
+    # segunda pasada por inclusión flexible
+    for candidate in normalized_candidates:
+        for col_norm, col_real in normalized_cols.items():
+            if candidate and candidate in col_norm:
+                return col_real
+    return None
+
+
+def upsert_claim(claims: Dict[str, Dict[str, Any]], claim_no: str = "", local_claim_no: str = "", hq_claim_no: str = "") -> Dict[str, Any]:
+    local = safe_str(local_claim_no)
+    hq = safe_str(hq_claim_no)
+    if not local and not hq and claim_no:
+        local, hq = infer_claim_ids(claim_no)
+    key = make_claim_key(local, hq, claim_no)
+    if not key:
+        raise ValueError("Claim vacía")
+    claim = claims.setdefault(key, empty_claim_record(claim_no or local or hq, local, hq))
+    if local:
+        claim["local_claim_no"] = local
+    if hq:
+        claim["hq_claim_no"] = hq
+    if not safe_str(claim.get("claim_no", "")):
+        claim["claim_no"] = local or hq or claim_no
+    return claim
+
+
+def read_claims_from_uploaded_excel(uploaded_file) -> Dict[str, Dict[str, Any]]:
     xls = pd.ExcelFile(uploaded_file)
     claims: Dict[str, Dict[str, Any]] = {}
 
     if "Claim document checklist I" in xls.sheet_names:
         doc_df = pd.read_excel(uploaded_file, sheet_name="Claim document checklist I", header=None)
-        # En la plantilla: fila 3 humana = índice 2, datos desde fila 4 = índice 3.
+        doc_columns = {
+            "doc_or": 2,
+            "doc_parts_order": 3,
+            "doc_previous_or": 4,
+            "doc_evidence": 5,
+            "doc_causal_part": 6,
+            "doc_labor": 7,
+            "doc_aux_material": 8,
+            "doc_dates": 9,
+            "doc_vin": 10,
+        }
         for row_idx in range(3, len(doc_df)):
-            claim_no = safe_str(doc_df.iloc[row_idx, 1] if doc_df.shape[1] > 1 else "")
-            if not claim_no or claim_no.lower() == "nan":
+            raw_claim = safe_str(doc_df.iloc[row_idx, 1] if doc_df.shape[1] > 1 else "")
+            if not raw_claim or raw_claim.lower() == "nan":
                 continue
-            claim = claims.setdefault(claim_no, empty_claim_record(claim_no))
-
-            doc_columns = {
-                "doc_or": 2,
-                "doc_parts_order": 3,
-                "doc_previous_or": 4,
-                "doc_evidence": 5,
-                "doc_causal_part": 6,
-                "doc_labor": 7,
-                "doc_aux_material": 8,
-                "doc_dates": 9,
-                "doc_vin": 10,
-            }
-            check_by_key = {check.key: check for check in DOCUMENT_CHECKS}
+            local, hq = infer_claim_ids(raw_claim)
+            claim = upsert_claim(claims, raw_claim, local, hq)
             for key, col_idx in doc_columns.items():
                 if col_idx < doc_df.shape[1]:
-                    claim["evaluations"][key] = new_evaluation(check_by_key[key], doc_df.iloc[row_idx, col_idx])
-
+                    claim["evaluations"][key] = new_evaluation(CHECK_BY_KEY[key], doc_df.iloc[row_idx, col_idx])
             if doc_df.shape[1] > 15:
-                claim["general_comment"] = safe_str(doc_df.iloc[row_idx, 15])
+                comment = safe_str(doc_df.iloc[row_idx, 15])
+                if comment:
+                    claim["general_comment"] = comment
             if doc_df.shape[1] > 11:
-                campaign_check = safe_str(doc_df.iloc[row_idx, 11])
-                if campaign_check:
-                    claim["evaluations"]["info_campaign_check"]["comment"] = campaign_check
+                campaign_value = safe_str(doc_df.iloc[row_idx, 11])
+                if campaign_value:
+                    claim["evaluations"]["info_campaign_check"]["comment"] = campaign_value
             if doc_df.shape[1] > 12:
-                pending_campaigns = safe_str(doc_df.iloc[row_idx, 12])
-                if pending_campaigns:
-                    claim["evaluations"]["info_pending_campaigns"]["comment"] = pending_campaigns
+                campaign_pending = safe_str(doc_df.iloc[row_idx, 12])
+                if campaign_pending:
+                    claim["evaluations"]["info_pending_campaigns"]["comment"] = campaign_pending
 
     if "Claim old parts checklist II" in xls.sheet_names:
         old_df = pd.read_excel(uploaded_file, sheet_name="Claim old parts checklist II", header=None)
+        old_columns = {
+            "old_management": 2,
+            "old_label": 3,
+            "old_causal_part": 4,
+            "old_failure_info": 5,
+            "old_destruction": 6,
+            "old_destruction_certificate": 7,
+        }
         for row_idx in range(3, len(old_df)):
-            claim_no = safe_str(old_df.iloc[row_idx, 1] if old_df.shape[1] > 1 else "")
-            if not claim_no or claim_no.lower() == "nan":
+            raw_claim = safe_str(old_df.iloc[row_idx, 1] if old_df.shape[1] > 1 else "")
+            if not raw_claim or raw_claim.lower() == "nan":
                 continue
-            claim = claims.setdefault(claim_no, empty_claim_record(claim_no))
-
-            old_columns = {
-                "old_management": 2,
-                "old_label": 3,
-                "old_causal_part": 4,
-                "old_failure_info": 5,
-                "old_destruction": 6,
-                "old_destruction_certificate": 7,
-            }
-            check_by_key = {check.key: check for check in OLD_PARTS_CHECKS}
+            local, hq = infer_claim_ids(raw_claim)
+            claim = upsert_claim(claims, raw_claim, local, hq)
             for key, col_idx in old_columns.items():
                 if col_idx < old_df.shape[1]:
-                    claim["evaluations"][key] = new_evaluation(check_by_key[key], old_df.iloc[row_idx, col_idx])
-
+                    claim["evaluations"][key] = new_evaluation(CHECK_BY_KEY[key], old_df.iloc[row_idx, col_idx])
             if old_df.shape[1] > 10:
                 old_comment = safe_str(old_df.iloc[row_idx, 10])
                 if old_comment:
-                    existing = claim.get("general_comment", "")
+                    existing = safe_str(claim.get("general_comment", ""))
                     claim["general_comment"] = (existing + "\n" + old_comment).strip() if existing else old_comment
 
-    # Fallback para Excel simple de HQ.
     if not claims:
         df = pd.read_excel(uploaded_file, sheet_name=xls.sheet_names[0])
-        normalized_cols = {str(col).strip().lower(): col for col in df.columns}
-        possible_claim_cols = ["claim no.", "claim no", "claim", "claim_number", "claim number", "garantía", "garantia"]
-        claim_col = next((normalized_cols[col] for col in possible_claim_cols if col in normalized_cols), None)
-        if claim_col is None:
-            raise ValueError("No encuentro una columna de Claim No. en el Excel.")
+        normalized_cols = {normalize_text(col): col for col in df.columns}
+        local_col = find_column(normalized_cols, [
+            "Claim España", "Claim ES", "Spanish claim", "Dealer claim", "Local claim", "Claim No.", "Claim No", "Garantía", "Garantia", "CO", "Claim",
+        ])
+        hq_col = find_column(normalized_cols, [
+            "HQ Claim", "HQ Claim No", "IDMS Claim", "IDMs Claim", "TAC", "TAC No", "Identificador HQ", "Claim HQ", "2810",
+        ])
+        generic_col = find_column(normalized_cols, ["Claim No.", "Claim No", "Claim", "claim_number", "claim number", "Garantía", "Garantia"])
+        if local_col is None and hq_col is None and generic_col is None:
+            raise ValueError("No encuentro columnas de claim. Usa al menos Claim España/CO o HQ Claim/IDMS.")
+
+        meta_cols = {
+            "dealer": find_column(normalized_cols, ["dealer", "concesionario", "service dealer"]),
+            "vin": find_column(normalized_cols, ["vin", "chassis", "bastidor"]),
+            "model": find_column(normalized_cols, ["model", "modelo"]),
+            "amount": find_column(normalized_cols, ["amount", "importe", "coste", "total"]),
+            "repair_date": find_column(normalized_cols, ["repair date", "fecha reparacion", "fecha reparación"]),
+            "submission_date": find_column(normalized_cols, ["submission date", "fecha envio", "fecha envío"]),
+        }
 
         for _, row in df.iterrows():
-            claim_no = safe_str(row.get(claim_col, ""))
-            if not claim_no:
+            local_value = safe_str(row.get(local_col, "")) if local_col is not None else ""
+            hq_value = safe_str(row.get(hq_col, "")) if hq_col is not None else ""
+            generic_value = safe_str(row.get(generic_col, "")) if generic_col is not None else ""
+
+            if not local_value and not hq_value and generic_value:
+                local_value, hq_value = infer_claim_ids(generic_value)
+            if not local_value and not hq_value:
                 continue
-            claim = claims.setdefault(claim_no, empty_claim_record(claim_no))
-            for target, possible_names in {
-                "dealer": ["dealer", "concesionario", "service dealer"],
-                "vin": ["vin", "chassis", "bastidor"],
-                "model": ["model", "modelo"],
-                "amount": ["amount", "importe", "coste", "total"],
-                "repair_date": ["repair date", "fecha reparacion", "fecha reparación"],
-                "submission_date": ["submission date", "fecha envio", "fecha envío"],
-            }.items():
-                source_col = next((normalized_cols[name] for name in possible_names if name in normalized_cols), None)
+
+            claim = upsert_claim(claims, generic_value or local_value or hq_value, local_value, hq_value)
+            for field, source_col in meta_cols.items():
                 if source_col is not None:
-                    claim[target] = safe_str(row.get(source_col, ""))
+                    claim[field] = safe_str(row.get(source_col, ""))
 
     return claims
 
 
 # =============================================================================
-# EXPORTACIÓN E INFORME
+# COMENTARIOS Y PLAN DE ACCIÓN
 # =============================================================================
 
-def build_summary_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
+
+def evaluation_comment(claim: Dict[str, Any], check: AuditCheck) -> str:
+    return safe_str(claim.get("evaluations", {}).get(check.key, {}).get("comment", ""))
+
+
+def build_general_comment_from_observations(claim: Dict[str, Any], include_campaigns: bool = True, language: str = "es") -> str:
+    checks = ALL_CHECKS if include_campaigns else ALL_SCORING_CHECKS
+    lines = []
+    for check in checks:
+        comment = evaluation_comment(claim, check)
+        if not comment:
+            continue
+        label = check_label(check, language)
+        if comment.lower().lstrip().startswith(label.lower() + ":"):
+            lines.append(comment)
+        else:
+            lines.append(f"{label}: {comment}")
+    return "\n".join(lines).strip()
+
+
+def build_action_plan_rows(claims: Dict[str, Dict[str, Any]], language: str = "es") -> List[Dict[str, Any]]:
+    rows = []
+    for check in ALL_SCORING_CHECKS:
+        entries = []
+        total_lost = 0
+        affected_claims = 0
+        for claim in claims.values():
+            evaluation = claim.get("evaluations", {}).get(check.key, {})
+            points = evaluation.get("points")
+            status = safe_str(evaluation.get("status", "")) or ("Pendiente" if language == "es" else "Pending")
+            comment = evaluation_comment(claim, check)
+            lost = check.max_points if points is None else max(0, check.max_points - int(points or 0))
+            if lost > 0 or comment:
+                affected_claims += 1
+                total_lost += int(lost)
+                claim_id = claim_identifier(claim, language)
+                if comment:
+                    entries.append(f"{claim_id}: {comment}")
+                else:
+                    if language == "es":
+                        entries.append(f"{claim_id}: {status}, sin observación específica.")
+                    else:
+                        entries.append(f"{claim_id}: {status}, no specific observation.")
+        if affected_claims:
+            if language == "es":
+                exception = f"{affected_claims} claim(s) con desviación u observación. Puntos perdidos: {total_lost}."
+            else:
+                exception = f"{affected_claims} claim(s) with deviation or observation. Lost points: {total_lost}."
+            rows.append({
+                "block": block_label(check.block_key, language),
+                "parameter": check_label(check, language),
+                "exception": exception,
+                "observations": "\n".join(entries),
+                "countermeasure": COUNTERMEASURES.get(check.key, {}).get(language, TEXT[language]["generic_countermeasure"]),
+                "lost_points": total_lost,
+                "affected_claims": affected_claims,
+            })
+    return rows
+
+
+# =============================================================================
+# DATAFRAMES / EXPORTACIÓN
+# =============================================================================
+
+
+def build_summary_dataframe(claims: Dict[str, Dict[str, Any]], language: str = "es") -> pd.DataFrame:
+    t = TEXT[language]
     rows = []
     for claim in claims.values():
         score = calculate_claim_score(claim)
         rows.append({
-            "Claim No.": claim["claim_no"],
-            "Dealer": claim.get("dealer", ""),
-            "VIN": claim.get("vin", ""),
-            "Modelo": claim.get("model", ""),
-            "Importe": claim.get("amount", ""),
-            "Puntos documentación": score["doc_points"],
-            "Puntos piezas viejas": score["old_points"],
-            "Resultado /100": score["total_points"],
-            "% éxito": score["success_percent"],
-            "Estado": get_claim_workflow_status(claim),
-            "Pendientes": " | ".join(score["pending"]),
-            "Comentario NSC": claim.get("nsc_comment", ""),
-            "Comentarios": claim.get("general_comment", ""),
-            "Fotos piezas viejas": old_parts_photos_summary(claim),
-            "Certificado destrucción": destruction_certificate_summary(claim),
+            t["claim_no"]: claim_identifier(claim, language),
+            t["other_id"]: claim_other_identifier(claim, language),
+            t["dealer"]: claim.get("dealer", ""),
+            t["vin"]: claim.get("vin", ""),
+            t["model"]: claim.get("model", ""),
+            t["amount"]: claim.get("amount", ""),
+            t["doc_score"]: score["doc_points"],
+            t["old_score"]: score["old_points"],
+            t["total_score"]: score["total_points"],
+            t["success"]: score["success_percent"],
+            t["result"]: result_label(score["total_points"], language),
+            t["pending"]: " | ".join(score["pending"]),
+            t["comments"]: claim.get("general_comment", ""),
         })
     return pd.DataFrame(rows)
 
 
-def build_detail_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
+def build_detail_dataframe(claims: Dict[str, Dict[str, Any]], language: str = "es") -> pd.DataFrame:
+    t = TEXT[language]
     rows = []
-    check_by_key = {check.key: check for check in ALL_CHECKS}
     for claim in claims.values():
-        for key, evaluation in claim["evaluations"].items():
-            check = check_by_key[key]
+        for check in ALL_CHECKS:
+            evaluation = claim.get("evaluations", {}).get(check.key, {})
+            points = evaluation.get("points")
+            max_points = check.max_points
             rows.append({
-                "Claim No.": claim["claim_no"],
-                "Dealer": claim.get("dealer", ""),
-                "VIN": claim.get("vin", ""),
-                "Modelo": claim.get("model", ""),
-                "Importe": claim.get("amount", ""),
-                "Estado trabajo claim": get_claim_workflow_status(claim),
-                "Bloque": check.block,
-                "Apartado": check.label,
-                "Estado": evaluation.get("status", ""),
-                "Puntos": evaluation.get("points"),
-                "Máximo": check.max_points,
-                "Pérdida": "" if evaluation.get("points") is None else check.max_points - int(evaluation.get("points") or 0),
-                "Comentario apartado": evaluation.get("comment", ""),
-                "Criterio": check.guidance,
+                t["claim_no"]: claim_identifier(claim, language),
+                t["other_id"]: claim_other_identifier(claim, language),
+                t["dealer"]: claim.get("dealer", ""),
+                t["vin"]: claim.get("vin", ""),
+                t["model"]: claim.get("model", ""),
+                t["amount"]: claim.get("amount", ""),
+                "Bloque" if language == "es" else "Section": block_label(check.block_key, language),
+                "Apartado" if language == "es" else "Item": check_label(check, language),
+                "Estado" if language == "es" else "Status": evaluation.get("status", ""),
+                "Puntos" if language == "es" else "Points": points,
+                "Máximo" if language == "es" else "Max": max_points,
+                "Pérdida" if language == "es" else "Lost": "" if points is None else max_points - int(points or 0),
+                "Comentario apartado" if language == "es" else "Item observation": evaluation.get("comment", ""),
+                "Criterio" if language == "es" else "Criterion": check_guidance(check, language),
             })
     return pd.DataFrame(rows)
 
 
-def build_improvement_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
-    rows = []
-    for claim in claims.values():
-        score = calculate_claim_score(claim)
-        for block, area, lost, max_points, status in score["lost_by_area"]:
-            rows.append({
-                "Claim No.": claim["claim_no"],
-                "Dealer": claim.get("dealer", ""),
-                "VIN": claim.get("vin", ""),
-                "Modelo": claim.get("model", ""),
-                "Importe": claim.get("amount", ""),
-                "Bloque": block,
-                "Área de mejora": area,
-                "Estado": status,
-                "Puntos perdidos": lost,
-                "Máximo apartado": max_points,
-                "Comentario NSC": claim.get("nsc_comment", ""),
-                "Comentario claim": claim.get("general_comment", ""),
-            })
-    return pd.DataFrame(rows)
-
-
-
-def old_parts_evidence_required(claim: Dict[str, Any]) -> bool:
-    """Decide si hay que pedir evidencias de piezas viejas para la claim.
-
-    Si todos los apartados de piezas viejas están en No aplica o Pendiente, no forzamos
-    fotos/certificado. Si el auditor empieza a puntuar piezas viejas como OK/Parcial/NOK
-    o ya ha subido adjuntos, activamos la validación.
-    """
-    attachments = get_claim_attachments(claim)
-    if attachments.get("old_parts_photos") or attachments.get("destruction_certificate"):
-        return True
-
-    for check in OLD_PARTS_CHECKS:
-        evaluation = claim.get("evaluations", {}).get(check.key, {})
-        status = safe_str(evaluation.get("status", ""))
-        if status not in ("", "Pendiente", "N/A"):
-            return True
-
-    return False
-
-
-def destruction_certificate_required(claim: Dict[str, Any]) -> bool:
-    evaluation = claim.get("evaluations", {}).get("old_destruction_certificate", {})
-    status = safe_str(evaluation.get("status", ""))
-    return status not in ("", "Pendiente", "N/A")
-
-
-def build_closing_validation_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
-    """Checklist de cierre: avisa de pendientes antes de dar la auditoría por cerrada."""
-    rows = []
-
-    for claim in claims.values():
-        score = calculate_claim_score(claim)
-        claim_no = claim.get("claim_no", "")
-        workflow_status = get_claim_workflow_status(claim)
-
-        if score["pending"]:
-            rows.append({
-                "Claim No.": claim_no,
-                "Tipo aviso": "Puntuación pendiente",
-                "Detalle": "Apartados sin revisar: " + " | ".join(score["pending"]),
-                "Severidad": "Alta",
-                "Estado claim": workflow_status,
-            })
-
-        if score["lost_by_area"] and not safe_str(claim.get("general_comment", "")):
-            rows.append({
-                "Claim No.": claim_no,
-                "Tipo aviso": "Comentario general vacío",
-                "Detalle": "Hay puntos perdidos, pero no hay comentario general generado/escrito.",
-                "Severidad": "Media",
-                "Estado claim": workflow_status,
-            })
-
-        attachments = get_claim_attachments(claim)
-        photos_count = len(attachments.get("old_parts_photos", []))
-        if old_parts_evidence_required(claim) and photos_count < 3:
-            rows.append({
-                "Claim No.": claim_no,
-                "Tipo aviso": "Fotos piezas viejas",
-                "Detalle": f"Hay {photos_count} foto(s) adjunta(s). Recomendado mínimo: 3.",
-                "Severidad": "Media",
-                "Estado claim": workflow_status,
-            })
-
-        if destruction_certificate_required(claim) and not attachments.get("destruction_certificate"):
-            rows.append({
-                "Claim No.": claim_no,
-                "Tipo aviso": "Certificado destrucción",
-                "Detalle": "El apartado de certificado no está marcado como N/A/Pendiente, pero no hay archivo adjunto.",
-                "Severidad": "Media",
-                "Estado claim": workflow_status,
-            })
-
-        if workflow_status in ("Pendiente", "En revisión") and score["completed"]:
-            rows.append({
-                "Claim No.": claim_no,
-                "Tipo aviso": "Estado de trabajo",
-                "Detalle": "La puntuación está completa, pero la claim no está marcada como Completada/Cerrada.",
-                "Severidad": "Baja",
-                "Estado claim": workflow_status,
-            })
-
-    return pd.DataFrame(rows)
-
-
-
-def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> bytes:
-    """
-    Exportación analítica en Excel usando xlsxwriter.
-    Requiere en requirements.txt: xlsxwriter
-    """
+def export_analytical_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, language: str = "es") -> bytes:
     output = BytesIO()
-    summary_df = build_summary_dataframe(claims)
-    summary_export_df = summary_df.copy()
-    if "% éxito" in summary_export_df.columns:
-        summary_export_df["% éxito"] = pd.to_numeric(summary_export_df["% éxito"], errors="coerce") / 100
-    detail_df = build_detail_dataframe(claims)
-    improvement_df = build_improvement_dataframe(claims)
-    attachments_df = build_attachments_dataframe(claims)
-    closing_df = build_closing_validation_dataframe(claims)
-    comparison_df = build_dealer_nsc_comparison_dataframe(claims)
+    t = TEXT[language]
     audit_score = calculate_audit_score(claims)
+    summary_df = build_summary_dataframe(claims, language)
+    detail_df = build_detail_dataframe(claims, language)
+    action_df = pd.DataFrame(build_action_plan_rows(claims, language))
+    if action_df.empty:
+        action_df = pd.DataFrame(columns=["block", "parameter", "exception", "observations", "countermeasure", "lost_points", "affected_claims"])
 
     cover_df = pd.DataFrame([
-        {"Campo": "Auditoría", "Valor": audit_name},
-        {"Campo": "Dealer", "Valor": dealer},
-        {"Campo": "Auditor", "Valor": auditor},
-        {"Campo": "Fecha exportación", "Valor": datetime.now().strftime("%Y-%m-%d %H:%M")},
-        {"Campo": "Claims", "Valor": audit_score["claims"]},
-        {"Campo": "Claims completadas", "Valor": audit_score["completed_claims"]},
-        {"Campo": "Resultado", "Valor": f"{audit_score['total_points']}/{audit_score['max_points']}"},
-        {"Campo": "% éxito", "Valor": f"{audit_score['success_percent']:.1f}%"},
+        {"Campo" if language == "es" else "Field": t["report_title"], "Valor" if language == "es" else "Value": audit_name},
+        {"Campo" if language == "es" else "Field": t["dealer"], "Valor" if language == "es" else "Value": dealer},
+        {"Campo" if language == "es" else "Field": "Auditor", "Valor" if language == "es" else "Value": auditor},
+        {"Campo" if language == "es" else "Field": "Fecha exportación" if language == "es" else "Export date", "Valor" if language == "es" else "Value": datetime.now().strftime("%Y-%m-%d %H:%M")},
+        {"Campo" if language == "es" else "Field": "Resultado", "Valor" if language == "es" else "Value": f"{audit_score['success_percent']:.1f}% ({audit_score['total_points']}/{audit_score['max_points']})"},
     ])
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        cover_df.to_excel(writer, index=False, sheet_name="Resumen auditoría")
-        summary_export_df.to_excel(writer, index=False, sheet_name="Claims")
-        detail_df.to_excel(writer, index=False, sheet_name="Detalle apartados")
-        improvement_df.to_excel(writer, index=False, sheet_name="Áreas de mejora")
-        attachments_df.to_excel(writer, index=False, sheet_name="Adjuntos")
-        closing_df.to_excel(writer, index=False, sheet_name="Validación cierre")
-        comparison_df.to_excel(writer, index=False, sheet_name="Comparación Dealer NSC")
+        cover_df.to_excel(writer, index=False, sheet_name="Resumen" if language == "es" else "Summary")
+        summary_export = summary_df.copy()
+        if t["success"] in summary_export.columns:
+            summary_export[t["success"]] = pd.to_numeric(summary_export[t["success"]], errors="coerce") / 100
+        summary_export.to_excel(writer, index=False, sheet_name="Claims")
+        detail_df.to_excel(writer, index=False, sheet_name="Detalle" if language == "es" else "Detail")
+        action_df.rename(columns={
+            "block": "Bloque" if language == "es" else "Section",
+            "parameter": t["auditable_list"],
+            "exception": t["exception_comments"],
+            "observations": t["observations"],
+            "countermeasure": t["countermeasure"],
+            "lost_points": "Puntos perdidos" if language == "es" else "Lost points",
+            "affected_claims": "Claims afectadas" if language == "es" else "Affected claims",
+        }).to_excel(writer, index=False, sheet_name="Plan de mejora" if language == "es" else "Action plan")
 
         workbook = writer.book
-        header_format = workbook.add_format({
-            "bold": True,
-            "font_color": "white",
-            "bg_color": "#1F4E78",
-            "border": 1,
-            "align": "center",
-            "valign": "vcenter",
-            "text_wrap": True,
-        })
+        header_format = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#1F4E78", "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True})
         body_format = workbook.add_format({"border": 1, "valign": "top", "text_wrap": True})
         percent_format = workbook.add_format({"num_format": "0.0%", "border": 1, "valign": "top"})
-        integer_format = workbook.add_format({"num_format": "0", "border": 1, "valign": "top"})
-
-        sheet_widths = {
-            "Resumen auditoría": [22, 55],
-            "Claims": [18, 24, 22, 18, 14, 20, 20, 14, 14, 16, 45, 50, 60, 42, 34],
-            "Detalle apartados": [18, 24, 22, 18, 14, 18, 28, 30, 26, 18, 14, 14, 45, 80],
-            "Áreas de mejora": [18, 24, 22, 18, 14, 28, 32, 18, 18, 18, 50, 60],
-            "Adjuntos": [18, 24, 8, 42, 24, 16, 22],
-            "Validación cierre": [18, 26, 80, 14, 18],
-            "Comparación Dealer NSC": [18, 24, 24, 20, 22, 22, 18, 50, 50],
-        }
-
         for sheet_name, worksheet in writer.sheets.items():
-            df = {
-                "Resumen auditoría": cover_df,
-                "Claims": summary_export_df,
-                "Detalle apartados": detail_df,
-                "Áreas de mejora": improvement_df,
-                "Adjuntos": attachments_df,
-                "Validación cierre": closing_df,
-                "Comparación Dealer NSC": comparison_df,
-            }[sheet_name]
-
+            df = {"Resumen" if language == "es" else "Summary": cover_df, "Claims": summary_export, "Detalle" if language == "es" else "Detail": detail_df, "Plan de mejora" if language == "es" else "Action plan": action_df}[sheet_name]
             rows, cols = df.shape
             worksheet.freeze_panes(1, 0)
-            if rows >= 0 and cols > 0:
-                worksheet.autofilter(0, 0, rows, cols - 1)
-
+            if cols:
+                worksheet.autofilter(0, 0, max(rows, 1), cols - 1)
             for col_num, value in enumerate(df.columns.values):
                 worksheet.write(0, col_num, value, header_format)
-
-            widths = sheet_widths.get(sheet_name, [])
-            for col_num in range(cols):
-                width = widths[col_num] if col_num < len(widths) else 18
-                worksheet.set_column(col_num, col_num, width, body_format)
-
-            if sheet_name == "Claims" and rows > 0:
-                for points_column in ["Puntos documentación", "Puntos piezas viejas", "Resultado /100"]:
-                    if points_column in df.columns:
-                        col_idx = df.columns.get_loc(points_column)
-                        worksheet.set_column(col_idx, col_idx, 16, integer_format)
-                if "% éxito" in df.columns:
-                    percent_col = df.columns.get_loc("% éxito")
-                    worksheet.set_column(percent_col, percent_col, 14, percent_format)
-                    worksheet.conditional_format(1, percent_col, rows, percent_col, {
-                        "type": "3_color_scale",
-                        "min_color": "#F4CCCC",
-                        "mid_color": "#FFF2CC",
-                        "max_color": "#E2F0D9",
-                    })
-
+                worksheet.set_column(col_num, col_num, 22 if col_num < 5 else 35, body_format)
+            if sheet_name == "Claims" and t["success"] in summary_export.columns:
+                percent_col = summary_export.columns.get_loc(t["success"])
+                worksheet.set_column(percent_col, percent_col, 14, percent_format)
     return output.getvalue()
 
 
-def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> bytes:
-    """
-    Genera un Excel tipo "boletín de notas" usando xlsxwriter.
-
-    Hojas:
-    - Boletín de notas
-    - content
-    - Claim document checklist I
-    - Claim old parts checklist II
-    - Improvement of claim issues III
-    - Evaluation content
-
-    Regla de puntuación:
-    - Documentación = 58 puntos
-    - Piezas viejas = 42 puntos
-    - Total = 100 puntos
-    - No aplica = máxima puntuación del apartado
-    - Campañas = informativo, sin sumar ni restar
-    """
+def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, language: str = "es") -> bytes:
     output = BytesIO()
     workbook = None
-
+    t = TEXT[language]
     try:
         import xlsxwriter  # noqa: F401
         workbook = xlsxwriter.Workbook(output, {"in_memory": True})
 
-        # ------------------------------------------------------------------
-        # Formatos
-        # ------------------------------------------------------------------
-        fmt_title = workbook.add_format({
-            "bold": True,
-            "font_size": 14,
-            "font_color": "#1F4E78",
-            "valign": "vcenter",
-            "text_wrap": True,
-        })
-        fmt_header = workbook.add_format({
-            "bold": True,
-            "font_color": "white",
-            "bg_color": "#1F4E78",
-            "border": 1,
-            "align": "center",
-            "valign": "vcenter",
-            "text_wrap": True,
-        })
+        fmt_title = workbook.add_format({"bold": True, "font_size": 14, "font_color": "#1F4E78", "valign": "vcenter", "text_wrap": True})
+        fmt_header = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#1F4E78", "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True})
         fmt_body = workbook.add_format({"border": 1, "valign": "top", "text_wrap": True})
         fmt_bold = workbook.add_format({"bold": True, "border": 1, "valign": "top", "text_wrap": True})
         fmt_int = workbook.add_format({"border": 1, "valign": "top", "num_format": "0"})
@@ -1470,19 +1086,6 @@ def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str,
             for col_idx, width in enumerate(widths):
                 ws.set_column(col_idx, col_idx, width)
 
-        def result_label(points):
-            try:
-                p = float(points)
-            except Exception:
-                return "Pendiente"
-            if p >= 90:
-                return "Excelente"
-            if p >= 80:
-                return "Correcto"
-            if p >= 60:
-                return "Mejorable"
-            return "Crítico"
-
         def result_format(points):
             try:
                 p = float(points)
@@ -1495,364 +1098,251 @@ def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str,
             return fmt_bad
 
         def evaluation_value(claim, check):
-            evaluation = claim["evaluations"].get(check.key, {})
-            points = evaluation.get("points")
+            points = claim["evaluations"].get(check.key, {}).get("points")
             return "" if points is None else points
 
-        def evaluation_status(claim, check):
-            evaluation = claim["evaluations"].get(check.key, {})
-            return evaluation.get("status", "")
-
-        def evaluation_comment(claim, check):
-            evaluation = claim["evaluations"].get(check.key, {})
-            return evaluation.get("comment", "")
-
         # ------------------------------------------------------------------
-        # Boletín de notas
+        # Scorecard / Boletín
         # ------------------------------------------------------------------
-        grade_ws = workbook.add_worksheet("Boletín de notas")
-        grade_ws.merge_range("A1:J1", "Boletín de notas - Warranty Audit", fmt_title)
+        grade_ws = workbook.add_worksheet(t["scorecard"][:31])
+        grade_ws.merge_range("A1:M1", f"{t['scorecard']} - Warranty Audit", fmt_title)
         grade_headers = [
-            "Claim No.", "Dealer", "VIN", "Modelo", "Importe",
-            "Documentación /58", "Piezas viejas /42", "Total /100", "% éxito",
-            "Resultado", "Estado trabajo", "Pendientes", "Comentario NSC", "Comentarios", "Fotos piezas viejas", "Certificado destrucción",
+            t["claim_no"], t["other_id"], t["dealer"], t["vin"], t["model"], t["amount"],
+            t["doc_score"], t["old_score"], t["total_score"], t["success"], t["result"], t["pending"], t["comments"],
         ]
         write_headers(grade_ws, 2, grade_headers)
-        set_widths(grade_ws, [20, 24, 24, 18, 14, 18, 18, 14, 14, 16, 18, 48, 50, 60, 42, 34])
+        set_widths(grade_ws, [20, 20, 24, 22, 18, 14, 18, 18, 14, 14, 16, 45, 70])
         grade_ws.freeze_panes(3, 0)
-
-        row_idx = 3
-        for claim in claims.values():
+        for idx, claim in enumerate(claims.values(), start=3):
             score = calculate_claim_score(claim)
-            total_points = score["total_points"]
             row_values = [
-                claim["claim_no"],
+                claim_identifier(claim, language),
+                claim_other_identifier(claim, language),
                 claim.get("dealer", dealer or ""),
                 claim.get("vin", ""),
                 claim.get("model", ""),
                 claim.get("amount", ""),
                 score["doc_points"],
                 score["old_points"],
-                total_points,
+                score["total_points"],
                 score["success_percent"] / 100,
-                result_label(total_points),
-                get_claim_workflow_status(claim),
+                result_label(score["total_points"], language),
                 " | ".join(score["pending"]),
-                claim.get("nsc_comment", ""),
                 claim.get("general_comment", ""),
-                old_parts_photos_summary(claim),
-                destruction_certificate_summary(claim),
             ]
-            write_row(grade_ws, row_idx, row_values, fmt_body)
-            grade_ws.write_number(row_idx, 5, score["doc_points"], fmt_int)
-            grade_ws.write_number(row_idx, 6, score["old_points"], fmt_int)
-            grade_ws.write_number(row_idx, 7, total_points, result_format(total_points))
-            grade_ws.write_number(row_idx, 8, score["success_percent"] / 100, fmt_percent)
-            grade_ws.write(row_idx, 9, result_label(total_points), result_format(total_points))
-            row_idx += 1
-        if row_idx > 3:
-            grade_ws.autofilter(2, 0, row_idx - 1, len(grade_headers) - 1)
-            grade_ws.conditional_format(3, 8, row_idx - 1, 8, {
-                "type": "3_color_scale",
-                "min_color": "#F4CCCC",
-                "mid_color": "#FFF2CC",
-                "max_color": "#E2F0D9",
-            })
+            write_row(grade_ws, idx, row_values, fmt_body)
+            grade_ws.write_number(idx, 6, score["doc_points"], fmt_int)
+            grade_ws.write_number(idx, 7, score["old_points"], fmt_int)
+            grade_ws.write_number(idx, 8, score["total_points"], result_format(score["total_points"]))
+            grade_ws.write_number(idx, 9, score["success_percent"] / 100, fmt_percent)
+            grade_ws.write(idx, 10, result_label(score["total_points"], language), result_format(score["total_points"]))
+        if claims:
+            grade_ws.autofilter(2, 0, len(claims) + 2, len(grade_headers) - 1)
+            grade_ws.conditional_format(3, 9, len(claims) + 2, 9, {"type": "3_color_scale", "min_color": "#F4CCCC", "mid_color": "#FFF2CC", "max_color": "#E2F0D9"})
 
         # ------------------------------------------------------------------
-        # content
+        # Content
         # ------------------------------------------------------------------
         content_ws = workbook.add_worksheet("content")
-        content_ws.merge_range("A1:D1", "Warranty audit report card / Boletín de auditoría", fmt_title)
+        content_ws.merge_range("A1:D1", f"Warranty audit report card / {t['scorecard']}", fmt_title)
         content_rows = [
-            ["Audit name", audit_name or ""],
-            ["Dealer", dealer or ""],
+            ["Audit name" if language == "en" else "Auditoría", audit_name or ""],
+            [t["dealer"], dealer or ""],
             ["Auditor", auditor or ""],
-            ["Export date", datetime.now().strftime("%Y-%m-%d %H:%M")],
-            ["Scoring rule", "Claim document checklist I = 58 / Claim old parts checklist II = 42 / Total = 100"],
-            ["N/A rule", "No aplica = maximum score of the section"],
-            ["Campaigns", "Informative only. No points added or deducted."],
+            ["Export date" if language == "en" else "Fecha exportación", datetime.now().strftime("%Y-%m-%d %H:%M")],
+            ["Scoring rule" if language == "en" else "Regla de puntuación", "Claim document checklist I = 58 / Claim old parts checklist II = 42 / Total = 100"],
+            ["N/A rule" if language == "en" else "Regla N/A", "No aplica = maximum score" if language == "en" else "No aplica = puntuación máxima del apartado"],
+            ["Campaigns" if language == "en" else "Campañas", t["campaign_info"]],
+            ["Manual observations" if language == "en" else "Observaciones manuales", t["not_translated_note"]],
         ]
-        set_widths(content_ws, [24, 90, 18, 18])
-        for idx, row in enumerate(content_rows, start=2):
-            content_ws.write(idx, 0, row[0], fmt_bold)
-            content_ws.write(idx, 1, row[1], fmt_body)
+        set_widths(content_ws, [28, 90, 18, 18])
+        for row_idx, row in enumerate(content_rows, start=2):
+            content_ws.write(row_idx, 0, row[0], fmt_bold)
+            content_ws.write(row_idx, 1, row[1], fmt_body)
+
         audit_score = calculate_audit_score(claims)
-        content_ws.write(10, 0, "Global result", fmt_bold)
-        content_ws.write(10, 1, f"{audit_score['success_percent']:.1f}% ({audit_score['total_points']}/{audit_score['max_points']})", result_format(audit_score["success_percent"]))
+        content_ws.write(11, 0, "Global result" if language == "en" else "Resultado global", fmt_bold)
+        content_ws.write(11, 1, f"{audit_score['success_percent']:.1f}% ({audit_score['total_points']}/{audit_score['max_points']})", result_format(audit_score["success_percent"]))
 
         # ------------------------------------------------------------------
         # Claim document checklist I
         # ------------------------------------------------------------------
         doc_ws = workbook.add_worksheet("Claim document checklist I")
         doc_headers = [
-            "No.", "Claim No.",
-            *[check.label for check in DOCUMENT_CHECKS],
-            "Comprobación campañas", "Campañas pendientes",
-            "Total documentación", "Resultado documentación %", "Comentarios",
+            "No.", t["claim_no"], t["other_id"],
+            *[check_label(check, language) for check in DOCUMENT_CHECKS],
+            t["campaign_check"], t["pending_campaigns"], t["doc_score"], "Document %" if language == "en" else "Resultado documentación %", t["comments"],
         ]
         write_headers(doc_ws, 0, doc_headers)
-        set_widths(doc_ws, [8, 20, 12, 18, 14, 12, 14, 12, 16, 18, 12, 24, 24, 18, 18, 50])
-        doc_ws.freeze_panes(1, 2)
+        set_widths(doc_ws, [8, 20, 20, 12, 20, 18, 12, 16, 12, 18, 22, 12, 24, 24, 18, 18, 60])
+        doc_ws.freeze_panes(1, 3)
         for idx, claim in enumerate(claims.values(), start=1):
             excel_row = idx + 1
-            row = [idx, claim["claim_no"]]
+            row = [idx, claim_identifier(claim, language), claim_other_identifier(claim, language)]
             row.extend(evaluation_value(claim, check) for check in DOCUMENT_CHECKS)
-            row.append(claim["evaluations"].get("info_campaign_check", {}).get("comment", ""))
-            row.append(claim["evaluations"].get("info_pending_campaigns", {}).get("comment", ""))
-            row.append(f"=SUM(C{excel_row}:K{excel_row})")
-            row.append(f"=L{excel_row}/{MAX_DOCUMENT_POINTS}")
+            row.append(evaluation_comment(claim, CAMPAIGN_CHECKS[0]))
+            row.append(evaluation_comment(claim, CAMPAIGN_CHECKS[1]))
+            row.append(f"=SUM(D{excel_row}:L{excel_row})")
+            row.append(f"=N{excel_row}/{MAX_DOCUMENT_POINTS}")
             row.append(claim.get("general_comment", ""))
             write_row(doc_ws, idx, row, fmt_body)
-            for c in range(2, 11):
-                if isinstance(row[c], (int, float)):
-                    doc_ws.write_number(idx, c, row[c], fmt_int)
-            doc_ws.write_formula(idx, 13, f"=SUM(C{excel_row}:K{excel_row})", fmt_int)
-            doc_ws.write_formula(idx, 14, f"=N{excel_row}/{MAX_DOCUMENT_POINTS}", fmt_formula_percent)
-        if len(claims) > 0:
+            for col_idx in range(3, 12):
+                if isinstance(row[col_idx], (int, float)):
+                    doc_ws.write_number(idx, col_idx, row[col_idx], fmt_int)
+            doc_ws.write_formula(idx, 14, f"=SUM(D{excel_row}:L{excel_row})", fmt_int)
+            doc_ws.write_formula(idx, 15, f"=O{excel_row}/{MAX_DOCUMENT_POINTS}", fmt_formula_percent)
+        if claims:
             doc_ws.autofilter(0, 0, len(claims), len(doc_headers) - 1)
-            doc_ws.conditional_format(1, 14, len(claims), 14, {
-                "type": "3_color_scale",
-                "min_color": "#F4CCCC",
-                "mid_color": "#FFF2CC",
-                "max_color": "#E2F0D9",
-            })
+            doc_ws.conditional_format(1, 15, len(claims), 15, {"type": "3_color_scale", "min_color": "#F4CCCC", "mid_color": "#FFF2CC", "max_color": "#E2F0D9"})
 
         # ------------------------------------------------------------------
         # Claim old parts checklist II
         # ------------------------------------------------------------------
         old_ws = workbook.add_worksheet("Claim old parts checklist II")
         old_headers = [
-            "No.", "Claim No.",
-            *[check.label for check in OLD_PARTS_CHECKS],
-            "Total piezas viejas", "Resultado piezas viejas %", "Comentarios",
-            "Fotos piezas viejas", "Certificado destrucción",
+            "No.", t["claim_no"], t["other_id"],
+            *[check_label(check, language) for check in OLD_PARTS_CHECKS],
+            t["old_score"], "Old parts %" if language == "en" else "Resultado piezas viejas %", t["comments"],
         ]
         write_headers(old_ws, 0, old_headers)
-        set_widths(old_ws, [8, 20, 18, 20, 16, 24, 20, 26, 18, 18, 50, 42, 34])
-        old_ws.freeze_panes(1, 2)
+        set_widths(old_ws, [8, 20, 20, 22, 22, 18, 28, 24, 30, 18, 18, 65])
+        old_ws.freeze_panes(1, 3)
         for idx, claim in enumerate(claims.values(), start=1):
             excel_row = idx + 1
-            row = [idx, claim["claim_no"]]
+            row = [idx, claim_identifier(claim, language), claim_other_identifier(claim, language)]
             row.extend(evaluation_value(claim, check) for check in OLD_PARTS_CHECKS)
-            row.append(f"=SUM(C{excel_row}:H{excel_row})")
-            row.append(f"=I{excel_row}/{MAX_OLD_PARTS_POINTS}")
+            row.append(f"=SUM(D{excel_row}:I{excel_row})")
+            row.append(f"=J{excel_row}/{MAX_OLD_PARTS_POINTS}")
             row.append(claim.get("general_comment", ""))
-            row.append(old_parts_photos_summary(claim))
-            row.append(destruction_certificate_summary(claim))
             write_row(old_ws, idx, row, fmt_body)
-            for c in range(2, 8):
-                if isinstance(row[c], (int, float)):
-                    old_ws.write_number(idx, c, row[c], fmt_int)
-            old_ws.write_formula(idx, 8, f"=SUM(C{excel_row}:H{excel_row})", fmt_int)
-            old_ws.write_formula(idx, 9, f"=I{excel_row}/{MAX_OLD_PARTS_POINTS}", fmt_formula_percent)
-        if len(claims) > 0:
+            for col_idx in range(3, 9):
+                if isinstance(row[col_idx], (int, float)):
+                    old_ws.write_number(idx, col_idx, row[col_idx], fmt_int)
+            old_ws.write_formula(idx, 9, f"=SUM(D{excel_row}:I{excel_row})", fmt_int)
+            old_ws.write_formula(idx, 10, f"=J{excel_row}/{MAX_OLD_PARTS_POINTS}", fmt_formula_percent)
+        if claims:
             old_ws.autofilter(0, 0, len(claims), len(old_headers) - 1)
-            old_ws.conditional_format(1, 9, len(claims), 9, {
-                "type": "3_color_scale",
-                "min_color": "#F4CCCC",
-                "mid_color": "#FFF2CC",
-                "max_color": "#E2F0D9",
-            })
+            old_ws.conditional_format(1, 10, len(claims), 10, {"type": "3_color_scale", "min_color": "#F4CCCC", "mid_color": "#FFF2CC", "max_color": "#E2F0D9"})
 
         # ------------------------------------------------------------------
-        # Improvement of claim issues III
+        # Improvement of claim issues III - página 3 / plan de acción
         # ------------------------------------------------------------------
         imp_ws = workbook.add_worksheet("Improvement of claim issues III")
-        imp_headers = ["Claim No.", "Parameter / auditable area", "Exception / comments", "Observations", "Countermeasure"]
-        write_headers(imp_ws, 0, imp_headers)
-        set_widths(imp_ws, [20, 32, 32, 60, 60])
-        imp_ws.freeze_panes(1, 0)
-        imp_row = 1
-        for claim in claims.values():
-            score = calculate_claim_score(claim)
-            for block, area, lost, max_points, status in score["lost_by_area"]:
-                comments = []
-                check = next((item for item in ALL_SCORING_CHECKS if item.block == block and item.label == area), None)
-                if check is not None:
-                    section_comment = evaluation_comment(claim, check)
-                    if section_comment:
-                        comments.append(section_comment)
-                if claim.get("general_comment", ""):
-                    comments.append(claim.get("general_comment", ""))
-                write_row(imp_ws, imp_row, [
-                    claim["claim_no"],
-                    area,
-                    f"{status}: {lost}/{max_points} puntos perdidos",
-                    "\n".join(comments),
-                    "Reforzar el cumplimiento del criterio y revisar la documentación antes del envío de la claim.",
+        imp_ws.merge_range("A1:E1", t["action_plan_title"], fmt_title)
+        imp_headers = ["Block" if language == "en" else "Bloque", t["auditable_list"], t["exception_comments"], t["observations"], t["countermeasure"]]
+        write_headers(imp_ws, 1, imp_headers)
+        set_widths(imp_ws, [28, 34, 42, 85, 85])
+        imp_ws.freeze_panes(2, 0)
+        action_rows = build_action_plan_rows(claims, language)
+        if not action_rows:
+            write_row(imp_ws, 2, ["", t["no_deviations"], "", "", ""], fmt_body)
+            last_row = 2
+        else:
+            for row_idx, item in enumerate(action_rows, start=2):
+                write_row(imp_ws, row_idx, [
+                    item["block"],
+                    item["parameter"],
+                    item["exception"],
+                    item["observations"],
+                    item["countermeasure"],
                 ], fmt_body)
-                imp_row += 1
-        if imp_row == 1:
-            write_row(imp_ws, imp_row, ["", "Sin desviaciones puntuables", "", "", ""], fmt_body)
-            imp_row += 1
-        imp_ws.autofilter(0, 0, imp_row - 1, len(imp_headers) - 1)
-
-        # ------------------------------------------------------------------
-        # Adjuntos piezas viejas
-        # ------------------------------------------------------------------
-        attachments_ws = workbook.add_worksheet("Adjuntos")
-        attachments_headers = ["Claim No.", "Tipo adjunto", "Nº", "Archivo", "Formato", "Tamaño bytes", "Subido en"]
-        write_headers(attachments_ws, 0, attachments_headers)
-        set_widths(attachments_ws, [20, 26, 8, 42, 24, 16, 22])
-        attachments_ws.freeze_panes(1, 0)
-        attachments_df = build_attachments_dataframe(claims)
-        if attachments_df.empty:
-            write_row(attachments_ws, 1, ["", "Sin adjuntos", "", "", "", "", ""], fmt_body)
-            attachments_ws.autofilter(0, 0, 1, len(attachments_headers) - 1)
-        else:
-            for row_idx, (_, attachment_row) in enumerate(attachments_df.iterrows(), start=1):
-                write_row(attachments_ws, row_idx, [attachment_row.get(header, "") for header in attachments_headers], fmt_body)
-            attachments_ws.autofilter(0, 0, len(attachments_df), len(attachments_headers) - 1)
-
-        # ------------------------------------------------------------------
-        # Validación de cierre
-        # ------------------------------------------------------------------
-        closing_ws = workbook.add_worksheet("Validación cierre")
-        closing_headers = ["Claim No.", "Tipo aviso", "Detalle", "Severidad", "Estado claim"]
-        write_headers(closing_ws, 0, closing_headers)
-        set_widths(closing_ws, [20, 28, 85, 14, 20])
-        closing_ws.freeze_panes(1, 0)
-        closing_df = build_closing_validation_dataframe(claims)
-        if closing_df.empty:
-            write_row(closing_ws, 1, ["", "Sin avisos", "La auditoría no tiene avisos de cierre.", "OK", ""], fmt_body)
-            closing_ws.autofilter(0, 0, 1, len(closing_headers) - 1)
-        else:
-            for row_idx, (_, closing_row) in enumerate(closing_df.iterrows(), start=1):
-                write_row(closing_ws, row_idx, [closing_row.get(header, "") for header in closing_headers], fmt_body)
-            closing_ws.autofilter(0, 0, len(closing_df), len(closing_headers) - 1)
+            last_row = len(action_rows) + 1
+        imp_ws.autofilter(1, 0, last_row, len(imp_headers) - 1)
 
         # ------------------------------------------------------------------
         # Evaluation content
         # ------------------------------------------------------------------
         eval_ws = workbook.add_worksheet("Evaluation content")
-        eval_headers = ["Checklist", "Apartado", "Máximo", "Opciones", "Criterio"]
+        eval_headers = ["Checklist", "Apartado" if language == "es" else "Item", "Máximo" if language == "es" else "Max", "Opciones" if language == "es" else "Options", "Criterio" if language == "es" else "Criterion"]
         write_headers(eval_ws, 0, eval_headers)
-        set_widths(eval_ws, [28, 34, 12, 42, 85])
+        set_widths(eval_ws, [30, 38, 12, 54, 95])
         eval_ws.freeze_panes(1, 0)
         for row_idx, check in enumerate(ALL_CHECKS, start=1):
             options_text = " | ".join(
-                f"{option.status}: {'-' if option.points is None else option.points}"
+                f"{option_display(option, language)}: {'-' if option.points is None else option.points}"
                 for option in check.options
             )
-            write_row(eval_ws, row_idx, [check.block, check.label, check.max_points, options_text, check.guidance], fmt_body)
+            write_row(eval_ws, row_idx, [block_label(check.block_key, language), check_label(check, language), check.max_points, options_text, check_guidance(check, language)], fmt_body)
         eval_ws.autofilter(0, 0, len(ALL_CHECKS), len(eval_headers) - 1)
 
         workbook.close()
         workbook = None
         return output.getvalue()
-
     finally:
         if workbook is not None:
             workbook.close()
 
-def generate_text_report(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> str:
+
+def generate_text_report(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, language: str = "es") -> str:
+    t = TEXT[language]
     audit_score = calculate_audit_score(claims)
-    improvement_df = build_improvement_dataframe(claims)
-    summary_df = build_summary_dataframe(claims)
-
-    if improvement_df.empty:
-        top_areas = pd.DataFrame(columns=["Área de mejora", "Puntos perdidos"])
-    else:
-        top_areas = (
-            improvement_df.groupby("Área de mejora", as_index=False)["Puntos perdidos"]
-            .sum()
-            .sort_values("Puntos perdidos", ascending=False)
-            .head(5)
-        )
-
-    critical_claims = summary_df.sort_values("Resultado /100", ascending=True).head(5)
+    action_rows = build_action_plan_rows(claims, language)
+    summary_df = build_summary_dataframe(claims, language)
 
     lines = []
-    lines.append(f"Informe de auditoría: {audit_name or 'Sin nombre'}")
-    lines.append(f"Dealer: {dealer or 'No informado'}")
-    lines.append(f"Auditor: {auditor or 'No informado'}")
+    lines.append(f"{t['report_title']}: {audit_name or 'Warranty audit'}")
+    lines.append(f"{t['dealer']}: {dealer or ('No informado' if language == 'es' else 'Not reported')}")
+    lines.append(f"Auditor: {auditor or ('No informado' if language == 'es' else 'Not reported')}")
     lines.append("")
-    lines.append("Resumen ejecutivo")
-    lines.append(
-        f"Se han revisado {audit_score['claims']} garantías, con {audit_score['completed_claims']} completadas. "
-        f"El resultado global de la auditoría es {audit_score['success_percent']:.1f}% "
-        f"({audit_score['total_points']}/{audit_score['max_points']} puntos)."
-    )
-    lines.append("")
-    lines.append("Resultado por bloque")
-    lines.append(f"- Documentación de claim: {audit_score['doc_points']}/{audit_score['claims'] * MAX_DOCUMENT_POINTS} puntos.")
-    lines.append(f"- Piezas viejas: {audit_score['old_points']}/{audit_score['claims'] * MAX_OLD_PARTS_POINTS} puntos.")
-    lines.append("- Campañas: revisión informativa, sin impacto en puntuación.")
-    lines.append("")
-    lines.append("Principales áreas de mejora")
-    if top_areas.empty:
-        lines.append("No se han detectado desviaciones puntuables.")
+    lines.append(t["executive_summary"])
+    if language == "es":
+        lines.append(
+            f"Se han revisado {audit_score['claims']} garantías, con {audit_score['completed_claims']} completadas. "
+            f"El resultado global de la auditoría es {audit_score['success_percent']:.1f}% "
+            f"({audit_score['total_points']}/{audit_score['max_points']} puntos)."
+        )
     else:
-        for _, row in top_areas.iterrows():
-            lines.append(f"- {row['Área de mejora']}: {int(row['Puntos perdidos'])} puntos perdidos.")
+        lines.append(
+            f"{audit_score['claims']} claims have been reviewed, with {audit_score['completed_claims']} completed. "
+            f"The global audit result is {audit_score['success_percent']:.1f}% "
+            f"({audit_score['total_points']}/{audit_score['max_points']} points)."
+        )
     lines.append("")
-    lines.append("Claims con menor puntuación")
-    for _, row in critical_claims.iterrows():
-        lines.append(f"- {row['Claim No.']}: {row['Resultado /100']}/100. {safe_str(row['Comentarios'])}")
-    lines.append("")
-    closing_df = build_closing_validation_dataframe(claims)
-    lines.append("Validación de cierre")
-    if closing_df.empty:
-        lines.append("No hay avisos de cierre pendientes.")
+    lines.append(t["block_result"])
+    if language == "es":
+        lines.append(f"- Documentación de claim: {audit_score['doc_points']}/{audit_score['claims'] * MAX_DOCUMENT_POINTS} puntos.")
+        lines.append(f"- Piezas viejas: {audit_score['old_points']}/{audit_score['claims'] * MAX_OLD_PARTS_POINTS} puntos.")
     else:
-        high = len(closing_df[closing_df["Severidad"] == "Alta"]) if "Severidad" in closing_df.columns else 0
-        medium = len(closing_df[closing_df["Severidad"] == "Media"]) if "Severidad" in closing_df.columns else 0
-        low = len(closing_df[closing_df["Severidad"] == "Baja"]) if "Severidad" in closing_df.columns else 0
-        lines.append(f"Avisos detectados: {len(closing_df)} (alta: {high}, media: {medium}, baja: {low}).")
-        for _, row in closing_df.head(8).iterrows():
-            lines.append(f"- {row['Claim No.']} · {row['Tipo aviso']}: {row['Detalle']}")
+        lines.append(f"- Claim documentation: {audit_score['doc_points']}/{audit_score['claims'] * MAX_DOCUMENT_POINTS} points.")
+        lines.append(f"- Old parts: {audit_score['old_points']}/{audit_score['claims'] * MAX_OLD_PARTS_POINTS} points.")
+    lines.append(f"- {t['campaign_info']}")
     lines.append("")
-    lines.append("Conclusión")
-    lines.append(
-        "Se recomienda focalizar el plan de mejora en las áreas con mayor pérdida de puntos, "
-        "reforzando la calidad documental, la justificación técnica y la trazabilidad de piezas viejas cuando aplique."
-    )
+    lines.append(t["improvement_areas"])
+    if not action_rows:
+        lines.append(t["no_deviations"] + ".")
+    else:
+        for item in sorted(action_rows, key=lambda row: row["lost_points"], reverse=True)[:8]:
+            lines.append(f"- {item['parameter']}: {item['exception']}")
+    lines.append("")
+    lines.append(t["lowest_claims"])
+    if not summary_df.empty:
+        score_col = t["total_score"]
+        claim_col = t["claim_no"]
+        comments_col = t["comments"]
+        for _, row in summary_df.sort_values(score_col, ascending=True).head(5).iterrows():
+            lines.append(f"- {row[claim_col]}: {row[score_col]}/100. {safe_str(row[comments_col])}")
+    lines.append("")
+    lines.append(t["conclusion"])
+    if language == "es":
+        lines.append("Se recomienda focalizar el plan de mejora en las áreas con mayor pérdida de puntos y reforzar la revisión previa de la documentación antes del envío de claims.")
+    else:
+        lines.append("It is recommended to focus the improvement plan on the areas with the highest lost points and reinforce documentation review before claim submission.")
+    lines.append("")
+    lines.append(t["not_translated_note"])
     return "\n".join(lines)
 
 
-def export_audit_package_zip(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> bytes:
-    """Exporta un paquete completo con Excel, boletín, informe, JSON de trabajo y adjuntos reales."""
+def export_bilingual_package_zip(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> bytes:
     output = BytesIO()
     base_name = build_audit_file_basename(dealer, auditor)
-
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-        zip_file.writestr(
-            f"{base_name}/{base_name}.json",
-            serialize_audit_workfile(claims, audit_name, dealer, auditor, st.session_state.get("audit_mode", AUDIT_MODES[0])),
-        )
-        zip_file.writestr(
-            f"{base_name}/{base_name}_analitico.xlsx",
-            export_excel(claims, audit_name, dealer, auditor),
-        )
-        zip_file.writestr(
-            f"{base_name}/{base_name}_boletin.xlsx",
-            export_report_card_excel(claims, audit_name, dealer, auditor),
-        )
-        zip_file.writestr(
-            f"{base_name}/{base_name}_informe.txt",
-            generate_text_report(claims, audit_name, dealer, auditor).encode("utf-8"),
-        )
-
-        for claim in claims.values():
-            claim_folder = sanitize_for_filename(claim.get("claim_no", "claim"), "claim")
-            attachments = get_claim_attachments(claim)
-
-            for index, photo in enumerate(attachments.get("old_parts_photos", []), start=1):
-                filename = sanitize_for_filename(photo.get("name", f"foto_{index}"), f"foto_{index}")
-                zip_file.writestr(
-                    f"{base_name}/evidencias/{claim_folder}/piezas_viejas/fotos/{index:02d}_{filename}",
-                    attachment_bytes(photo),
-                )
-
-            certificate = attachments.get("destruction_certificate")
-            if certificate:
-                filename = sanitize_for_filename(certificate.get("name", "certificado_destruccion"), "certificado_destruccion")
-                zip_file.writestr(
-                    f"{base_name}/evidencias/{claim_folder}/piezas_viejas/certificado_destruccion/{filename}",
-                    attachment_bytes(certificate),
-                )
-
+        zip_file.writestr(f"{base_name}/{base_name}.json", serialize_audit_workfile(claims, audit_name, dealer, auditor))
+        zip_file.writestr(f"{base_name}/{base_name}_ES_boletin.xlsx", export_scorecard_excel(claims, audit_name, dealer, auditor, "es"))
+        zip_file.writestr(f"{base_name}/{base_name}_EN_scorecard.xlsx", export_scorecard_excel(claims, audit_name, dealer, auditor, "en"))
+        zip_file.writestr(f"{base_name}/{base_name}_ES_informe.txt", generate_text_report(claims, audit_name, dealer, auditor, "es").encode("utf-8"))
+        zip_file.writestr(f"{base_name}/{base_name}_EN_report.txt", generate_text_report(claims, audit_name, dealer, auditor, "en").encode("utf-8"))
+        zip_file.writestr(f"{base_name}/{base_name}_ES_analitico.xlsx", export_analytical_excel(claims, audit_name, dealer, auditor, "es"))
+        zip_file.writestr(f"{base_name}/{base_name}_EN_analytical.xlsx", export_analytical_excel(claims, audit_name, dealer, auditor, "en"))
     return output.getvalue()
 
 
@@ -1860,92 +1350,107 @@ def export_audit_package_zip(claims: Dict[str, Dict[str, Any]], audit_name: str,
 # INTERFAZ STREAMLIT
 # =============================================================================
 
+
 def init_state():
-    if "claims" not in st.session_state:
-        st.session_state.claims = {}
-    if "selected_claim" not in st.session_state:
-        st.session_state.selected_claim = None
-    if "audit_name" not in st.session_state:
-        st.session_state.audit_name = "Auditoría garantías"
-    if "audit_dealer" not in st.session_state:
-        st.session_state.audit_dealer = ""
-    if "audit_auditor" not in st.session_state:
-        st.session_state.audit_auditor = ""
-    if "audit_mode" not in st.session_state:
-        st.session_state.audit_mode = AUDIT_MODES[0]
+    st.session_state.setdefault("claims", {})
+    st.session_state.setdefault("selected_claim", None)
+    st.session_state.setdefault("audit_name", "Auditoría garantías")
+    st.session_state.setdefault("audit_dealer", "")
+    st.session_state.setdefault("audit_auditor", "")
+    st.session_state.setdefault("active_audit_section", "I. Documentación")
 
 
-def build_general_comment_from_observations(claim: Dict[str, Any], include_campaigns: bool = True) -> str:
-    """Construye el comentario general usando solo las observaciones escritas en cada apartado.
+def apply_default_dealer_to_blank_claims(claims: Dict[str, Dict[str, Any]], dealer: str) -> None:
+    dealer = safe_str(dealer)
+    if not dealer:
+        return
+    for claim in claims.values():
+        if not safe_str(claim.get("dealer", "")):
+            claim["dealer"] = dealer
 
-    No inventa desviaciones por puntuación: simplemente recopila los comentarios manuales
-    que el auditor ha escrito en Documentación, Piezas viejas y, si procede, Campañas.
-    """
-    checks = ALL_CHECKS if include_campaigns else ALL_SCORING_CHECKS
-    lines = []
 
-    for check in checks:
-        evaluation = claim.get("evaluations", {}).get(check.key, {})
-        comment = safe_str(evaluation.get("comment", ""))
+def display_claim_option(key: str) -> str:
+    claim = st.session_state.claims.get(key, {})
+    local = safe_str(claim.get("local_claim_no", ""))
+    hq = safe_str(claim.get("hq_claim_no", ""))
+    score = calculate_claim_score(claim) if claim else {"total_points": 0}
+    if local and hq:
+        return f"{local} / {hq} · {score['total_points']}/100"
+    return f"{local or hq or key} · {score['total_points']}/100"
 
-        if not comment:
-            continue
 
-        # Evita duplicar el título si el usuario ya ha empezado el comentario con "OR: ...".
-        normalized_comment = comment.lower().lstrip()
-        normalized_label = check.label.lower().strip()
-        if normalized_comment.startswith(normalized_label + ":"):
-            lines.append(comment)
-        else:
-            lines.append(f"{check.label}: {comment}")
+def sync_claim_meta_field(claim: Dict[str, Any], field: str, label: str) -> str:
+    claim_key = make_claim_key(claim.get("local_claim_no"), claim.get("hq_claim_no"), claim.get("claim_no"))
+    widget_key = f"claim_meta_{claim_key}_{field}"
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = safe_str(claim.get(field, ""))
+    value = st.text_input(label, key=widget_key)
+    claim[field] = safe_str(value)
+    return claim[field]
 
-    return "\n".join(lines).strip()
+
+def render_claim_quick_card(claim: Dict[str, Any], default_dealer: str = ""):
+    st.caption("Ficha de la garantía")
+    key_before = make_claim_key(claim.get("local_claim_no"), claim.get("hq_claim_no"), claim.get("claim_no"))
+    cols = st.columns(6)
+    with cols[0]:
+        local = sync_claim_meta_field(claim, "local_claim_no", "Claim ES / Dealer")
+    with cols[1]:
+        hq = sync_claim_meta_field(claim, "hq_claim_no", "Claim HQ / IDMS")
+    with cols[2]:
+        options = get_dealer_options(claim.get("dealer", "") or default_dealer)
+        dealer_key = f"claim_meta_{key_before}_dealer"
+        if not safe_str(claim.get("dealer", "")) and default_dealer:
+            claim["dealer"] = default_dealer
+        if dealer_key not in st.session_state or st.session_state[dealer_key] not in options:
+            st.session_state[dealer_key] = claim.get("dealer", "") if claim.get("dealer", "") in options else ""
+        dealer_value = st.selectbox("Dealer", options, key=dealer_key, format_func=format_dealer_option)
+        claim["dealer"] = safe_str(dealer_value)
+    with cols[3]:
+        sync_claim_meta_field(claim, "vin", "VIN")
+    with cols[4]:
+        sync_claim_meta_field(claim, "model", "Modelo")
+    with cols[5]:
+        sync_claim_meta_field(claim, "amount", "Importe")
+
+    # Actualizar claim_no interno y clave si cambian los IDs.
+    claim["claim_no"] = local or hq or claim.get("claim_no", "")
+    key_after = make_claim_key(local, hq, claim.get("claim_no", ""))
+    if key_after and key_after != key_before and key_before in st.session_state.claims:
+        st.session_state.claims[key_after] = st.session_state.claims.pop(key_before)
+        st.session_state.selected_claim = key_after
+        st.rerun()
 
 
 def render_check_editor(claim: Dict[str, Any], checks: List[AuditCheck]):
-    role_prefix = get_active_review_role()
+    claim_key = make_claim_key(claim.get("local_claim_no"), claim.get("hq_claim_no"), claim.get("claim_no"))
     for check in checks:
         evaluation = claim["evaluations"][check.key]
-        labels = option_labels(check)
-
-        # Buscar índice actual.
-        current_label = evaluation.get("label", PENDING.label)
-        current_index = 0
-        for idx, label in enumerate(labels):
-            if label.startswith(current_label):
-                current_index = idx
-                break
-
+        current_option = option_from_key(check, safe_str(evaluation.get("option_key", "pending")))
+        labels = option_labels(check, "es")
+        current_label = option_display(current_option, "es")
+        current_index = labels.index(current_label) if current_label in labels else 0
         with st.container(border=True):
             cols = st.columns([2.2, 1.2, 2.8])
             with cols[0]:
-                st.markdown(f"**{check.label}**")
-                st.caption(f"Máximo: {check.max_points} puntos · {check.guidance}")
+                st.markdown(f"**{check.label_es}**")
+                st.caption(f"Máximo: {check.max_points} puntos · {check.guidance_es}")
             with cols[1]:
-                selected = st.selectbox(
-                    "Evaluación",
-                    labels,
-                    index=current_index,
-                    key=f"select_{role_prefix}_{claim['claim_no']}_{check.key}",
-                    label_visibility="collapsed",
-                )
+                selected = st.selectbox("Evaluación", labels, index=current_index, key=f"select_{claim_key}_{check.key}", label_visibility="collapsed")
                 option = option_from_label(check, selected)
+                evaluation["option_key"] = option.key
                 evaluation["status"] = option.status
-                evaluation["label"] = option.label
                 evaluation["points"] = option.points
                 evaluation["max_points"] = check.max_points
-
                 if option.points is None:
                     st.warning("Pendiente")
                 else:
                     st.metric("Puntos", f"{option.points}/{check.max_points}")
             with cols[2]:
-                evaluation["comment"] = st.text_area(
-                    "Comentario del apartado",
-                    value=evaluation.get("comment", ""),
-                    key=f"comment_{role_prefix}_{claim['claim_no']}_{check.key}",
-                    height=90,
-                )
+                comment_key = f"comment_{claim_key}_{check.key}"
+                if comment_key not in st.session_state:
+                    st.session_state[comment_key] = evaluation.get("comment", "")
+                evaluation["comment"] = st.text_area("Observación del apartado", key=comment_key, height=85)
 
 
 def render_campaign_editor(claim: Dict[str, Any]):
@@ -1953,478 +1458,102 @@ def render_campaign_editor(claim: Dict[str, Any]):
     render_check_editor(claim, CAMPAIGN_CHECKS)
 
 
-def display_value(value: Any, fallback: str = "No informado") -> str:
-    value = safe_str(value)
-    return value if value else fallback
+def render_comments_editor(claim: Dict[str, Any]):
+    st.caption("El comentario general se genera usando solo las observaciones que hayas escrito en cada apartado. No inventa nada por la nota.")
+    claim_key = make_claim_key(claim.get("local_claim_no"), claim.get("hq_claim_no"), claim.get("claim_no"))
+    general_key = f"general_comment_{claim_key}"
+    if general_key not in st.session_state:
+        st.session_state[general_key] = claim.get("general_comment", "")
+    if st.button("Generar desde observaciones de apartados", key=f"generate_comment_{claim_key}"):
+        generated = build_general_comment_from_observations(claim, include_campaigns=True, language="es")
+        if generated:
+            claim["general_comment"] = generated
+            st.session_state[general_key] = generated
+            st.success("Comentario general generado desde las observaciones de los apartados.")
+        else:
+            st.warning("No hay observaciones escritas en los apartados para generar el comentario general.")
+    claim["general_comment"] = st.text_area("Comentarios generales de la claim", key=general_key, height=180)
 
 
-def sync_claim_meta_field(claim: Dict[str, Any], field: str, label: str, default_value: str = "") -> str:
-    claim_no = claim["claim_no"]
-    key = f"claim_meta_{claim_no}_{field}"
-
-    if not safe_str(claim.get(field, "")) and default_value:
-        claim[field] = default_value
-
-    if key not in st.session_state:
-        st.session_state[key] = safe_str(claim.get(field, ""))
-
-    value = st.text_input(label, key=key)
-    claim[field] = safe_str(value)
-    return claim[field]
-
-
-def sync_claim_dealer_field(claim: Dict[str, Any], default_dealer: str = "") -> str:
-    """Dealer por claim mediante desplegable de dealers activos."""
-    claim_no = claim["claim_no"]
-    key = f"claim_meta_{claim_no}_dealer"
-
-    if not safe_str(claim.get("dealer", "")) and default_dealer:
-        claim["dealer"] = default_dealer
-
-    current_value = safe_str(claim.get("dealer", ""))
-    options = get_dealer_options(current_value or default_dealer)
-
-    if key not in st.session_state or st.session_state[key] not in options:
-        st.session_state[key] = current_value if current_value in options else ""
-
-    if not safe_str(st.session_state.get(key, "")) and current_value:
-        st.session_state[key] = current_value
-
-    value = st.selectbox(
-        "Dealer",
-        options,
-        key=key,
-        format_func=format_dealer_option,
-    )
-    claim["dealer"] = safe_str(value)
-    return claim["dealer"]
-
-
-def render_claim_quick_card(claim: Dict[str, Any], default_dealer: str = ""):
-    """Ficha editable por claim: útil para futura integración en plataforma mayor."""
-    st.caption("Ficha de la garantía")
-    cols = st.columns(4)
-    with cols[0]:
-        sync_claim_dealer_field(claim, default_dealer)
-    with cols[1]:
-        sync_claim_meta_field(claim, "vin", "VIN")
-    with cols[2]:
-        sync_claim_meta_field(claim, "model", "Modelo")
-    with cols[3]:
-        sync_claim_meta_field(claim, "amount", "Importe")
-
-
-def render_old_parts_attachments(claim: Dict[str, Any]):
-    """Adjuntos específicos de la pestaña de piezas viejas."""
-    attachments = get_claim_attachments(claim)
-    claim_no = claim["claim_no"]
-    version_key = f"attachment_uploader_version_{claim_no}"
-    if version_key not in st.session_state:
-        st.session_state[version_key] = 0
-    version = st.session_state[version_key]
-
-    st.markdown("### Adjuntos de piezas viejas")
-    st.caption(
-        "Adjunta al menos 3 fotos de piezas viejas y, aparte, el certificado de destrucción "
-        "si aplica. Los adjuntos se guardan en el JSON de trabajo y en el paquete ZIP, incluidos PDF."
-    )
-
-    photo_files = st.file_uploader(
-        "Fotos de piezas viejas — mínimo 3 archivos",
-        type=OLD_PART_PHOTO_FILE_TYPES,
-        accept_multiple_files=True,
-        key=f"old_parts_photos_{claim_no}_{version}",
-        help="Formatos admitidos: JPG, JPEG, PNG y WEBP.",
-    )
-
-    if photo_files:
-        attachments["old_parts_photos"] = [uploaded_file_to_attachment(file) for file in photo_files]
-
-    photos = attachments.get("old_parts_photos", [])
-    if len(photos) >= 3:
-        st.success(f"Fotos de piezas viejas adjuntas: {len(photos)} archivo(s).")
-    elif len(photos) > 0:
-        st.warning(f"Fotos de piezas viejas adjuntas: {len(photos)} archivo(s). Recomendado mínimo: 3.")
-    else:
-        st.info("Todavía no hay fotos de piezas viejas adjuntas para esta claim.")
-
-    if photos:
-        with st.expander("Ver / descargar fotos adjuntas"):
-            for index, photo in enumerate(photos, start=1):
-                col_name, col_download = st.columns([3, 1])
-                with col_name:
-                    st.write(f"{index}. {safe_str(photo.get('name', 'foto'))} · {photo.get('size', 0)} bytes")
-                with col_download:
-                    st.download_button(
-                        "Descargar",
-                        data=attachment_bytes(photo),
-                        file_name=safe_str(photo.get("name", f"foto_{index}")) or f"foto_{index}",
-                        mime=safe_str(photo.get("type", "application/octet-stream")) or "application/octet-stream",
-                        key=f"download_photo_{claim_no}_{index}_{safe_str(photo.get('name', 'foto'))}",
-                    )
-
-        if st.button("Eliminar fotos adjuntas", key=f"clear_photos_{claim_no}"):
-            attachments["old_parts_photos"] = []
-            st.session_state[version_key] += 1
-            st.rerun()
-
-    certificate_file = st.file_uploader(
-        "Certificado de destrucción — foto o PDF",
-        type=DESTRUCTION_CERTIFICATE_FILE_TYPES,
-        accept_multiple_files=False,
-        key=f"destruction_certificate_{claim_no}_{version}",
-        help="Formatos admitidos: JPG, JPEG, PNG, WEBP y PDF.",
-    )
-
-    if certificate_file is not None:
-        attachments["destruction_certificate"] = uploaded_file_to_attachment(certificate_file)
-
-    certificate = attachments.get("destruction_certificate")
-    if certificate:
-        cert_cols = st.columns([3, 1, 1])
-        with cert_cols[0]:
-            st.success(
-                f"Certificado adjunto: {safe_str(certificate.get('name', 'certificado'))} "
-                f"· {certificate.get('size', 0)} bytes"
-            )
-        with cert_cols[1]:
-            st.download_button(
-                "Descargar certificado",
-                data=attachment_bytes(certificate),
-                file_name=safe_str(certificate.get("name", "certificado_destruccion")) or "certificado_destruccion",
-                mime=safe_str(certificate.get("type", "application/octet-stream")) or "application/octet-stream",
-                key=f"download_certificate_{claim_no}",
-            )
-        with cert_cols[2]:
-            if st.button("Eliminar certificado", key=f"clear_certificate_{claim_no}"):
-                attachments["destruction_certificate"] = None
-                st.session_state[version_key] += 1
-                st.rerun()
-    else:
-        st.info("Todavía no hay certificado de destrucción adjunto para esta claim.")
-
-    claim["attachments"] = attachments
-
-
-def sync_uploaded_attachments_from_session_state(claims: Dict[str, Dict[str, Any]]) -> None:
-    """
-    Sincroniza adjuntos ya subidos con st.session_state antes de construir descargas.
-
-    En Streamlit el script se ejecuta de arriba a abajo. Los botones de descarga están
-    por encima del uploader de adjuntos, así que, si el usuario subía un certificado PDF
-    y descargaba el ZIP en esa misma pantalla, el ZIP podía construirse con el estado
-    anterior. Esta función lee directamente los file_uploader ya presentes en
-    session_state y los persiste en la claim antes de generar JSON/Excel/ZIP.
-    """
-    if not claims:
-        return
-
-    for claim in claims.values():
-        claim_no = safe_str(claim.get("claim_no", ""))
-        if not claim_no:
-            continue
-
-        attachments = get_claim_attachments(claim)
-        version = st.session_state.get(f"attachment_uploader_version_{claim_no}", 0)
-
-        photos_key = f"old_parts_photos_{claim_no}_{version}"
-        photo_files = st.session_state.get(photos_key)
-        if photo_files:
-            if not isinstance(photo_files, list):
-                photo_files = [photo_files]
-            attachments["old_parts_photos"] = [
-                uploaded_file_to_attachment(file)
-                for file in photo_files
-                if file is not None
-            ]
-
-        certificate_key = f"destruction_certificate_{claim_no}_{version}"
-        certificate_file = st.session_state.get(certificate_key)
-        if isinstance(certificate_file, list):
-            certificate_file = certificate_file[0] if certificate_file else None
-        if certificate_file is not None:
-            attachments["destruction_certificate"] = uploaded_file_to_attachment(certificate_file)
-
-        claim["attachments"] = attachments
-
-
-
-def sync_editor_state_from_session_state(claims: Dict[str, Dict[str, Any]]) -> None:
-    """Sincroniza widgets de edición antes de construir descargas.
-
-    Los botones de descarga están en la columna izquierda y se renderizan antes que
-    el editor de la claim. Esta función evita que una exportación se lleve valores
-    de la ejecución anterior si acabas de cambiar un selector o escribir una
-    observación.
-    """
-    if not claims:
-        return
-
-    check_by_key = {check.key: check for check in ALL_CHECKS}
-    role_prefix = get_active_review_role()
-    active_evaluations_field = get_active_evaluations_field()
-    active_general_comment_field = get_active_general_comment_field()
-
-    for claim in claims.values():
-        ensure_claim_review_layers(claim)
-        claim["evaluations"] = claim[active_evaluations_field]
-        claim_no = safe_str(claim.get("claim_no", ""))
-        if not claim_no:
-            continue
-
-        dealer_key = f"claim_meta_{claim_no}_dealer"
-        if dealer_key in st.session_state:
-            claim["dealer"] = safe_str(st.session_state.get(dealer_key, ""))
-
-        for field in ["vin", "model", "amount", "repair_date", "submission_date"]:
-            meta_key = f"claim_meta_{claim_no}_{field}"
-            if meta_key in st.session_state:
-                claim[field] = safe_str(st.session_state.get(meta_key, ""))
-
-        workflow_key = f"claim_workflow_status_{claim_no}"
-        if workflow_key in st.session_state:
-            claim["workflow_status"] = normalize_workflow_status(st.session_state.get(workflow_key, "Pendiente"))
-
-        nsc_comment_key = f"nsc_comment_{claim_no}"
-        if nsc_comment_key in st.session_state:
-            claim["nsc_comment"] = safe_str(st.session_state.get(nsc_comment_key, ""))
-
-        active_general_comment_key = f"{role_prefix}_general_comment_{claim_no}"
-        legacy_general_comment_key = f"general_comment_{claim_no}"
-        if active_general_comment_key in st.session_state:
-            claim[active_general_comment_field] = safe_str(st.session_state.get(active_general_comment_key, ""))
-            claim["general_comment"] = claim[active_general_comment_field]
-        elif legacy_general_comment_key in st.session_state:
-            claim[active_general_comment_field] = safe_str(st.session_state.get(legacy_general_comment_key, ""))
-            claim["general_comment"] = claim[active_general_comment_field]
-
-        for check_key, check in check_by_key.items():
-            evaluation = claim.get("evaluations", {}).setdefault(check_key, new_evaluation(check))
-
-            select_keys = [
-                f"select_{role_prefix}_{claim_no}_{check_key}",
-                f"select_{claim_no}_{check_key}",  # compatibilidad con versiones anteriores
-            ]
-            for select_key in select_keys:
-                if select_key in st.session_state:
-                    option = option_from_label(check, safe_str(st.session_state.get(select_key, "")))
-                    evaluation["status"] = option.status
-                    evaluation["label"] = option.label
-                    evaluation["points"] = option.points
-                    evaluation["max_points"] = check.max_points
-                    break
-
-            comment_keys = [
-                f"comment_{role_prefix}_{claim_no}_{check_key}",
-                f"comment_{claim_no}_{check_key}",  # compatibilidad con versiones anteriores
-            ]
-            for comment_key in comment_keys:
-                if comment_key in st.session_state:
-                    evaluation["comment"] = safe_str(st.session_state.get(comment_key, ""))
-                    break
-
-
-
-def render_supervisor_panel() -> None:
-    """Panel NSC offline: lista auditorías recibidas y permite abrir una para revisión."""
-    audits = st.session_state.get("supervisor_audits", [])
-    if not audits:
-        return
-
-    st.markdown("### Panel NSC · auditorías cargadas")
-    overview_rows = []
-    for index, audit in enumerate(audits, start=1):
-        overview_rows.append({
-            "#": index,
-            "Auditoría": audit.get("audit_name", ""),
-            "Dealer": audit.get("dealer", ""),
-            "Auditor / origen": audit.get("auditor", ""),
-            "Claims": audit.get("claims_count", 0),
-            "Completadas": audit.get("completed_claims", 0),
-            "Resultado NSC": f"{float(audit.get('nsc_success_percent', 0) or 0):.1f}%",
-            "Dif. media NSC-Dealer": f"{float(audit.get('avg_difference', 0) or 0):+.1f}",
-            "Archivo": audit.get("source_name", ""),
-        })
-
-    st.dataframe(pd.DataFrame(overview_rows), use_container_width=True, hide_index=True)
-
-    for index, audit in enumerate(audits):
-        with st.expander(f"{index + 1}. {audit.get('dealer', 'Dealer')} · {audit.get('audit_name', 'Auditoría')}"):
-            claims_copy = clone_jsonable(audit.get("claims", {}))
-            ensure_review_layers_for_claims(claims_copy)
-            comparison_df = build_dealer_nsc_comparison_dataframe(claims_copy)
-            if comparison_df.empty:
-                st.caption("Sin claims para comparar.")
-            else:
-                st.dataframe(comparison_df, use_container_width=True, hide_index=True)
-            if st.button("Abrir esta auditoría en modo NSC", key=f"open_supervisor_audit_{index}"):
-                st.session_state.claims = claims_copy
-                st.session_state.audit_name = audit.get("audit_name", "Auditoría garantías")
-                st.session_state.audit_dealer = audit.get("dealer", "")
-                st.session_state.audit_auditor = audit.get("auditor", "")
-                st.session_state.audit_mode = AUDIT_MODE_NSC
-                st.session_state.selected_claim = next(iter(claims_copy.keys()), None)
-                activate_review_layer_for_claims(st.session_state.claims, AUDIT_MODE_NSC)
-                st.rerun()
-
+def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, base_name: str):
+    tabs = st.tabs(["Informe español", "Report English"])
+    with tabs[0]:
+        report_es = generate_text_report(claims, audit_name, dealer, auditor, "es")
+        st.text_area("Informe generado ES", value=report_es, height=420)
+        st.download_button("Descargar informe ES .txt", data=report_es.encode("utf-8"), file_name=f"{base_name}_ES_informe.txt", mime="text/plain")
+    with tabs[1]:
+        report_en = generate_text_report(claims, audit_name, dealer, auditor, "en")
+        st.text_area("Generated report EN", value=report_en, height=420)
+        st.download_button("Download EN report .txt", data=report_en.encode("utf-8"), file_name=f"{base_name}_EN_report.txt", mime="text/plain")
 
 
 def main():
-    st.set_page_config(page_title="Warranty Internal Audit Tool", layout="wide")
+    st.set_page_config(page_title="Warranty Audit Assistant", page_icon="🧾", layout="wide")
     init_state()
-    ensure_review_layers_for_claims(st.session_state.claims)
-    activate_review_layer_for_claims(st.session_state.claims, st.session_state.get("audit_mode", AUDIT_MODE_NSC))
-    sync_uploaded_attachments_from_session_state(st.session_state.claims)
-    sync_editor_state_from_session_state(st.session_state.claims)
-    activate_review_layer_for_claims(st.session_state.claims, st.session_state.get("audit_mode", AUDIT_MODE_NSC))
 
-    active_mode = get_active_audit_mode()
-    st.title("Warranty Audit Portal")
-    st.caption("Fase 1/2 offline: dealer rellena y exporta JSON/ZIP; NSC carga, revisa, compara y cierra. Fase 3 queda preparada para base de datos online.")
+    st.title("🧾 Warranty Audit Assistant")
+    st.caption("Herramienta interna para revisar claims, calcular puntuación y generar boletín/plan de acción en español e inglés.")
 
     with st.sidebar:
         st.header("Auditoría")
+        st.session_state.audit_name = st.text_input("Nombre auditoría", value=st.session_state.audit_name)
+        dealer_options = get_dealer_options(st.session_state.audit_dealer)
+        if st.session_state.audit_dealer not in dealer_options:
+            dealer_options.insert(1, st.session_state.audit_dealer)
+        st.session_state.audit_dealer = st.selectbox("Dealer", dealer_options, index=dealer_options.index(st.session_state.audit_dealer) if st.session_state.audit_dealer in dealer_options else 0, format_func=format_dealer_option)
+        st.session_state.audit_auditor = st.text_input("Auditor", value=st.session_state.audit_auditor)
+        dealer = safe_str(st.session_state.audit_dealer)
+        auditor = safe_str(st.session_state.audit_auditor)
+        audit_name = safe_str(st.session_state.audit_name)
+        base_name = build_audit_file_basename(dealer, auditor)
 
-        selected_mode = st.selectbox(
-            "Modo de trabajo",
-            AUDIT_MODES,
-            key="audit_mode",
-            help="Dealer: autoauditoría y entrega. NSC: supervisor, revisión y comparación frente a lo entregado por dealer.",
-        )
-        st.info(
-            "Modo NSC: revisa/corrige auditorías recibidas."
-            if selected_mode == AUDIT_MODE_NSC
-            else "Modo Dealer: rellena la autoauditoría y descarga JSON/ZIP para enviarlo a NSC."
-        )
-
-        st.subheader("Guardar / cargar progreso")
-        workfile = st.file_uploader(
-            "Cargar auditoría guardada o entrega dealer (.json/.zip)",
-            type=["json", "zip"],
-            key="workfile_upload",
-            help="Carga un JSON de trabajo o un ZIP completo generado por la app.",
-        )
-        if workfile is not None and st.button("Cargar auditoría", type="primary"):
+        st.divider()
+        st.subheader("Cargar / continuar")
+        workfile = st.file_uploader("Cargar auditoría guardada (.json)", type=["json"], key="workfile_upload")
+        if workfile is not None and st.button("Cargar JSON"):
             try:
-                loaded_claims, loaded_audit_name, loaded_dealer, loaded_auditor, loaded_mode = load_audit_workfile(workfile)
-                st.session_state.claims = loaded_claims
-                st.session_state.selected_claim = next(iter(loaded_claims.keys()))
-                st.session_state.audit_name = loaded_audit_name
+                claims, loaded_name, loaded_dealer, loaded_auditor = load_audit_workfile(workfile)
+                st.session_state.claims = claims
+                st.session_state.audit_name = loaded_name
                 st.session_state.audit_dealer = loaded_dealer
                 st.session_state.audit_auditor = loaded_auditor
-                st.session_state.audit_mode = loaded_mode
-                st.success(f"Auditoría cargada: {len(loaded_claims)} claims.")
+                st.session_state.selected_claim = next(iter(claims.keys()))
+                st.success(f"Auditoría cargada: {len(claims)} claims.")
                 st.rerun()
             except Exception as exc:
-                st.error(f"No se pudo cargar la auditoría guardada: {exc}")
+                st.error(f"No se pudo cargar el JSON: {exc}")
 
-        if st.session_state.claims:
-            st.download_button(
-                "Descargar auditoría de trabajo (.json)",
-                data=serialize_audit_workfile(
-                    st.session_state.claims,
-                    st.session_state.audit_name,
-                    st.session_state.audit_dealer,
-                    st.session_state.audit_auditor,
-                    st.session_state.get("audit_mode", AUDIT_MODES[0]),
-                ),
-                file_name=f"{build_audit_file_basename(st.session_state.get('audit_dealer', ''), st.session_state.get('audit_auditor', ''))}.json",
-                mime="application/json",
-                help="Descarga el archivo de progreso para poder reabrir la auditoría más adelante.",
-                key="download_workfile_sidebar",
-            )
-            st.caption("Este JSON es el archivo de trabajo editable. El ZIP también incluye una copia.")
-        else:
-            st.caption("Carga claims para poder descargar el JSON de trabajo.")
-
-        if st.session_state.get("audit_mode") == AUDIT_MODE_NSC:
-            st.divider()
-            st.subheader("Panel NSC offline")
-            received_files = st.file_uploader(
-                "Cargar auditorías recibidas para comparar",
-                type=["json", "zip"],
-                accept_multiple_files=True,
-                key="supervisor_received_uploads",
-                help="Fase 2 sin base de datos: subes varios JSON/ZIP recibidos y el panel los resume. Puedes abrir cualquiera para revisarlo.",
-            )
-            if received_files and st.button("Añadir al panel NSC"):
-                if "supervisor_audits" not in st.session_state:
-                    st.session_state.supervisor_audits = []
-                added = 0
-                for received_file in received_files:
-                    try:
-                        raw_bytes = received_file.getvalue()
-                        loaded_claims, loaded_audit_name, loaded_dealer, loaded_auditor, _loaded_mode = load_audit_workfile_from_bytes(raw_bytes, safe_str(getattr(received_file, "name", "")))
-                        st.session_state.supervisor_audits.append(
-                            build_supervisor_overview_row(
-                                loaded_claims,
-                                loaded_audit_name,
-                                loaded_dealer,
-                                loaded_auditor,
-                                safe_str(getattr(received_file, "name", "")),
-                            )
-                        )
-                        added += 1
-                    except Exception as exc:
-                        st.warning(f"No se pudo cargar {safe_str(getattr(received_file, 'name', 'archivo'))}: {exc}")
-                if added:
-                    st.success(f"Añadidas {added} auditoría(s) al panel NSC.")
-
-            if st.session_state.get("supervisor_audits"):
-                st.caption(f"Auditorías en panel: {len(st.session_state.supervisor_audits)}")
-                if st.button("Limpiar panel NSC"):
-                    st.session_state.supervisor_audits = []
-                    st.rerun()
-
-        st.divider()
-        audit_name = st.text_input("Nombre auditoría", key="audit_name")
-
-        dealer_values = get_dealer_options(st.session_state.get("audit_dealer", ""))
-        dealer = st.selectbox(
-            "Dealer",
-            dealer_values,
-            key="audit_dealer",
-            format_func=format_dealer_option,
-            help="Listado de dealers activos. Si cargas un JSON antiguo con otro dealer, se conservará como opción temporal.",
-        )
-
-        auditor = st.text_input("Auditor", key="audit_auditor")
-        export_base_name = build_audit_file_basename(dealer, auditor)
-        st.caption(f"Nombre base de archivos: `{export_base_name}`")
-
-        st.divider()
-        uploaded_file = st.file_uploader("Subir checklist o lista HQ", type=["xlsx", "xlsm", "xls"], key="claims_upload")
-        if uploaded_file is not None and st.button("Cargar claims", type="secondary"):
+        uploaded_excel = st.file_uploader("Subir checklist o lista de claims", type=["xlsx", "xlsm", "xls"], key="claims_upload")
+        if uploaded_excel is not None and st.button("Cargar claims"):
             try:
-                st.session_state.claims = read_claims_from_uploaded_excel(uploaded_file)
-                if st.session_state.claims:
-                    # Si la checklist oficial no trae dealer por claim, usamos el dealer general
-                    # indicado en la barra lateral para que no quede la ficha en blanco.
-                    default_dealer = safe_str(st.session_state.get("audit_dealer", ""))
-                    if default_dealer:
-                        for loaded_claim in st.session_state.claims.values():
-                            if not safe_str(loaded_claim.get("dealer", "")):
-                                loaded_claim["dealer"] = default_dealer
-
-                    st.session_state.selected_claim = next(iter(st.session_state.claims.keys()))
-                    st.success(f"Cargadas {len(st.session_state.claims)} claims.")
-                    st.rerun()
-                else:
-                    st.warning("No se encontraron claims en el archivo.")
+                loaded_claims = read_claims_from_uploaded_excel(uploaded_excel)
+                if dealer:
+                    apply_default_dealer_to_blank_claims(loaded_claims, dealer)
+                st.session_state.claims = loaded_claims
+                st.session_state.selected_claim = next(iter(loaded_claims.keys())) if loaded_claims else None
+                st.success(f"Cargadas {len(loaded_claims)} claims.")
+                st.rerun()
             except Exception as exc:
                 st.error(f"No se pudo cargar el archivo: {exc}")
 
         st.divider()
-        manual_claim = st.text_input("Añadir claim manual")
-        if st.button("Añadir claim") and manual_claim.strip():
-            claim_no = manual_claim.strip()
-            new_claim = empty_claim_record(claim_no)
-            if safe_str(st.session_state.get("audit_dealer", "")):
-                new_claim["dealer"] = safe_str(st.session_state.audit_dealer)
-            st.session_state.claims.setdefault(claim_no, new_claim)
-            st.session_state.selected_claim = claim_no
-            st.success(f"Claim {claim_no} añadida.")
-            st.rerun()
+        st.subheader("Añadir claim manual")
+        with st.form("manual_claim_form"):
+            manual_local = st.text_input("Claim ES / Dealer (CO...)")
+            manual_hq = st.text_input("Claim HQ / IDMS / 2810...")
+            submitted = st.form_submit_button("Añadir claim")
+        if submitted:
+            if not safe_str(manual_local) and not safe_str(manual_hq):
+                st.warning("Indica al menos un identificador de claim.")
+            else:
+                claim = empty_claim_record(local_claim_no=manual_local, hq_claim_no=manual_hq)
+                if dealer:
+                    claim["dealer"] = dealer
+                key = make_claim_key(claim.get("local_claim_no"), claim.get("hq_claim_no"), claim.get("claim_no"))
+                st.session_state.claims.setdefault(key, claim)
+                st.session_state.selected_claim = key
+                st.success("Claim añadida.")
+                st.rerun()
 
         st.divider()
         st.subheader("Regla de puntuación")
@@ -2434,17 +1563,10 @@ def main():
         st.caption("No aplica = máximo del apartado. Campañas = informativo.")
 
     claims: Dict[str, Dict[str, Any]] = st.session_state.claims
-    ensure_review_layers_for_claims(claims)
-    activate_review_layer_for_claims(claims, st.session_state.get("audit_mode", AUDIT_MODE_NSC))
-    apply_default_dealer_to_blank_claims(claims, dealer)
-    sync_uploaded_attachments_from_session_state(claims)
-    sync_editor_state_from_session_state(claims)
-    activate_review_layer_for_claims(claims, st.session_state.get("audit_mode", AUDIT_MODE_NSC))
+    apply_default_dealer_to_blank_claims(claims, safe_str(st.session_state.audit_dealer))
 
     if not claims:
-        if st.session_state.get("audit_mode") == AUDIT_MODE_NSC and st.session_state.get("supervisor_audits"):
-            render_supervisor_panel()
-        st.info("Sube la checklist de auditoría, añade una claim manual o carga una entrega JSON/ZIP para empezar.")
+        st.info("Sube la checklist/lista de claims o añade una claim manual para empezar.")
         st.stop()
 
     audit_score = calculate_audit_score(claims)
@@ -2454,298 +1576,87 @@ def main():
     kpi_cols[2].metric("Documentación", f"{audit_score['doc_points']}/{audit_score['claims'] * MAX_DOCUMENT_POINTS}")
     kpi_cols[3].metric("Piezas viejas", f"{audit_score['old_points']}/{audit_score['claims'] * MAX_OLD_PARTS_POINTS}")
     kpi_cols[4].metric("Éxito global", f"{audit_score['success_percent']:.1f}%")
-
-    if st.session_state.get("audit_mode") == AUDIT_MODE_NSC:
-        with st.expander("Comparación Dealer vs NSC", expanded=False):
-            comparison_df = build_dealer_nsc_comparison_dataframe(claims)
-            if comparison_df.empty:
-                st.caption("Todavía no hay datos para comparar.")
-            else:
-                st.dataframe(comparison_df, use_container_width=True, hide_index=True)
-                total_dealer = pd.to_numeric(comparison_df["Autoauditoría dealer /100"], errors="coerce").fillna(0).sum()
-                total_nsc = pd.to_numeric(comparison_df["Revisión NSC /100"], errors="coerce").fillna(0).sum()
-                st.caption(f"Diferencia total NSC - Dealer: {total_nsc - total_dealer:+.0f} puntos.")
-
-        render_supervisor_panel()
-
     st.divider()
 
-    left, right = st.columns([1.1, 2.4])
+    left, right = st.columns([1.05, 2.5])
 
     with left:
         st.subheader("Claims")
-        summary_df = build_summary_dataframe(claims)
-        compact_columns = [
-            "Claim No.",
-            "Puntos documentación",
-            "Puntos piezas viejas",
-            "Resultado /100",
-            "Estado",
-        ]
-        st.dataframe(
-            summary_df[compact_columns],
-            use_container_width=True,
-            hide_index=True,
-        )
+        summary_df = build_summary_dataframe(claims, "es")
+        compact_cols = [TEXT["es"]["claim_no"], TEXT["es"]["other_id"], TEXT["es"]["doc_score"], TEXT["es"]["old_score"], TEXT["es"]["total_score"], TEXT["es"]["result"]]
+        st.dataframe(summary_df[[col for col in compact_cols if col in summary_df.columns]], use_container_width=True, hide_index=True)
 
         claim_options = list(claims.keys())
         if st.session_state.selected_claim not in claim_options:
             st.session_state.selected_claim = claim_options[0]
-
-        selected_claim = st.selectbox(
-            "Seleccionar claim",
-            claim_options,
-            index=claim_options.index(st.session_state.selected_claim),
-        )
+        selected_claim = st.selectbox("Seleccionar claim", claim_options, index=claim_options.index(st.session_state.selected_claim), format_func=display_claim_option)
         st.session_state.selected_claim = selected_claim
 
-        if st.button("Eliminar claim seleccionada", help="Solo elimina la claim de esta auditoría en curso."):
-            claim_to_delete = st.session_state.selected_claim
-            if claim_to_delete in claims:
-                del claims[claim_to_delete]
-                st.session_state.selected_claim = next(iter(claims.keys()), None)
-                st.rerun()
-
-        st.download_button(
-            "💾 Guardar progreso editable (.json)",
-            data=serialize_audit_workfile(claims, audit_name, dealer, auditor, st.session_state.get("audit_mode", AUDIT_MODES[0])),
-            file_name=f"{build_audit_file_basename(st.session_state.get('audit_dealer', ''), st.session_state.get('audit_auditor', ''))}.json",
-            mime="application/json",
-            help="Este es el archivo que debes subir en 'Cargar auditoría guardada' para continuar editando otro día.",
-            key="download_workfile_main",
-        )
-
-        st.download_button(
-            "Exportar auditoría a Excel",
-            data=export_excel(claims, audit_name, dealer, auditor),
-            file_name=f"{export_base_name}_analitico.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-        st.download_button(
-            "Exportar boletín de notas Excel",
-            data=export_report_card_excel(claims, audit_name, dealer, auditor),
-            file_name=f"{export_base_name}_boletin.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            help="Genera un Excel con hojas tipo plantilla: documentación, piezas viejas, áreas de mejora, criterios y boletín por claim.",
-        )
-
-        st.download_button(
-            "Exportar paquete completo (.zip)",
-            data=export_audit_package_zip(claims, audit_name, dealer, auditor),
-            file_name=f"{export_base_name}.zip",
-            mime="application/zip",
-            help="Incluye Excel analítico, boletín, informe TXT, JSON de trabajo y los archivos adjuntos reales por claim.",
-        )
-
-        closing_df = build_closing_validation_dataframe(claims)
-        if closing_df.empty:
-            st.success("Validación de cierre: OK")
-        else:
-            st.warning(f"Validación de cierre: {len(closing_df)} aviso(s)")
+        st.download_button("💾 Guardar progreso editable (.json)", data=serialize_audit_workfile(claims, audit_name, dealer, auditor), file_name=f"{base_name}.json", mime="application/json")
+        st.download_button("🇪🇸 Boletín ES para dealer", data=export_scorecard_excel(claims, audit_name, dealer, auditor, "es"), file_name=f"{base_name}_ES_boletin.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("🇬🇧 Scorecard EN para HQ", data=export_scorecard_excel(claims, audit_name, dealer, auditor, "en"), file_name=f"{base_name}_EN_scorecard.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("Exportar analítico ES", data=export_analytical_excel(claims, audit_name, dealer, auditor, "es"), file_name=f"{base_name}_ES_analitico.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("Exportar paquete ES+EN (.zip)", data=export_bilingual_package_zip(claims, audit_name, dealer, auditor), file_name=f"{base_name}_ES_EN.zip", mime="application/zip")
 
     with right:
         claim = claims[st.session_state.selected_claim]
         score = calculate_claim_score(claim)
-
-        st.subheader(f"Revisión claim {claim['claim_no']}")
-        render_claim_quick_card(claim, dealer or "")
+        st.subheader(f"Revisión claim {claim_identifier(claim, 'es') or claim_identifier(claim, 'en')}")
+        render_claim_quick_card(claim, dealer)
 
         score_cols = st.columns(4)
         score_cols[0].metric("Documentación", f"{score['doc_points']}/{MAX_DOCUMENT_POINTS}")
         score_cols[1].metric("Piezas viejas", f"{score['old_points']}/{MAX_OLD_PARTS_POINTS}")
         score_cols[2].metric("Resultado claim", f"{score['total_points']}/100")
-        score_cols[3].metric("Estado", get_claim_workflow_status(claim))
-
-        workflow_key = f"claim_workflow_status_{claim['claim_no']}"
-        pending_workflow_key = f"pending_workflow_status_{claim['claim_no']}"
-        current_workflow_status = get_claim_workflow_status(claim)
-        claim["workflow_status"] = current_workflow_status
-
-        # Los botones de estado escriben en una clave temporal para no modificar
-        # directamente el valor de un widget después de crearlo en la misma ejecución.
-        if pending_workflow_key in st.session_state:
-            current_workflow_status = normalize_workflow_status(st.session_state[pending_workflow_key])
-            claim["workflow_status"] = current_workflow_status
-            st.session_state[workflow_key] = current_workflow_status
-            del st.session_state[pending_workflow_key]
-
-        if workflow_key not in st.session_state or st.session_state[workflow_key] not in CLAIM_WORKFLOW_STATUSES:
-            st.session_state[workflow_key] = current_workflow_status
-
-        workflow_cols = st.columns([1.4, 1, 1, 1.2])
-        with workflow_cols[0]:
-            selected_workflow_status = st.selectbox(
-                "Estado de trabajo",
-                CLAIM_WORKFLOW_STATUSES,
-                index=CLAIM_WORKFLOW_STATUSES.index(st.session_state[workflow_key]),
-                key=workflow_key,
-            )
-            claim["workflow_status"] = normalize_workflow_status(selected_workflow_status)
-        with workflow_cols[1]:
-            if st.button("Marcar completada", use_container_width=True, key=f"mark_completed_{claim['claim_no']}"):
-                claim["workflow_status"] = "Completada"
-                st.session_state[pending_workflow_key] = "Completada"
-                st.rerun()
-        with workflow_cols[2]:
-            if st.button("Requiere aclaración", use_container_width=True, key=f"mark_clarification_{claim['claim_no']}"):
-                claim["workflow_status"] = "Requiere aclaración"
-                st.session_state[pending_workflow_key] = "Requiere aclaración"
-                st.rerun()
-        with workflow_cols[3]:
-            if st.button("Cerrar claim", use_container_width=True, key=f"mark_closed_{claim['claim_no']}"):
-                claim["workflow_status"] = "Cerrada"
-                st.session_state[pending_workflow_key] = "Cerrada"
-                st.rerun()
-
-        if st.session_state.get("audit_mode") == AUDIT_MODE_NSC:
-            nsc_comment_key = f"nsc_comment_{claim['claim_no']}"
-            if nsc_comment_key not in st.session_state:
-                st.session_state[nsc_comment_key] = claim.get("nsc_comment", "")
-            claim["nsc_comment"] = st.text_input(
-                "Comentario interno NSC / seguimiento rápido",
-                key=nsc_comment_key,
-                placeholder="Ej.: revisar fotos, pedir aclaración, OK para cierre...",
-            )
-        else:
-            st.caption("Modo Dealer: los comentarios internos NSC no se muestran.")
-
+        score_cols[3].metric("Estado", "Completada" if score["completed"] else "Pendiente")
         if score["pending"]:
             st.warning("Apartados pendientes: " + ", ".join(score["pending"]))
 
         section_names = ["I. Documentación", "II. Piezas viejas", "Campañas", "Comentarios", "Informe"]
-
-        if "active_audit_section" not in st.session_state:
-            st.session_state.active_audit_section = section_names[0]
-
         if st.session_state.active_audit_section not in section_names:
             st.session_state.active_audit_section = section_names[0]
-
-        st.radio(
-            "Sección de revisión",
-            section_names,
-            index=section_names.index(st.session_state.active_audit_section),
-            horizontal=True,
-            key="active_audit_section",
-            label_visibility="collapsed",
-        )
-
+        st.radio("Sección", section_names, index=section_names.index(st.session_state.active_audit_section), horizontal=True, key="active_audit_section", label_visibility="collapsed")
         selected_section = st.session_state.active_audit_section
 
         if selected_section == "I. Documentación":
             render_check_editor(claim, DOCUMENT_CHECKS)
-
         elif selected_section == "II. Piezas viejas":
             render_check_editor(claim, OLD_PARTS_CHECKS)
-            render_old_parts_attachments(claim)
-
         elif selected_section == "Campañas":
             render_campaign_editor(claim)
-
         elif selected_section == "Comentarios":
-            st.caption(
-                "El comentario general se puede generar automáticamente a partir de las "
-                "observaciones que hayas escrito en cada apartado. No inventa nada por la nota."
-            )
-
-            role_prefix = get_active_review_role()
-            general_comment_field = get_active_general_comment_field()
-            general_comment_key = f"{role_prefix}_general_comment_{claim['claim_no']}"
-            if general_comment_key not in st.session_state:
-                st.session_state[general_comment_key] = claim.get(general_comment_field, claim.get("general_comment", ""))
-
-            button_label = (
-                "Generar comentario NSC desde observaciones"
-                if st.session_state.get("audit_mode") == AUDIT_MODE_NSC
-                else "Generar comentario dealer desde observaciones"
-            )
-            if st.button(button_label, key=f"generate_comment_{role_prefix}_{claim['claim_no']}"):
-                generated_comment = build_general_comment_from_observations(claim, include_campaigns=True)
-
-                if generated_comment:
-                    claim[general_comment_field] = generated_comment
-                    claim["general_comment"] = generated_comment
-                    st.session_state[general_comment_key] = generated_comment
-                    st.success("Comentario general generado desde las observaciones de los apartados.")
-                else:
-                    st.warning("No hay observaciones escritas en los apartados para generar el comentario general.")
-
-            claim[general_comment_field] = st.text_area(
-                "Comentarios generales de la claim",
-                key=general_comment_key,
-                height=180,
-            )
-            claim["general_comment"] = claim[general_comment_field]
-
-            if st.session_state.get("audit_mode") == AUDIT_MODE_NSC:
-                dealer_comment = safe_str(claim.get("dealer_general_comment", ""))
-                if dealer_comment and dealer_comment != safe_str(claim.get("nsc_general_comment", "")):
-                    with st.expander("Ver comentario entregado por dealer"):
-                        st.write(dealer_comment)
-
+            render_comments_editor(claim)
         elif selected_section == "Informe":
-            report = generate_text_report(claims, audit_name, dealer, auditor)
-            st.text_area("Informe generado", value=report, height=420)
-            st.download_button(
-                "Descargar informe .txt",
-                data=report.encode("utf-8"),
-                file_name=f"{export_base_name}_informe.txt",
-                mime="text/plain",
-            )
-
-            st.markdown("### Validación de cierre")
-            closing_df = build_closing_validation_dataframe(claims)
-            if closing_df.empty:
-                st.success("Sin avisos de cierre. La auditoría está limpia para exportar/cerrar.")
-            else:
-                st.warning(f"Hay {len(closing_df)} aviso(s) antes de cerrar la auditoría.")
-                st.dataframe(closing_df, use_container_width=True, hide_index=True)
+            render_report_section(claims, audit_name, dealer, auditor, base_name)
 
         st.divider()
         section_index = section_names.index(st.session_state.active_audit_section)
-        section_nav_cols = st.columns([1, 1, 2])
-
-        with section_nav_cols[0]:
-            if st.button(
-                "← Apartado anterior",
-                disabled=section_index == 0,
-                use_container_width=True,
-                key=f"previous_section_{claim['claim_no']}",
-            ):
+        nav_section_cols = st.columns([1, 1, 2])
+        with nav_section_cols[0]:
+            if st.button("← Apartado anterior", disabled=section_index == 0, use_container_width=True):
                 st.session_state.active_audit_section = section_names[section_index - 1]
                 st.rerun()
-
-        with section_nav_cols[1]:
-            if st.button(
-                "Siguiente apartado →",
-                type="primary",
-                disabled=section_index >= len(section_names) - 1,
-                use_container_width=True,
-                key=f"next_section_{claim['claim_no']}",
-            ):
+        with nav_section_cols[1]:
+            if st.button("Siguiente apartado →", type="primary", disabled=section_index >= len(section_names) - 1, use_container_width=True):
                 st.session_state.active_audit_section = section_names[section_index + 1]
                 st.rerun()
-
-        with section_nav_cols[2]:
+        with nav_section_cols[2]:
             st.caption(f"Apartado {section_index + 1} de {len(section_names)} · {st.session_state.active_audit_section}")
 
         st.divider()
         current_index = claim_options.index(st.session_state.selected_claim)
-        nav_cols = st.columns([1, 1, 2])
-
-        with nav_cols[0]:
+        nav_claim_cols = st.columns([1, 1, 2])
+        with nav_claim_cols[0]:
             if st.button("← Anterior claim", disabled=current_index == 0, use_container_width=True):
                 st.session_state.selected_claim = claim_options[current_index - 1]
                 st.session_state.active_audit_section = section_names[0]
                 st.rerun()
-
-        with nav_cols[1]:
+        with nav_claim_cols[1]:
             if st.button("Siguiente claim →", disabled=current_index >= len(claim_options) - 1, use_container_width=True):
                 st.session_state.selected_claim = claim_options[current_index + 1]
                 st.session_state.active_audit_section = section_names[0]
                 st.rerun()
-
-        with nav_cols[2]:
+        with nav_claim_cols[2]:
             st.caption(f"Claim {current_index + 1} de {len(claim_options)}")
 
 
