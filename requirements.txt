@@ -2,3 +2,4 @@ openpyxl
 streamlit
 pandas
 xlsxwriter
+google-genai
