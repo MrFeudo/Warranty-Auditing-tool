@@ -1496,23 +1496,70 @@ Your task is to create a professional executive audit report and action plan in 
 Use ONLY the audit data provided below. Do not invent claims, scores, deductions or facts.
 Do not recalculate the score. Use the provided scores exactly.
 
-Important style requirements:
-- Spanish text is for the dealer: clear, professional, direct, improvement-oriented.
+IMPORTANT STYLE REQUIREMENTS:
+- Spanish text is for the dealer: clear, professional, direct and improvement-oriented.
 - English text is for HQ: corporate, concise and formal.
 - Summarize repeated observations into meaningful improvement areas.
 - Do not output a raw list like "23 claims with deviation" as the main content.
 - Explain what the pattern means and what action should be taken.
 - Keep the tone constructive, not accusatory.
-- The action plan must include practical countermeasures based on the observations.
 - Manual Spanish observations must be translated naturally into English in the English output.
 - Scoring is rule-based; do not change it.
+- Do not use excessive asterisks or bold Markdown markers. Keep the report readable in plain text too.
+
+IMPORTANT CHECKLIST NAMING RULES:
+- Respect the current checklist naming exactly.
+- In Spanish, use the exact Spanish audited parameter names received in the audit data.
+- In English, use the exact English audited parameter names received in the audit data.
+- Do not rename audited parameters into generic alternatives.
+
+ACTION PLAN STRUCTURE:
+The action plan must follow the audit checklist structure, like an audit scorecard/action plan table.
+Return action_plan_rows_es and action_plan_rows_en as arrays with ONE ROW FOR EACH audited parameter, in this exact order:
+1. OR
+2. Pedido piezas / albarán
+3. OR previa
+4. Evidencias
+5. Pieza causa correcta
+6. Mano de obra
+7. Material auxiliar
+8. Fecha/hora envío Claim
+9. VIN
+10. Gestión piezas viejas
+11. Etiquetado pieza vieja
+12. Pieza causa
+13. Info tipo fallo pieza causa
+14. Destrucción pieza vieja
+15. Certificado destrucción piezas viejas
+
+For English rows, use the exact English checklist names from the audit data.
+Each row must contain:
+- group: "Claim" for document checklist items, "Old part" for old parts checklist items.
+- parameter: exact checklist parameter name.
+- evaluation: "X" when there is any deviation, deduction impact or relevant observation for that parameter. Otherwise "V".
+- observations: concise aggregated observation. Empty string if evaluation is "V".
+- countermeasures: concise practical countermeasure. Empty string if evaluation is "V".
+
+Return also action_plan_es and action_plan_en as readable Markdown tables with columns:
+Audited parameters | Evaluation | Observations | Countermeasures
+
+REPORT FORMAT:
+- report_es and report_en must be highly readable.
+- Use short plain headings and short bullet points.
+- Recommended structure: Executive summary, Main findings, Main improvement areas, Conclusion.
 
 Return ONLY valid JSON with this exact structure:
 {{
   "report_es": "Texto completo del informe ejecutivo en español",
   "report_en": "Full executive report in English",
-  "action_plan_es": "Mini plan de acción en español, estructurado por áreas de mejora",
-  "action_plan_en": "Mini action plan in English, structured by improvement areas",
+  "action_plan_es": "Tabla markdown del plan de acción en español",
+  "action_plan_en": "Markdown table of the action plan in English",
+  "action_plan_rows_es": [
+    {{"group": "Claim", "parameter": "OR", "evaluation": "V", "observations": "", "countermeasures": ""}}
+  ],
+  "action_plan_rows_en": [
+    {{"group": "Claim", "parameter": "Repair order", "evaluation": "V", "observations": "", "countermeasures": ""}}
+  ],
   "claim_comments_en": {{
     "CLAIM_HQ_OR_ES_ID": "Professional English translation/summary of the claim observations"
   }}
@@ -1537,6 +1584,10 @@ def generate_gemini_audit_outputs(claims: Dict[str, Dict[str, Any]], audit_name:
 
     try:
         from google import genai
+        try:
+            from google.genai import types
+        except Exception:
+            types = None
     except Exception as exc:
         return False, f"No está instalado el SDK de Gemini. Añade google-genai a requirements.txt. Detalle: {exc}"
 
@@ -1545,7 +1596,16 @@ def generate_gemini_audit_outputs(claims: Dict[str, Dict[str, Any]], audit_name:
 
     try:
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(model=model or GEMINI_MODEL_DEFAULT, contents=prompt)
+        request_kwargs = {
+            "model": model or GEMINI_MODEL_DEFAULT,
+            "contents": prompt,
+        }
+        # Temperatura baja: más determinista, rápida y menos propensa a inventar formato.
+        if types is not None:
+            request_kwargs["config"] = types.GenerateContentConfig(temperature=0.15)
+        else:
+            request_kwargs["config"] = {"temperature": 0.15}
+        response = client.models.generate_content(**request_kwargs)
         raw_text = getattr(response, "text", "") or ""
     except Exception as exc:
         return False, f"Gemini no ha podido generar el informe: {exc}"
@@ -1558,16 +1618,22 @@ def generate_gemini_audit_outputs(claims: Dict[str, Dict[str, Any]], audit_name:
     st.session_state.ai_report_en = safe_str(parsed.get("report_en", ""))
     st.session_state.ai_action_plan_es = safe_str(parsed.get("action_plan_es", ""))
     st.session_state.ai_action_plan_en = safe_str(parsed.get("action_plan_en", ""))
+
+    rows_es = parsed.get("action_plan_rows_es", [])
+    rows_en = parsed.get("action_plan_rows_en", [])
+    st.session_state.ai_action_plan_rows_es = rows_es if isinstance(rows_es, list) else []
+    st.session_state.ai_action_plan_rows_en = rows_en if isinstance(rows_en, list) else []
+
     claim_comments = parsed.get("claim_comments_en", {})
     st.session_state.ai_claim_comments_en = claim_comments if isinstance(claim_comments, dict) else {}
     st.session_state.ai_generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    st.session_state.ai_model_used = model or GEMINI_MODEL_DEFAULT
     return True, "Informe ejecutivo, plan de acción y traducciones EN generadas con Gemini."
 
 
 def clear_ai_outputs() -> None:
     for key in [
         "ai_report_es", "ai_report_en", "ai_action_plan_es", "ai_action_plan_en",
+        "ai_action_plan_rows_es", "ai_action_plan_rows_en",
         "ai_claim_comments_en", "ai_generated_at", "ai_model_used",
     ]:
         if key in st.session_state:
@@ -1711,6 +1777,116 @@ def build_action_plan_rows(claims: Dict[str, Dict[str, Any]], language: str = "e
             "lost_points": 0,
             "affected_claims": affected_deductions,
         })
+    return rows
+
+
+def ai_action_plan_rows_for_language(language: str = "es") -> List[Dict[str, str]]:
+    """Filas estructuradas devueltas por Gemini para la hoja Improvement/action plan."""
+    key = "ai_action_plan_rows_es" if language == "es" else "ai_action_plan_rows_en"
+    try:
+        raw_rows = st.session_state.get(key, []) or []
+    except Exception:
+        raw_rows = []
+    if not isinstance(raw_rows, list):
+        return []
+    rows: List[Dict[str, str]] = []
+    for raw in raw_rows:
+        if not isinstance(raw, dict):
+            continue
+        rows.append({
+            "group": safe_str(raw.get("group", "")),
+            "parameter": safe_str(raw.get("parameter", "")),
+            "evaluation": "X" if safe_str(raw.get("evaluation", "")).upper() == "X" else "V",
+            "observations": safe_str(raw.get("observations", "")),
+            "countermeasures": safe_str(raw.get("countermeasures", "")),
+        })
+    return rows
+
+
+def build_action_plan_scorecard_rows(claims: Dict[str, Dict[str, Any]], language: str = "es") -> List[Dict[str, str]]:
+    """
+    Construye la página 3 en formato checklist/action plan.
+    Siempre incluye todos los apartados y marca V/X.
+    Si Gemini ha generado filas estructuradas, se usan sus observaciones/contramedidas,
+    pero se fuerza el orden y los nombres exactos de la checklist.
+    """
+    sync_all_claims_from_widget_state(claims)
+
+    ai_rows = ai_action_plan_rows_for_language(language)
+    ai_by_parameter = {
+        normalize_text(row.get("parameter", "")): row
+        for row in ai_rows
+        if row.get("parameter")
+    }
+
+    rows: List[Dict[str, str]] = []
+    for check in ALL_SCORING_CHECKS:
+        expected_parameter = check_label(check, language)
+        group = "Claim" if check.block_key == "document" else "Old part"
+
+        comments = []
+        total_lost = 0
+        affected_claims = 0
+        for claim in claims.values():
+            evaluation = claim.get("evaluations", {}).get(check.key, {})
+            points = evaluation.get("points")
+            lost = check.max_points if points is None else max(0, check.max_points - int(points or 0))
+            comment = comment_for_language(evaluation_comment(claim, check), language)
+            if lost > 0 or comment:
+                affected_claims += 1
+                total_lost += int(lost)
+                if comment:
+                    comments.append(comment)
+
+        has_issue = affected_claims > 0 or total_lost > 0
+        evaluation_mark = "X" if has_issue else "V"
+
+        # Fallback automático si no hay Gemini o falta una fila concreta.
+        if has_issue:
+            unique_comments = []
+            seen = set()
+            for comment in comments:
+                norm = normalize_text(comment)
+                if norm and norm not in seen:
+                    unique_comments.append(comment)
+                    seen.add(norm)
+            if language == "es":
+                observation = f"Se detectan desviaciones u observaciones en {affected_claims} claim(s)."
+                if total_lost:
+                    observation += f" Puntos perdidos: {total_lost}."
+                if unique_comments:
+                    observation += " " + " / ".join(unique_comments[:3])
+            else:
+                observation = f"Deviations or observations were identified in {affected_claims} claim(s)."
+                if total_lost:
+                    observation += f" Lost points: {total_lost}."
+                if unique_comments:
+                    observation += " " + " / ".join(unique_comments[:3])
+            countermeasure = COUNTERMEASURES.get(check.key, {}).get(language, TEXT[language]["generic_countermeasure"])
+        else:
+            observation = ""
+            countermeasure = ""
+
+        ai_row = ai_by_parameter.get(normalize_text(expected_parameter), {})
+        if ai_row:
+            # El nombre y el orden se fuerzan desde la checklist; solo aprovechamos contenido IA.
+            ai_evaluation = safe_str(ai_row.get("evaluation", "")).upper()
+            evaluation_mark = "X" if ai_evaluation == "X" or has_issue else "V"
+            if evaluation_mark == "X":
+                observation = safe_str(ai_row.get("observations", "")) or observation
+                countermeasure = safe_str(ai_row.get("countermeasures", "")) or countermeasure
+            else:
+                observation = ""
+                countermeasure = ""
+
+        rows.append({
+            "group": group,
+            "parameter": expected_parameter,
+            "evaluation": evaluation_mark,
+            "observations": observation,
+            "countermeasures": countermeasure,
+        })
+
     return rows
 
 
@@ -2086,37 +2262,43 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
         # Improvement of claim issues III - página 3 / plan de acción
         # ------------------------------------------------------------------
         imp_ws = workbook.add_worksheet("Improvement of claim issues III")
-        imp_ws.merge_range("A1:E1", t["action_plan_title"], fmt_title)
-        set_widths(imp_ws, [28, 34, 42, 85, 85])
+        imp_ws.merge_range("A1:E1", "Action Plan" if language == "en" else "Plan de acción", fmt_title)
+        set_widths(imp_ws, [14, 34, 14, 85, 85])
 
-        ai_action_plan = get_ai_action_plan_for_language(language)
-        if ai_action_plan:
-            imp_ws.merge_range("A2:E2", "Plan generado con Gemini" if language == "es" else "Gemini-generated action plan", fmt_bold)
-            imp_ws.merge_range("A3:E8", ai_action_plan, fmt_body)
-            header_row = 9
-            data_start_row = 10
-        else:
-            header_row = 1
-            data_start_row = 2
+        imp_headers = [
+            "",
+            "Audited parameters" if language == "en" else "Parámetros auditados",
+            "Evaluation" if language == "en" else "Evaluación",
+            "Observations" if language == "en" else "Observaciones",
+            "Countermeasures" if language == "en" else "Contramedidas",
+        ]
+        write_headers(imp_ws, 1, imp_headers)
+        imp_ws.freeze_panes(2, 0)
 
-        imp_headers = ["Block" if language == "en" else "Bloque", t["auditable_list"], t["exception_comments"], t["observations"], t["countermeasure"]]
-        write_headers(imp_ws, header_row, imp_headers)
-        imp_ws.freeze_panes(header_row + 1, 0)
-        action_rows = build_action_plan_rows(claims, language)
-        if not action_rows:
-            write_row(imp_ws, data_start_row, ["", t["no_deviations"], "", "", ""], fmt_body)
-            last_row = data_start_row
-        else:
-            for row_idx, item in enumerate(action_rows, start=data_start_row):
-                write_row(imp_ws, row_idx, [
-                    item["block"],
-                    item["parameter"],
-                    item["exception"],
-                    item["observations"],
-                    item["countermeasure"],
-                ], fmt_body)
-            last_row = data_start_row + len(action_rows) - 1
-        imp_ws.autofilter(header_row, 0, last_row, len(imp_headers) - 1)
+        plan_rows = build_action_plan_scorecard_rows(claims, language)
+        start_row = 2
+        for row_idx, item in enumerate(plan_rows, start=start_row):
+            write_row(imp_ws, row_idx, [
+                item["group"],
+                item["parameter"],
+                item["evaluation"],
+                item["observations"],
+                item["countermeasures"],
+            ], fmt_body)
+            if item["evaluation"] == "X":
+                imp_ws.write(row_idx, 2, "X", fmt_bad)
+            else:
+                imp_ws.write(row_idx, 2, "V", fmt_ok)
+
+        # Agrupación visual tipo plantilla: Claim / Old part.
+        if plan_rows:
+            doc_count = len(DOCUMENT_CHECKS)
+            old_count = len(OLD_PARTS_CHECKS)
+            if doc_count > 1:
+                imp_ws.merge_range(start_row, 0, start_row + doc_count - 1, 0, "Claim", fmt_body)
+            if old_count > 1:
+                imp_ws.merge_range(start_row + doc_count, 0, start_row + doc_count + old_count - 1, 0, "Old\npart", fmt_body)
+            imp_ws.autofilter(1, 0, start_row + len(plan_rows) - 1, len(imp_headers) - 1)
 
         # ------------------------------------------------------------------
         # Evaluation content
@@ -2231,7 +2413,6 @@ def init_state():
     st.session_state.setdefault("audit_auditor", "")
     st.session_state.setdefault("audit_section_index", 0)
     st.session_state.setdefault("claim_paste_editor_version", 0)
-    st.session_state.setdefault("gemini_model", GEMINI_MODEL_DEFAULT)
 
 
 def clamp_index(index: Any, max_len: int) -> int:
@@ -2465,7 +2646,7 @@ def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, de
     with st.expander("✨ Generación con Gemini", expanded=not bool(get_ai_report_for_language("es"))):
         st.caption(
             "Gemini no cambia las puntuaciones. Solo redacta el informe ejecutivo, "
-            "resume las observaciones y mejora la versión en inglés."
+            "resume las observaciones, traduce al inglés y propone un plan de acción con la estructura de la checklist."
         )
         secret_key = get_secret_value("GEMINI_API_KEY", "GOOGLE_API_KEY")
         if secret_key:
@@ -2479,12 +2660,6 @@ def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, de
                 key="gemini_api_key_input",
             )
 
-        st.session_state.gemini_model = st.text_input(
-            "Modelo Gemini",
-            value=st.session_state.get("gemini_model", GEMINI_MODEL_DEFAULT),
-            help="Recomendado: gemini-2.5-flash",
-        )
-
         ai_cols = st.columns([1, 1, 2])
         with ai_cols[0]:
             if st.button("Generar con Gemini", type="primary", use_container_width=True):
@@ -2494,7 +2669,7 @@ def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, de
                     dealer,
                     auditor,
                     api_key,
-                    st.session_state.get("gemini_model", GEMINI_MODEL_DEFAULT),
+                    GEMINI_MODEL_DEFAULT,
                 )
                 if ok:
                     st.success(message)
@@ -2507,32 +2682,46 @@ def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, de
                 st.rerun()
         with ai_cols[2]:
             generated_at = get_ai_output("ai_generated_at")
-            model_used = get_ai_output("ai_model_used")
             if generated_at:
-                st.caption(f"Último informe IA: {generated_at} · {model_used}")
+                st.caption(f"Último informe IA: {generated_at}")
             else:
                 st.caption("Si no generas con Gemini, se usa el informe básico automático.")
 
     tabs = st.tabs(["Informe español", "Report English", "Plan acción ES", "Action plan EN"])
     with tabs[0]:
         report_es = generate_text_report(claims, audit_name, dealer, auditor, "es")
-        st.text_area("Informe generado ES", value=report_es, height=420)
+        st.markdown(report_es)
         st.download_button("Descargar informe ES .txt", data=report_es.encode("utf-8"), file_name=f"{base_name}_ES_informe.txt", mime="text/plain")
     with tabs[1]:
         report_en = generate_text_report(claims, audit_name, dealer, auditor, "en")
-        st.text_area("Generated report EN", value=report_en, height=420)
+        st.markdown(report_en)
         st.download_button("Download EN report .txt", data=report_en.encode("utf-8"), file_name=f"{base_name}_EN_report.txt", mime="text/plain")
     with tabs[2]:
+        action_rows_es = build_action_plan_scorecard_rows(claims, "es")
+        st.dataframe(pd.DataFrame(action_rows_es).rename(columns={
+            "group": "Grupo",
+            "parameter": "Parámetros auditados",
+            "evaluation": "Evaluación",
+            "observations": "Observaciones",
+            "countermeasures": "Contramedidas",
+        }), use_container_width=True, hide_index=True)
         action_es = get_ai_action_plan_for_language("es")
-        if not action_es:
-            action_es = "Genera el informe con Gemini para obtener un plan de acción narrativo. Mientras tanto, el Excel usa el plan estructurado automático."
-        st.text_area("Plan de acción ES", value=action_es, height=340)
+        if action_es:
+            with st.expander("Ver tabla generada por Gemini en texto", expanded=False):
+                st.markdown(action_es)
     with tabs[3]:
+        action_rows_en = build_action_plan_scorecard_rows(claims, "en")
+        st.dataframe(pd.DataFrame(action_rows_en).rename(columns={
+            "group": "Group",
+            "parameter": "Audited parameters",
+            "evaluation": "Evaluation",
+            "observations": "Observations",
+            "countermeasures": "Countermeasures",
+        }), use_container_width=True, hide_index=True)
         action_en = get_ai_action_plan_for_language("en")
-        if not action_en:
-            action_en = "Generate the report with Gemini to obtain a narrative action plan. Meanwhile, the Excel uses the structured automatic action plan."
-        st.text_area("Action plan EN", value=action_en, height=340)
-
+        if action_en:
+            with st.expander("View Gemini-generated table as text", expanded=False):
+                st.markdown(action_en)
 
 
 def render_claim_paste_loader(dealer: str, show_title: bool = True):
