@@ -3,7 +3,7 @@
 Warranty Audit Assistant - versión interna bilingüe
 
 Instalación:
-    py -m pip install streamlit pandas openpyxl xlsxwriter
+    py -m pip install streamlit pandas openpyxl xlsxwriter google-genai
 
 Ejecución:
     streamlit run app.py
@@ -28,6 +28,7 @@ Qué hace:
 from __future__ import annotations
 
 import json
+import os
 import re
 import zipfile
 import unicodedata
@@ -194,6 +195,8 @@ CHECK_BY_KEY = {check.key: check for check in ALL_CHECKS}
 MAX_DOCUMENT_POINTS = sum(check.max_points for check in DOCUMENT_CHECKS)
 MAX_OLD_PARTS_POINTS = sum(check.max_points for check in OLD_PARTS_CHECKS)
 MAX_TOTAL_POINTS = MAX_DOCUMENT_POINTS + MAX_OLD_PARTS_POINTS
+
+GEMINI_MODEL_DEFAULT = "gemini-2.5-flash"
 
 ACTIVE_DEALERS: List[str] = [
     "ACAI MOTOR MÁLAGA", "ALFAVISA BILBAO", "ALIMOTOR ELCHE", "ANFERPA SEGOVIA",
@@ -1301,6 +1304,236 @@ def refresh_claim_general_comment(claim: Dict[str, Any]) -> str:
     return comment
 
 
+def get_streamlit_state_value(key: str, default: Any = "") -> Any:
+    """Lee session_state de forma segura incluso si la función se llama fuera de Streamlit."""
+    try:
+        return st.session_state.get(key, default)
+    except Exception:
+        return default
+
+
+def get_ai_output(key: str) -> str:
+    value = get_streamlit_state_value(key, "")
+    return safe_str(value)
+
+
+def get_ai_claim_comment(claim: Dict[str, Any], language: str = "es") -> str:
+    """Devuelve comentario de claim pulido/traducido por IA si existe."""
+    if language == "en":
+        try:
+            comments = st.session_state.get("ai_claim_comments_en", {}) or {}
+        except Exception:
+            comments = {}
+        identifiers = [
+            claim_identifier(claim, "en"),
+            safe_str(claim.get("hq_claim_no", "")),
+            safe_str(claim.get("local_claim_no", "")),
+            safe_str(claim.get("claim_no", "")),
+        ]
+        for identifier in identifiers:
+            if identifier and identifier in comments and safe_str(comments[identifier]):
+                return safe_str(comments[identifier])
+    return ""
+
+
+def general_comment_for_export(claim: Dict[str, Any], language: str = "es") -> str:
+    """Comentario usado en exports. En inglés aprovecha traducciones IA si ya se han generado."""
+    ai_comment = get_ai_claim_comment(claim, language)
+    if ai_comment:
+        return ai_comment
+    return auto_general_comment(claim, language)
+
+
+def get_ai_report_for_language(language: str = "es") -> str:
+    return get_ai_output("ai_report_es" if language == "es" else "ai_report_en")
+
+
+def get_ai_action_plan_for_language(language: str = "es") -> str:
+    return get_ai_output("ai_action_plan_es" if language == "es" else "ai_action_plan_en")
+
+
+def get_secret_value(*names: str) -> str:
+    """Busca una clave en Streamlit Secrets o variables de entorno."""
+    for name in names:
+        try:
+            value = st.secrets.get(name, "")
+            if value:
+                return safe_str(value)
+        except Exception:
+            pass
+        value = os.environ.get(name, "")
+        if value:
+            return safe_str(value)
+    return ""
+
+
+def build_ai_audit_payload(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> Dict[str, Any]:
+    """Prepara un contexto compacto para Gemini. La IA solo redacta/resume; no recalcula puntos."""
+    sync_all_claims_from_widget_state(claims)
+    audit_score = calculate_audit_score(claims)
+    action_rows_es = build_action_plan_rows(claims, "es")
+
+    claim_payload = []
+    for claim in claims.values():
+        score = calculate_claim_score(claim)
+        observations = []
+        for check in ALL_SCORING_CHECKS:
+            evaluation = claim.get("evaluations", {}).get(check.key, {})
+            points = evaluation.get("points")
+            lost = check.max_points if points is None else max(0, check.max_points - int(points or 0))
+            comment = evaluation_comment(claim, check)
+            if lost > 0 or comment:
+                observations.append({
+                    "section": block_label(check.block_key, "es"),
+                    "item_key": check.key,
+                    "item_es": check.label_es,
+                    "item_en": check.label_en,
+                    "status": evaluation.get("status", ""),
+                    "points": points,
+                    "max_points": check.max_points,
+                    "lost_points": lost,
+                    "observation_es": comment,
+                })
+        deduction = {
+            "type": safe_str(claim.get("deduction_type", "none")) or "none",
+            "amount": claim_deduction_amount(claim),
+            "reason_es": safe_str(claim.get("deduction_reason", "")),
+        }
+        claim_payload.append({
+            "claim_hq_id": safe_str(claim.get("hq_claim_no", "")),
+            "claim_es_id": safe_str(claim.get("local_claim_no", "")),
+            "dealer": safe_str(claim.get("dealer", "")) or dealer,
+            "score": score,
+            "deduction": deduction,
+            "automatic_general_comment_es": auto_general_comment(claim, "es"),
+            "observations": observations,
+        })
+
+    return {
+        "audit_name": audit_name,
+        "dealer_general": dealer,
+        "auditor": auditor,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "scoring_rule": {
+            "document_checklist_max": MAX_DOCUMENT_POINTS,
+            "old_parts_checklist_max": MAX_OLD_PARTS_POINTS,
+            "total_max": MAX_TOTAL_POINTS,
+            "not_applicable_rule": "N/A gives maximum points and does not penalize the score",
+            "campaigns": "Not included",
+        },
+        "audit_score": audit_score,
+        "main_improvement_rows_es": action_rows_es,
+        "claims": claim_payload,
+    }
+
+
+def extract_json_object(text: str) -> Dict[str, Any]:
+    """Intenta extraer JSON aunque el modelo lo devuelva dentro de ```json."""
+    raw = safe_str(text)
+    if not raw:
+        return {}
+    raw = re.sub(r"^```(?:json)?", "", raw.strip(), flags=re.IGNORECASE).strip()
+    raw = re.sub(r"```$", "", raw.strip()).strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(raw[start:end + 1])
+        except Exception:
+            return {}
+    return {}
+
+
+def build_gemini_audit_prompt(payload: Dict[str, Any]) -> str:
+    return f"""
+You are an automotive warranty audit assistant for an NSC warranty department.
+
+Your task is to create a professional executive audit report and action plan in Spanish and English.
+Use ONLY the audit data provided below. Do not invent claims, scores, deductions or facts.
+Do not recalculate the score. Use the provided scores exactly.
+
+Important style requirements:
+- Spanish text is for the dealer: clear, professional, direct, improvement-oriented.
+- English text is for HQ: corporate, concise and formal.
+- Summarize repeated observations into meaningful improvement areas.
+- Do not output a raw list like "23 claims with deviation" as the main content.
+- Explain what the pattern means and what action should be taken.
+- Keep the tone constructive, not accusatory.
+- The action plan must include practical countermeasures based on the observations.
+- Manual Spanish observations must be translated naturally into English in the English output.
+- Scoring is rule-based; do not change it.
+
+Return ONLY valid JSON with this exact structure:
+{{
+  "report_es": "Texto completo del informe ejecutivo en español",
+  "report_en": "Full executive report in English",
+  "action_plan_es": "Mini plan de acción en español, estructurado por áreas de mejora",
+  "action_plan_en": "Mini action plan in English, structured by improvement areas",
+  "claim_comments_en": {{
+    "CLAIM_HQ_OR_ES_ID": "Professional English translation/summary of the claim observations"
+  }}
+}}
+
+For claim_comments_en:
+- Use the HQ claim ID when available.
+- If the HQ ID is empty, use the Spanish claim ID.
+- Include one entry for every claim that has observations or deductions.
+- Keep each claim comment concise but clear.
+
+Audit data JSON:
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+""".strip()
+
+
+def generate_gemini_audit_outputs(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, api_key: str, model: str = GEMINI_MODEL_DEFAULT) -> Tuple[bool, str]:
+    """Llama a Gemini y guarda informe/plan ES-EN en session_state."""
+    api_key = safe_str(api_key)
+    if not api_key:
+        return False, "No hay API key de Gemini. Añádela en Streamlit Secrets como GEMINI_API_KEY o pégala temporalmente en la app."
+
+    try:
+        from google import genai
+    except Exception as exc:
+        return False, f"No está instalado el SDK de Gemini. Añade google-genai a requirements.txt. Detalle: {exc}"
+
+    payload = build_ai_audit_payload(claims, audit_name, dealer, auditor)
+    prompt = build_gemini_audit_prompt(payload)
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(model=model or GEMINI_MODEL_DEFAULT, contents=prompt)
+        raw_text = getattr(response, "text", "") or ""
+    except Exception as exc:
+        return False, f"Gemini no ha podido generar el informe: {exc}"
+
+    parsed = extract_json_object(raw_text)
+    if not parsed:
+        return False, "Gemini respondió, pero no se pudo interpretar como JSON. Prueba otra vez."
+
+    st.session_state.ai_report_es = safe_str(parsed.get("report_es", ""))
+    st.session_state.ai_report_en = safe_str(parsed.get("report_en", ""))
+    st.session_state.ai_action_plan_es = safe_str(parsed.get("action_plan_es", ""))
+    st.session_state.ai_action_plan_en = safe_str(parsed.get("action_plan_en", ""))
+    claim_comments = parsed.get("claim_comments_en", {})
+    st.session_state.ai_claim_comments_en = claim_comments if isinstance(claim_comments, dict) else {}
+    st.session_state.ai_generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state.ai_model_used = model or GEMINI_MODEL_DEFAULT
+    return True, "Informe ejecutivo, plan de acción y traducciones EN generadas con Gemini."
+
+
+def clear_ai_outputs() -> None:
+    for key in [
+        "ai_report_es", "ai_report_en", "ai_action_plan_es", "ai_action_plan_en",
+        "ai_claim_comments_en", "ai_generated_at", "ai_model_used",
+    ]:
+        if key in st.session_state:
+            del st.session_state[key]
+
+
 def sync_claim_from_widget_state(claim: Dict[str, Any]) -> None:
     """
     Antes de calcular/exportar, recoge valores que ya estén en widgets Streamlit.
@@ -1537,7 +1770,7 @@ def build_summary_dataframe(claims: Dict[str, Dict[str, Any]], language: str = "
             t["success"]: score["success_percent"],
             t["result"]: result_label(score["total_points"], language),
             t["pending"]: " | ".join(pending_items_for_language(claim, language)),
-            t["comments"]: auto_general_comment(claim, language),
+            t["comments"]: general_comment_for_export(claim, language),
         })
     return pd.DataFrame(rows)
 
@@ -1707,7 +1940,7 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
                 score["success_percent"] / 100,
                 result_label(score["total_points"], language),
                 " | ".join(pending_items_for_language(claim, language)),
-                auto_general_comment(claim, language),
+                general_comment_for_export(claim, language),
             ]
             write_row(grade_ws, idx, row_values, fmt_body)
             grade_ws.write_number(idx, 7, claim_deduction_amount(claim), fmt_int)
@@ -1765,7 +1998,7 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             row.append(f"=M{excel_row}/{MAX_DOCUMENT_POINTS}")
             row.append(claim_deduction_amount(claim))
             row.append(claim_deduction_reason(claim, language))
-            row.append(auto_general_comment(claim, language))
+            row.append(general_comment_for_export(claim, language))
             write_row(doc_ws, idx, row, fmt_body)
             for col_idx in range(3, 12):
                 if isinstance(row[col_idx], (int, float)):
@@ -1797,7 +2030,7 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             row.append(f"=J{excel_row}/{MAX_OLD_PARTS_POINTS}")
             row.append(claim_deduction_amount(claim))
             row.append(claim_deduction_reason(claim, language))
-            row.append(auto_general_comment(claim, language))
+            row.append(general_comment_for_export(claim, language))
             write_row(old_ws, idx, row, fmt_body)
             for col_idx in range(3, 9):
                 if isinstance(row[col_idx], (int, float)):
@@ -1814,16 +2047,27 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
         # ------------------------------------------------------------------
         imp_ws = workbook.add_worksheet("Improvement of claim issues III")
         imp_ws.merge_range("A1:E1", t["action_plan_title"], fmt_title)
-        imp_headers = ["Block" if language == "en" else "Bloque", t["auditable_list"], t["exception_comments"], t["observations"], t["countermeasure"]]
-        write_headers(imp_ws, 1, imp_headers)
         set_widths(imp_ws, [28, 34, 42, 85, 85])
-        imp_ws.freeze_panes(2, 0)
+
+        ai_action_plan = get_ai_action_plan_for_language(language)
+        if ai_action_plan:
+            imp_ws.merge_range("A2:E2", "Plan generado con Gemini" if language == "es" else "Gemini-generated action plan", fmt_bold)
+            imp_ws.merge_range("A3:E8", ai_action_plan, fmt_body)
+            header_row = 9
+            data_start_row = 10
+        else:
+            header_row = 1
+            data_start_row = 2
+
+        imp_headers = ["Block" if language == "en" else "Bloque", t["auditable_list"], t["exception_comments"], t["observations"], t["countermeasure"]]
+        write_headers(imp_ws, header_row, imp_headers)
+        imp_ws.freeze_panes(header_row + 1, 0)
         action_rows = build_action_plan_rows(claims, language)
         if not action_rows:
-            write_row(imp_ws, 2, ["", t["no_deviations"], "", "", ""], fmt_body)
-            last_row = 2
+            write_row(imp_ws, data_start_row, ["", t["no_deviations"], "", "", ""], fmt_body)
+            last_row = data_start_row
         else:
-            for row_idx, item in enumerate(action_rows, start=2):
+            for row_idx, item in enumerate(action_rows, start=data_start_row):
                 write_row(imp_ws, row_idx, [
                     item["block"],
                     item["parameter"],
@@ -1831,8 +2075,8 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
                     item["observations"],
                     item["countermeasure"],
                 ], fmt_body)
-            last_row = len(action_rows) + 1
-        imp_ws.autofilter(1, 0, last_row, len(imp_headers) - 1)
+            last_row = data_start_row + len(action_rows) - 1
+        imp_ws.autofilter(header_row, 0, last_row, len(imp_headers) - 1)
 
         # ------------------------------------------------------------------
         # Evaluation content
@@ -1859,6 +2103,10 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
 
 
 def generate_text_report(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, language: str = "es") -> str:
+    ai_report = get_ai_report_for_language(language)
+    if ai_report:
+        return ai_report
+
     t = TEXT[language]
     audit_score = calculate_audit_score(claims)
     action_rows = build_action_plan_rows(claims, language)
@@ -1943,6 +2191,7 @@ def init_state():
     st.session_state.setdefault("audit_auditor", "")
     st.session_state.setdefault("audit_section_index", 0)
     st.session_state.setdefault("claim_paste_editor_version", 0)
+    st.session_state.setdefault("gemini_model", GEMINI_MODEL_DEFAULT)
 
 
 def clamp_index(index: Any, max_len: int) -> int:
@@ -2171,7 +2420,60 @@ def render_comments_editor(claim: Dict[str, Any]):
 
 
 def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, base_name: str):
-    tabs = st.tabs(["Informe español", "Report English"])
+    st.subheader("Informe y plan de acción")
+
+    with st.expander("✨ Generación con Gemini", expanded=not bool(get_ai_report_for_language("es"))):
+        st.caption(
+            "Gemini no cambia las puntuaciones. Solo redacta el informe ejecutivo, "
+            "resume las observaciones y mejora la versión en inglés."
+        )
+        secret_key = get_secret_value("GEMINI_API_KEY", "GOOGLE_API_KEY")
+        if secret_key:
+            st.success("API key detectada en Streamlit Secrets / variable de entorno.")
+            api_key = secret_key
+        else:
+            api_key = st.text_input(
+                "Gemini API key temporal",
+                type="password",
+                help="Para Streamlit Cloud, mejor guárdala en Secrets como GEMINI_API_KEY. Si la pegas aquí, solo se usa en esta sesión.",
+                key="gemini_api_key_input",
+            )
+
+        st.session_state.gemini_model = st.text_input(
+            "Modelo Gemini",
+            value=st.session_state.get("gemini_model", GEMINI_MODEL_DEFAULT),
+            help="Recomendado: gemini-2.5-flash",
+        )
+
+        ai_cols = st.columns([1, 1, 2])
+        with ai_cols[0]:
+            if st.button("Generar con Gemini", type="primary", use_container_width=True):
+                ok, message = generate_gemini_audit_outputs(
+                    claims,
+                    audit_name,
+                    dealer,
+                    auditor,
+                    api_key,
+                    st.session_state.get("gemini_model", GEMINI_MODEL_DEFAULT),
+                )
+                if ok:
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.error(message)
+        with ai_cols[1]:
+            if st.button("Borrar texto IA", use_container_width=True):
+                clear_ai_outputs()
+                st.rerun()
+        with ai_cols[2]:
+            generated_at = get_ai_output("ai_generated_at")
+            model_used = get_ai_output("ai_model_used")
+            if generated_at:
+                st.caption(f"Último informe IA: {generated_at} · {model_used}")
+            else:
+                st.caption("Si no generas con Gemini, se usa el informe básico automático.")
+
+    tabs = st.tabs(["Informe español", "Report English", "Plan acción ES", "Action plan EN"])
     with tabs[0]:
         report_es = generate_text_report(claims, audit_name, dealer, auditor, "es")
         st.text_area("Informe generado ES", value=report_es, height=420)
@@ -2180,6 +2482,16 @@ def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, de
         report_en = generate_text_report(claims, audit_name, dealer, auditor, "en")
         st.text_area("Generated report EN", value=report_en, height=420)
         st.download_button("Download EN report .txt", data=report_en.encode("utf-8"), file_name=f"{base_name}_EN_report.txt", mime="text/plain")
+    with tabs[2]:
+        action_es = get_ai_action_plan_for_language("es")
+        if not action_es:
+            action_es = "Genera el informe con Gemini para obtener un plan de acción narrativo. Mientras tanto, el Excel usa el plan estructurado automático."
+        st.text_area("Plan de acción ES", value=action_es, height=340)
+    with tabs[3]:
+        action_en = get_ai_action_plan_for_language("en")
+        if not action_en:
+            action_en = "Generate the report with Gemini to obtain a narrative action plan. Meanwhile, the Excel uses the structured automatic action plan."
+        st.text_area("Action plan EN", value=action_en, height=340)
 
 
 
@@ -2457,3 +2769,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
