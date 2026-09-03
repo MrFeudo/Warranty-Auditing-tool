@@ -423,6 +423,24 @@ def safe_str(value: Any) -> str:
     return str(value).strip()
 
 
+def json_default_serializer(value: Any):
+    """Fallback para mandar datos a Gemini sin petar por tipos de pandas/numpy/datetime."""
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds")
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        # numpy int/float/bool, si aparecen al leer Excel o dataframes.
+        if hasattr(value, "item"):
+            return value.item()
+    except Exception:
+        pass
+    return safe_str(value)
+
+
 def normalize_text(value: Any) -> str:
     text = safe_str(value).lower()
     text = unicodedata.normalize("NFD", text)
@@ -1376,6 +1394,28 @@ def build_ai_audit_payload(claims: Dict[str, Dict[str, Any]], audit_name: str, d
     claim_payload = []
     for claim in claims.values():
         score = calculate_claim_score(claim)
+        # calculate_claim_score incluye objetos AuditCheck dentro de lost_by_area,
+        # y esos objetos no se pueden convertir directamente a JSON para Gemini.
+        # Creamos una versión limpia y serializable del score para el prompt.
+        score_for_ai = {
+            "doc_points": int(score.get("doc_points", 0)),
+            "old_points": int(score.get("old_points", 0)),
+            "total_points": int(score.get("total_points", 0)),
+            "success_percent": float(score.get("success_percent", 0) or 0),
+            "pending": [safe_str(item) for item in score.get("pending", [])],
+            "completed": bool(score.get("completed", False)),
+            "lost_by_area": [
+                {
+                    "item_key": item_check.key,
+                    "item_es": item_check.label_es,
+                    "item_en": item_check.label_en,
+                    "section": block_label(item_check.block_key, "es"),
+                    "lost_points": int(lost_points),
+                    "status": safe_str(status),
+                }
+                for item_check, lost_points, status in score.get("lost_by_area", [])
+            ],
+        }
         observations = []
         for check in ALL_SCORING_CHECKS:
             evaluation = claim.get("evaluations", {}).get(check.key, {})
@@ -1403,7 +1443,7 @@ def build_ai_audit_payload(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             "claim_hq_id": safe_str(claim.get("hq_claim_no", "")),
             "claim_es_id": safe_str(claim.get("local_claim_no", "")),
             "dealer": safe_str(claim.get("dealer", "")) or dealer,
-            "score": score,
+            "score": score_for_ai,
             "deduction": deduction,
             "automatic_general_comment_es": auto_general_comment(claim, "es"),
             "observations": observations,
@@ -1485,7 +1525,7 @@ For claim_comments_en:
 - Keep each claim comment concise but clear.
 
 Audit data JSON:
-{json.dumps(payload, ensure_ascii=False, indent=2)}
+{json.dumps(payload, ensure_ascii=False, indent=2, default=json_default_serializer)}
 """.strip()
 
 
@@ -2769,4 +2809,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
