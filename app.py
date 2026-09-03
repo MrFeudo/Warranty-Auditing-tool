@@ -1821,6 +1821,77 @@ def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, de
         st.download_button("Download EN report .txt", data=report_en.encode("utf-8"), file_name=f"{base_name}_EN_report.txt", mime="text/plain")
 
 
+
+def render_claim_paste_loader(dealer: str, show_title: bool = True):
+    """
+    Muestra una tabla editable tipo Excel para pegar claims directamente en la zona principal.
+    Solo requiere dos identificadores: claim española/dealer y claim HQ/IDMS.
+    """
+    if show_title:
+        st.subheader("Pegar lista de claims")
+
+    st.caption(
+        "Copia dos columnas desde Excel y pégalas aquí: "
+        "Claim España/Dealer y Claim HQ/IDMS. Con esos dos identificadores basta."
+    )
+
+    editor_key = f"claims_paste_editor_{st.session_state.claim_paste_editor_version}"
+    pasted_claims_df = st.data_editor(
+        blank_claim_paste_dataframe(14),
+        key=editor_key,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Claim España / Dealer": st.column_config.TextColumn(
+                "Claim España / Dealer",
+                help="Identificador local para boletín al dealer, por ejemplo CO2026...",
+            ),
+            "Claim HQ / IDMS": st.column_config.TextColumn(
+                "Claim HQ / IDMS",
+                help="Identificador HQ/IDMS para scorecard en inglés, por ejemplo 2810... o TAC...",
+            ),
+        },
+    )
+
+    append_to_existing = False
+    if st.session_state.claims:
+        append_to_existing = st.checkbox(
+            "Añadir a las claims ya cargadas",
+            value=False,
+            key="append_pasted_claims_main",
+        )
+
+    claim_table_cols = st.columns([1, 1, 3])
+    with claim_table_cols[0]:
+        if st.button("Cargar tabla", type="primary", use_container_width=True, key="load_claim_table_main"):
+            try:
+                loaded_claims = read_claims_from_pasted_table(pasted_claims_df)
+                if not loaded_claims:
+                    st.warning("La tabla está vacía. Pega al menos una claim española o de HQ.")
+                else:
+                    if dealer:
+                        apply_default_dealer_to_blank_claims(loaded_claims, dealer)
+
+                    if append_to_existing and st.session_state.claims:
+                        st.session_state.claims.update(loaded_claims)
+                    else:
+                        st.session_state.claims = loaded_claims
+
+                    st.session_state.selected_claim = next(iter(loaded_claims.keys()))
+                    st.success(f"Cargadas {len(loaded_claims)} claims desde la tabla.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"No se pudo cargar la tabla: {exc}")
+
+    with claim_table_cols[1]:
+        if st.button("Limpiar tabla", use_container_width=True, key="clear_claim_table_main"):
+            st.session_state.claim_paste_editor_version += 1
+            st.rerun()
+
+    with claim_table_cols[2]:
+        st.caption("Tip: puedes pegar directamente desde Excel con Ctrl+V sobre la primera celda.")
+
 def main():
     st.set_page_config(page_title="Warranty Audit Assistant", page_icon="🧾", layout="wide")
     init_state()
@@ -1858,59 +1929,6 @@ def main():
                 st.error(f"No se pudo cargar el JSON: {exc}")
 
         st.divider()
-        st.subheader("Pegar claims")
-        st.caption(
-            "Copia dos columnas desde Excel y pégalas en esta tabla: "
-            "Claim España/Dealer y Claim HQ/IDMS. Con esos dos identificadores basta."
-        )
-
-        editor_key = f"claims_paste_editor_{st.session_state.claim_paste_editor_version}"
-        pasted_claims_df = st.data_editor(
-            blank_claim_paste_dataframe(12),
-            key=editor_key,
-            num_rows="dynamic",
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Claim España / Dealer": st.column_config.TextColumn(
-                    "Claim España / Dealer",
-                    help="Identificador local para boletín al dealer, por ejemplo CO2026...",
-                ),
-                "Claim HQ / IDMS": st.column_config.TextColumn(
-                    "Claim HQ / IDMS",
-                    help="Identificador HQ/IDMS para scorecard en inglés, por ejemplo 2810... o TAC...",
-                ),
-            },
-        )
-
-        append_to_existing = st.checkbox("Añadir a las claims ya cargadas", value=False)
-        claim_table_cols = st.columns(2)
-        with claim_table_cols[0]:
-            if st.button("Cargar tabla", use_container_width=True):
-                try:
-                    loaded_claims = read_claims_from_pasted_table(pasted_claims_df)
-                    if not loaded_claims:
-                        st.warning("La tabla está vacía. Pega al menos una claim española o de HQ.")
-                    else:
-                        if dealer:
-                            apply_default_dealer_to_blank_claims(loaded_claims, dealer)
-
-                        if append_to_existing and st.session_state.claims:
-                            st.session_state.claims.update(loaded_claims)
-                        else:
-                            st.session_state.claims = loaded_claims
-
-                        st.session_state.selected_claim = next(iter(loaded_claims.keys()))
-                        st.success(f"Cargadas {len(loaded_claims)} claims desde la tabla.")
-                        st.rerun()
-                except Exception as exc:
-                    st.error(f"No se pudo cargar la tabla: {exc}")
-        with claim_table_cols[1]:
-            if st.button("Limpiar tabla", use_container_width=True):
-                st.session_state.claim_paste_editor_version += 1
-                st.rerun()
-
-        st.divider()
         st.subheader("Regla de puntuación")
         st.write(f"Documentación: **{MAX_DOCUMENT_POINTS}**")
         st.write(f"Piezas viejas: **{MAX_OLD_PARTS_POINTS}**")
@@ -1921,8 +1939,12 @@ def main():
     apply_default_dealer_to_blank_claims(claims, safe_str(st.session_state.audit_dealer))
 
     if not claims:
-        st.info("Pega la lista de claims en la tabla de la barra lateral para empezar.")
+        st.info("Pega la lista de claims en la tabla de abajo para empezar.")
+        render_claim_paste_loader(dealer, show_title=True)
         st.stop()
+
+    with st.expander("Añadir o reemplazar claims desde tabla", expanded=False):
+        render_claim_paste_loader(dealer, show_title=False)
 
     audit_score = calculate_audit_score(claims)
     kpi_cols = st.columns(5)
@@ -2052,3 +2074,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
