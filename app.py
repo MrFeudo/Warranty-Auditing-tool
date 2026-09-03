@@ -17,7 +17,7 @@ Qué hace:
     Total = 100 puntos
 - Por defecto todos los apartados arrancan como OK / puntuación máxima.
 - No aplica = puntuación máxima del apartado.
-- Genera comentario general desde observaciones por apartado.
+- Genera automáticamente el comentario general desde las observaciones por apartado, sin botón manual.
 - Exporta boletín en español para dealer usando claim local CO...
 - Exporta scorecard en inglés para HQ usando identificador HQ/IDMS/TAC/2810...
 - Rellena la hoja/page 3 "Improvement of claim issues III" con las observaciones de los campos.
@@ -1083,6 +1083,7 @@ def normalize_loaded_claim(raw_claim: Any, fallback: str = "") -> Optional[Dict[
 
 
 def serialize_audit_workfile(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> bytes:
+    sync_all_claims_from_widget_state(claims)
     payload = {
         "file_type": "warranty_audit_workfile",
         "version": 2,
@@ -1275,7 +1276,94 @@ def build_general_comment_from_observations(claim: Dict[str, Any], include_campa
     return "\n".join(lines).strip()
 
 
+def auto_general_comment(claim: Dict[str, Any], language: str = "es") -> str:
+    """
+    Comentario general calculado automáticamente a partir de las observaciones
+    de los apartados. Si no hay observaciones, usa el motivo de deducción si existe.
+    """
+    generated = build_general_comment_from_observations(
+        claim,
+        include_campaigns=False,
+        language=language,
+    )
+    if generated:
+        return generated
+    return claim_deduction_reason(claim, language)
+
+
+def refresh_claim_general_comment(claim: Dict[str, Any]) -> str:
+    """
+    Guarda en la claim el comentario general en español calculado automáticamente.
+    Se conserva en el JSON para que el progreso sea transparente, pero no se edita a mano.
+    """
+    comment = auto_general_comment(claim, "es")
+    claim["general_comment"] = comment
+    return comment
+
+
+def sync_claim_from_widget_state(claim: Dict[str, Any]) -> None:
+    """
+    Antes de calcular/exportar, recoge valores que ya estén en widgets Streamlit.
+
+    Esto evita que un texto recién escrito en un text_area se quede fuera si el
+    usuario pulsa descargar sin pasar antes por otra sección de la app.
+    """
+    try:
+        session = st.session_state
+    except Exception:
+        refresh_claim_general_comment(claim)
+        return
+
+    claim_key = make_claim_key(
+        claim.get("local_claim_no"),
+        claim.get("hq_claim_no"),
+        claim.get("claim_no"),
+    )
+
+    for field in ["hq_claim_no", "local_claim_no", "vin", "model", "amount"]:
+        widget_key = f"claim_meta_{claim_key}_{field}"
+        if widget_key in session:
+            claim[field] = safe_str(session.get(widget_key, ""))
+
+    dealer_key = f"claim_meta_{claim_key}_dealer"
+    if dealer_key in session:
+        claim["dealer"] = safe_str(session.get(dealer_key, ""))
+
+    type_key = f"deduction_type_{claim_key}"
+    amount_key = f"deduction_amount_{claim_key}"
+    reason_key = f"deduction_reason_{claim_key}"
+    if type_key in session:
+        claim["deduction_type"] = safe_str(session.get(type_key, "none")) or "none"
+    if amount_key in session:
+        claim["deduction_amount"] = float(parse_amount_value(session.get(amount_key, 0)))
+    if reason_key in session:
+        claim["deduction_reason"] = safe_str(session.get(reason_key, ""))
+
+    for check in ALL_CHECKS:
+        evaluation = claim.setdefault("evaluations", {}).setdefault(check.key, new_evaluation(check))
+        select_key = f"select_{claim_key}_{check.key}"
+        if select_key in session:
+            option = option_from_label(check, session.get(select_key))
+            evaluation["option_key"] = option.key
+            evaluation["status"] = option.status
+            evaluation["points"] = option.points
+            evaluation["max_points"] = check.max_points
+
+        comment_key = f"comment_{claim_key}_{check.key}"
+        if comment_key in session:
+            evaluation["comment"] = safe_str(session.get(comment_key, ""))
+
+    claim["claim_no"] = safe_str(claim.get("local_claim_no")) or safe_str(claim.get("hq_claim_no")) or safe_str(claim.get("claim_no"))
+    refresh_claim_general_comment(claim)
+
+
+def sync_all_claims_from_widget_state(claims: Dict[str, Dict[str, Any]]) -> None:
+    for claim in claims.values():
+        sync_claim_from_widget_state(claim)
+
+
 def build_action_plan_rows(claims: Dict[str, Dict[str, Any]], language: str = "es") -> List[Dict[str, Any]]:
+    sync_all_claims_from_widget_state(claims)
     rows = []
     for check in ALL_SCORING_CHECKS:
         entries = []
@@ -1428,6 +1516,7 @@ def read_claims_from_pasted_table(table_df: pd.DataFrame) -> Dict[str, Dict[str,
 
 
 def build_summary_dataframe(claims: Dict[str, Dict[str, Any]], language: str = "es") -> pd.DataFrame:
+    sync_all_claims_from_widget_state(claims)
     t = TEXT[language]
     rows = []
     for claim in claims.values():
@@ -1448,12 +1537,13 @@ def build_summary_dataframe(claims: Dict[str, Dict[str, Any]], language: str = "
             t["success"]: score["success_percent"],
             t["result"]: result_label(score["total_points"], language),
             t["pending"]: " | ".join(pending_items_for_language(claim, language)),
-            t["comments"]: comment_for_language(claim.get("general_comment", ""), language),
+            t["comments"]: auto_general_comment(claim, language),
         })
     return pd.DataFrame(rows)
 
 
 def build_detail_dataframe(claims: Dict[str, Dict[str, Any]], language: str = "es") -> pd.DataFrame:
+    sync_all_claims_from_widget_state(claims)
     t = TEXT[language]
     rows = []
     for claim in claims.values():
@@ -1617,7 +1707,7 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
                 score["success_percent"] / 100,
                 result_label(score["total_points"], language),
                 " | ".join(pending_items_for_language(claim, language)),
-                comment_for_language(claim.get("general_comment", ""), language),
+                auto_general_comment(claim, language),
             ]
             write_row(grade_ws, idx, row_values, fmt_body)
             grade_ws.write_number(idx, 7, claim_deduction_amount(claim), fmt_int)
@@ -1675,7 +1765,7 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             row.append(f"=M{excel_row}/{MAX_DOCUMENT_POINTS}")
             row.append(claim_deduction_amount(claim))
             row.append(claim_deduction_reason(claim, language))
-            row.append(comment_for_language(claim.get("general_comment", ""), language))
+            row.append(auto_general_comment(claim, language))
             write_row(doc_ws, idx, row, fmt_body)
             for col_idx in range(3, 12):
                 if isinstance(row[col_idx], (int, float)):
@@ -1707,7 +1797,7 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             row.append(f"=J{excel_row}/{MAX_OLD_PARTS_POINTS}")
             row.append(claim_deduction_amount(claim))
             row.append(claim_deduction_reason(claim, language))
-            row.append(comment_for_language(claim.get("general_comment", ""), language))
+            row.append(auto_general_comment(claim, language))
             write_row(old_ws, idx, row, fmt_body)
             for col_idx in range(3, 9):
                 if isinstance(row[col_idx], (int, float)):
@@ -2047,22 +2137,37 @@ def render_check_editor(claim: Dict[str, Any], checks: List[AuditCheck]):
                     st.session_state[comment_key] = evaluation.get("comment", "")
                 evaluation["comment"] = st.text_area("Observación del apartado", key=comment_key, height=85)
 
+    refresh_claim_general_comment(claim)
+
 
 def render_comments_editor(claim: Dict[str, Any]):
-    st.caption("El comentario general se genera usando solo las observaciones que hayas escrito en cada apartado. No inventa nada por la nota.")
-    claim_key = make_claim_key(claim.get("local_claim_no"), claim.get("hq_claim_no"), claim.get("claim_no"))
-    general_key = f"general_comment_{claim_key}"
-    if general_key not in st.session_state:
-        st.session_state[general_key] = claim.get("general_comment", "")
-    if st.button("Generar desde observaciones de apartados", key=f"generate_comment_{claim_key}"):
-        generated = build_general_comment_from_observations(claim, include_campaigns=False, language="es")
-        if generated:
-            claim["general_comment"] = generated
-            st.session_state[general_key] = generated
-            st.success("Comentario general generado desde las observaciones de los apartados.")
-        else:
-            st.warning("No hay observaciones escritas en los apartados para generar el comentario general.")
-    claim["general_comment"] = st.text_area("Comentarios generales de la claim", key=general_key, height=180)
+    st.caption(
+        "El comentario general se actualiza automáticamente con las observaciones "
+        "que escribas en los apartados. Para cambiarlo, cambia la observación del apartado correspondiente."
+    )
+
+    sync_claim_from_widget_state(claim)
+    comment_es = refresh_claim_general_comment(claim)
+    comment_en = auto_general_comment(claim, "en")
+
+    if not comment_es:
+        st.info("Todavía no hay observaciones escritas en los apartados ni motivo de deducción.")
+
+    tab_es, tab_en = st.tabs(["Comentario automático ES", "Automatic comment EN"])
+    with tab_es:
+        st.text_area(
+            "Comentario general automático de la claim",
+            value=comment_es,
+            height=180,
+            disabled=True,
+        )
+    with tab_en:
+        st.text_area(
+            "Automatic general claim comment",
+            value=comment_en,
+            height=180,
+            disabled=True,
+        )
 
 
 def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, base_name: str):
@@ -2157,7 +2262,7 @@ def main():
     init_state()
 
     st.title("🧾 Warranty Audit Assistant")
-    st.caption("Herramienta interna para revisar claims, calcular puntuación y generar boletín/plan de acción en español e inglés.")
+    st.caption("Herramienta interna para revisar claims, calcular puntuación y generar automáticamente boletín/plan de acción en español e inglés.")
 
     with st.sidebar:
         st.header("Auditoría")
@@ -2197,6 +2302,7 @@ def main():
 
     claims: Dict[str, Dict[str, Any]] = st.session_state.claims
     apply_default_dealer_to_blank_claims(claims, safe_str(st.session_state.audit_dealer))
+    sync_all_claims_from_widget_state(claims)
 
     if not claims:
         st.info("Pega la lista de claims, con dealer si aplica, en la tabla de abajo para empezar.")
