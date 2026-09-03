@@ -1183,14 +1183,14 @@ def build_action_plan_rows(claims: Dict[str, Dict[str, Any]], language: str = "e
 # CARGA RÁPIDA DE CLAIMS DESDE TABLA EDITABLE
 # =============================================================================
 
-CLAIM_PASTE_COLUMNS = ["Claim España / Dealer", "Claim HQ / IDMS"]
+CLAIM_PASTE_COLUMNS = ["Claim HQ / IDMS", "Claim España / Dealer"]
 
 
 def blank_claim_paste_dataframe(rows: int = 12) -> pd.DataFrame:
     """Crea una tabla vacía para pegar claims desde Excel."""
     return pd.DataFrame(
         [
-            {"Claim España / Dealer": "", "Claim HQ / IDMS": ""}
+            {"Claim HQ / IDMS": "", "Claim España / Dealer": ""}
             for _ in range(rows)
         ]
     )
@@ -1201,8 +1201,8 @@ def read_claims_from_pasted_table(table_df: pd.DataFrame) -> Dict[str, Dict[str,
     Convierte la tabla editable de Streamlit en claims.
 
     Formato esperado:
-    - Columna 1: Claim España / Dealer (CO...)
-    - Columna 2: Claim HQ / IDMS (2810..., TAC..., etc.)
+    - Columna 1: Claim HQ / IDMS (2810..., TAC..., etc.)
+    - Columna 2: Claim España / Dealer (CO...)
 
     Si una fila solo trae un identificador, se intenta inferir si es local o HQ.
     """
@@ -1709,8 +1709,8 @@ def display_claim_option(key: str) -> str:
     hq = safe_str(claim.get("hq_claim_no", ""))
     score = calculate_claim_score(claim) if claim else {"total_points": 0}
     if local and hq:
-        return f"{local} / {hq} · {score['total_points']}/100"
-    return f"{local or hq or key} · {score['total_points']}/100"
+        return f"{hq} / {local} · {score['total_points']}/100"
+    return f"{hq or local or key} · {score['total_points']}/100"
 
 
 def sync_claim_meta_field(claim: Dict[str, Any], field: str, label: str) -> str:
@@ -1728,9 +1728,9 @@ def render_claim_quick_card(claim: Dict[str, Any], default_dealer: str = ""):
     key_before = make_claim_key(claim.get("local_claim_no"), claim.get("hq_claim_no"), claim.get("claim_no"))
     cols = st.columns(6)
     with cols[0]:
-        local = sync_claim_meta_field(claim, "local_claim_no", "Claim ES / Dealer")
-    with cols[1]:
         hq = sync_claim_meta_field(claim, "hq_claim_no", "Claim HQ / IDMS")
+    with cols[1]:
+        local = sync_claim_meta_field(claim, "local_claim_no", "Claim ES / Dealer")
     with cols[2]:
         options = get_dealer_options(claim.get("dealer", "") or default_dealer)
         dealer_key = f"claim_meta_{key_before}_dealer"
@@ -1832,7 +1832,7 @@ def render_claim_paste_loader(dealer: str, show_title: bool = True):
 
     st.caption(
         "Copia dos columnas desde Excel y pégalas aquí: "
-        "Claim España/Dealer y Claim HQ/IDMS. Con esos dos identificadores basta."
+        "Claim HQ/IDMS y Claim España/Dealer. Con esos dos identificadores basta."
     )
 
     editor_key = f"claims_paste_editor_{st.session_state.claim_paste_editor_version}"
@@ -1843,13 +1843,13 @@ def render_claim_paste_loader(dealer: str, show_title: bool = True):
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Claim España / Dealer": st.column_config.TextColumn(
-                "Claim España / Dealer",
-                help="Identificador local para boletín al dealer, por ejemplo CO2026...",
-            ),
             "Claim HQ / IDMS": st.column_config.TextColumn(
                 "Claim HQ / IDMS",
                 help="Identificador HQ/IDMS para scorecard en inglés, por ejemplo 2810... o TAC...",
+            ),
+            "Claim España / Dealer": st.column_config.TextColumn(
+                "Claim España / Dealer",
+                help="Identificador local para boletín al dealer, por ejemplo CO2026...",
             ),
         },
     )
@@ -2074,4 +2074,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
