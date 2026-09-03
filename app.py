@@ -1592,7 +1592,41 @@ def init_state():
     st.session_state.setdefault("audit_name", "Auditoría garantías")
     st.session_state.setdefault("audit_dealer", "")
     st.session_state.setdefault("audit_auditor", "")
-    st.session_state.setdefault("active_audit_section", "I. Documentación")
+    st.session_state.setdefault("audit_section_index", 0)
+
+
+def clamp_index(index: Any, max_len: int) -> int:
+    try:
+        index = int(index)
+    except Exception:
+        index = 0
+    if max_len <= 0:
+        return 0
+    return max(0, min(index, max_len - 1))
+
+
+def set_audit_section_index(new_index: int, section_names: tuple) -> None:
+    names = list(section_names)
+    index = clamp_index(new_index, len(names))
+    st.session_state.audit_section_index = index
+    if names:
+        # Esta key pertenece al radio, pero aquí se cambia dentro del callback,
+        # antes de que el widget se vuelva a crear en el siguiente rerun.
+        st.session_state.audit_section_radio = names[index]
+
+
+def sync_audit_section_from_radio(section_names: tuple) -> None:
+    names = list(section_names)
+    selected = st.session_state.get("audit_section_radio", names[0] if names else "")
+    if selected in names:
+        st.session_state.audit_section_index = names.index(selected)
+    else:
+        set_audit_section_index(0, section_names)
+
+
+def set_selected_claim_and_reset_section(claim_key: str, section_names: tuple) -> None:
+    st.session_state.selected_claim = claim_key
+    set_audit_section_index(0, section_names)
 
 
 def apply_default_dealer_to_blank_claims(claims: Dict[str, Dict[str, Any]], dealer: str) -> None:
@@ -1848,20 +1882,31 @@ def main():
             st.warning("Apartados pendientes: " + ", ".join(score["pending"]))
 
         section_names = ["I. Documentación", "II. Piezas viejas", "Campañas", "Comentarios", "Informe"]
-        if st.session_state.active_audit_section not in section_names:
-            st.session_state.active_audit_section = section_names[0]
+        section_tuple = tuple(section_names)
 
-        # No usamos key="active_audit_section" en el radio.
-        # Streamlit bloquea modificar una key después de instanciar su widget,
-        # y eso rompía los botones de apartado anterior/siguiente.
+        # Guardamos el apartado activo por índice propio, no usando la misma key del widget.
+        # Así evitamos el error de Streamlit al intentar cambiar una key ya usada por un widget.
+        section_index = clamp_index(st.session_state.get("audit_section_index", 0), len(section_names))
+        st.session_state.audit_section_index = section_index
+
+        # La key del radio se sincroniza ANTES de crear el widget.
+        # Los botones la cambian mediante callback, nunca después de instanciarla.
+        current_section_label = section_names[section_index]
+        if st.session_state.get("audit_section_radio") != current_section_label:
+            st.session_state.audit_section_radio = current_section_label
+
         selected_section = st.radio(
             "Sección",
             section_names,
-            index=section_names.index(st.session_state.active_audit_section),
             horizontal=True,
             label_visibility="collapsed",
+            key="audit_section_radio",
+            on_change=sync_audit_section_from_radio,
+            args=(section_tuple,),
         )
-        st.session_state.active_audit_section = selected_section
+
+        section_index = clamp_index(st.session_state.get("audit_section_index", section_names.index(selected_section)), len(section_names))
+        selected_section = section_names[section_index]
 
         if selected_section == "I. Documentación":
             render_check_editor(claim, DOCUMENT_CHECKS)
@@ -1875,32 +1920,46 @@ def main():
             render_report_section(claims, audit_name, dealer, auditor, base_name)
 
         st.divider()
-        section_index = section_names.index(st.session_state.active_audit_section)
         nav_section_cols = st.columns([1, 1, 2])
         with nav_section_cols[0]:
-            if st.button("← Apartado anterior", disabled=section_index == 0, use_container_width=True):
-                st.session_state.active_audit_section = section_names[section_index - 1]
-                st.rerun()
+            st.button(
+                "← Apartado anterior",
+                disabled=section_index == 0,
+                use_container_width=True,
+                on_click=set_audit_section_index,
+                args=(section_index - 1, section_tuple),
+            )
         with nav_section_cols[1]:
-            if st.button("Siguiente apartado →", type="primary", disabled=section_index >= len(section_names) - 1, use_container_width=True):
-                st.session_state.active_audit_section = section_names[section_index + 1]
-                st.rerun()
+            st.button(
+                "Siguiente apartado →",
+                type="primary",
+                disabled=section_index >= len(section_names) - 1,
+                use_container_width=True,
+                on_click=set_audit_section_index,
+                args=(section_index + 1, section_tuple),
+            )
         with nav_section_cols[2]:
-            st.caption(f"Apartado {section_index + 1} de {len(section_names)} · {st.session_state.active_audit_section}")
+            st.caption(f"Apartado {section_index + 1} de {len(section_names)} · {selected_section}")
 
         st.divider()
         current_index = claim_options.index(st.session_state.selected_claim)
         nav_claim_cols = st.columns([1, 1, 2])
         with nav_claim_cols[0]:
-            if st.button("← Anterior claim", disabled=current_index == 0, use_container_width=True):
-                st.session_state.selected_claim = claim_options[current_index - 1]
-                st.session_state.active_audit_section = section_names[0]
-                st.rerun()
+            st.button(
+                "← Anterior claim",
+                disabled=current_index == 0,
+                use_container_width=True,
+                on_click=set_selected_claim_and_reset_section,
+                args=(claim_options[current_index - 1] if current_index > 0 else st.session_state.selected_claim, section_tuple),
+            )
         with nav_claim_cols[1]:
-            if st.button("Siguiente claim →", disabled=current_index >= len(claim_options) - 1, use_container_width=True):
-                st.session_state.selected_claim = claim_options[current_index + 1]
-                st.session_state.active_audit_section = section_names[0]
-                st.rerun()
+            st.button(
+                "Siguiente claim →",
+                disabled=current_index >= len(claim_options) - 1,
+                use_container_width=True,
+                on_click=set_selected_claim_and_reset_section,
+                args=(claim_options[current_index + 1] if current_index < len(claim_options) - 1 else st.session_state.selected_claim, section_tuple),
+            )
         with nav_claim_cols[2]:
             st.caption(f"Claim {current_index + 1} de {len(claim_options)}")
 
