@@ -9,7 +9,7 @@ Ejecución:
     streamlit run app.py
 
 Qué hace:
-- Carga una checklist oficial o una lista simple de claims.
+- Permite pegar una lista de claims en una tabla editable tipo Excel.
 - Permite trabajar claim por claim.
 - Calcula automáticamente la puntuación:
     Claim document checklist I = 58 puntos
@@ -1180,6 +1180,70 @@ def build_action_plan_rows(claims: Dict[str, Dict[str, Any]], language: str = "e
 
 
 # =============================================================================
+# CARGA RÁPIDA DE CLAIMS DESDE TABLA EDITABLE
+# =============================================================================
+
+CLAIM_PASTE_COLUMNS = ["Claim España / Dealer", "Claim HQ / IDMS"]
+
+
+def blank_claim_paste_dataframe(rows: int = 12) -> pd.DataFrame:
+    """Crea una tabla vacía para pegar claims desde Excel."""
+    return pd.DataFrame(
+        [
+            {"Claim España / Dealer": "", "Claim HQ / IDMS": ""}
+            for _ in range(rows)
+        ]
+    )
+
+
+def read_claims_from_pasted_table(table_df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    """
+    Convierte la tabla editable de Streamlit en claims.
+
+    Formato esperado:
+    - Columna 1: Claim España / Dealer (CO...)
+    - Columna 2: Claim HQ / IDMS (2810..., TAC..., etc.)
+
+    Si una fila solo trae un identificador, se intenta inferir si es local o HQ.
+    """
+    claims: Dict[str, Dict[str, Any]] = {}
+
+    if table_df is None or table_df.empty:
+        return claims
+
+    for _, row in table_df.iterrows():
+        local_value = safe_str(row.get("Claim España / Dealer", ""))
+        hq_value = safe_str(row.get("Claim HQ / IDMS", ""))
+
+        # Si el usuario pega un único identificador en la primera columna, inferimos.
+        if local_value and not hq_value:
+            inferred_local, inferred_hq = infer_claim_ids(local_value)
+            local_value = inferred_local or local_value
+            hq_value = inferred_hq
+
+        # Si el usuario pega un único identificador en la segunda columna, inferimos también.
+        if hq_value and not local_value:
+            inferred_local, inferred_hq = infer_claim_ids(hq_value)
+            local_value = inferred_local
+            hq_value = inferred_hq or hq_value
+
+        if not local_value and not hq_value:
+            continue
+
+        claim = upsert_claim(
+            claims,
+            claim_no=local_value or hq_value,
+            local_claim_no=local_value,
+            hq_claim_no=hq_value,
+        )
+        claim["local_claim_no"] = local_value
+        claim["hq_claim_no"] = hq_value
+        claim["claim_no"] = local_value or hq_value
+
+    return claims
+
+
+# =============================================================================
 # DATAFRAMES / EXPORTACIÓN
 # =============================================================================
 
@@ -1593,6 +1657,7 @@ def init_state():
     st.session_state.setdefault("audit_dealer", "")
     st.session_state.setdefault("audit_auditor", "")
     st.session_state.setdefault("audit_section_index", 0)
+    st.session_state.setdefault("claim_paste_editor_version", 0)
 
 
 def clamp_index(index: Any, max_len: int) -> int:
@@ -1792,36 +1857,57 @@ def main():
             except Exception as exc:
                 st.error(f"No se pudo cargar el JSON: {exc}")
 
-        uploaded_excel = st.file_uploader("Subir checklist o lista de claims", type=["xlsx", "xlsm", "xls"], key="claims_upload")
-        if uploaded_excel is not None and st.button("Cargar claims"):
-            try:
-                loaded_claims = read_claims_from_uploaded_excel(uploaded_excel)
-                if dealer:
-                    apply_default_dealer_to_blank_claims(loaded_claims, dealer)
-                st.session_state.claims = loaded_claims
-                st.session_state.selected_claim = next(iter(loaded_claims.keys())) if loaded_claims else None
-                st.success(f"Cargadas {len(loaded_claims)} claims.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"No se pudo cargar el archivo: {exc}")
-
         st.divider()
-        st.subheader("Añadir claim manual")
-        with st.form("manual_claim_form"):
-            manual_local = st.text_input("Claim ES / Dealer (CO...)")
-            manual_hq = st.text_input("Claim HQ / IDMS / 2810...")
-            submitted = st.form_submit_button("Añadir claim")
-        if submitted:
-            if not safe_str(manual_local) and not safe_str(manual_hq):
-                st.warning("Indica al menos un identificador de claim.")
-            else:
-                claim = empty_claim_record(local_claim_no=manual_local, hq_claim_no=manual_hq)
-                if dealer:
-                    claim["dealer"] = dealer
-                key = make_claim_key(claim.get("local_claim_no"), claim.get("hq_claim_no"), claim.get("claim_no"))
-                st.session_state.claims.setdefault(key, claim)
-                st.session_state.selected_claim = key
-                st.success("Claim añadida.")
+        st.subheader("Pegar claims")
+        st.caption(
+            "Copia dos columnas desde Excel y pégalas en esta tabla: "
+            "Claim España/Dealer y Claim HQ/IDMS. Con esos dos identificadores basta."
+        )
+
+        editor_key = f"claims_paste_editor_{st.session_state.claim_paste_editor_version}"
+        pasted_claims_df = st.data_editor(
+            blank_claim_paste_dataframe(12),
+            key=editor_key,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Claim España / Dealer": st.column_config.TextColumn(
+                    "Claim España / Dealer",
+                    help="Identificador local para boletín al dealer, por ejemplo CO2026...",
+                ),
+                "Claim HQ / IDMS": st.column_config.TextColumn(
+                    "Claim HQ / IDMS",
+                    help="Identificador HQ/IDMS para scorecard en inglés, por ejemplo 2810... o TAC...",
+                ),
+            },
+        )
+
+        append_to_existing = st.checkbox("Añadir a las claims ya cargadas", value=False)
+        claim_table_cols = st.columns(2)
+        with claim_table_cols[0]:
+            if st.button("Cargar tabla", use_container_width=True):
+                try:
+                    loaded_claims = read_claims_from_pasted_table(pasted_claims_df)
+                    if not loaded_claims:
+                        st.warning("La tabla está vacía. Pega al menos una claim española o de HQ.")
+                    else:
+                        if dealer:
+                            apply_default_dealer_to_blank_claims(loaded_claims, dealer)
+
+                        if append_to_existing and st.session_state.claims:
+                            st.session_state.claims.update(loaded_claims)
+                        else:
+                            st.session_state.claims = loaded_claims
+
+                        st.session_state.selected_claim = next(iter(loaded_claims.keys()))
+                        st.success(f"Cargadas {len(loaded_claims)} claims desde la tabla.")
+                        st.rerun()
+                except Exception as exc:
+                    st.error(f"No se pudo cargar la tabla: {exc}")
+        with claim_table_cols[1]:
+            if st.button("Limpiar tabla", use_container_width=True):
+                st.session_state.claim_paste_editor_version += 1
                 st.rerun()
 
         st.divider()
@@ -1835,7 +1921,7 @@ def main():
     apply_default_dealer_to_blank_claims(claims, safe_str(st.session_state.audit_dealer))
 
     if not claims:
-        st.info("Sube la checklist/lista de claims o añade una claim manual para empezar.")
+        st.info("Pega la lista de claims en la tabla de la barra lateral para empezar.")
         st.stop()
 
     audit_score = calculate_audit_score(claims)
