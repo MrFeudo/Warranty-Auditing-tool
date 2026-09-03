@@ -21,6 +21,7 @@ Notas de cálculo:
 - Dealer se selecciona desde listado de dealers activos.
 - Los archivos exportados usan el nombre base Dealer_fecha_auditor.
 - Permite adjuntar fotos de piezas viejas y certificado de destrucción por claim.
+- Añade estado de trabajo por claim y validación de cierre antes de exportar.
 """
 
 from __future__ import annotations
@@ -194,6 +195,19 @@ MAX_TOTAL_POINTS = MAX_DOCUMENT_POINTS + MAX_OLD_PARTS_POINTS  # 100
 
 OLD_PART_PHOTO_FILE_TYPES = ["jpg", "jpeg", "png", "webp"]
 DESTRUCTION_CERTIFICATE_FILE_TYPES = ["jpg", "jpeg", "png", "webp", "pdf"]
+
+CLAIM_WORKFLOW_STATUSES: List[str] = [
+    "Pendiente",
+    "En revisión",
+    "Completada",
+    "Requiere aclaración",
+    "Cerrada",
+]
+
+AUDIT_MODES: List[str] = [
+    "NSC / Auditor interno",
+    "Dealer / Autoauditoría (fase futura)",
+]
 
 ACTIVE_DEALERS: List[str] = [
     "ACAI MOTOR MÁLAGA",
@@ -417,6 +431,32 @@ def apply_default_dealer_to_blank_claims(claims: Dict[str, Dict[str, Any]], deal
             claim["dealer"] = dealer
 
 
+def normalize_workflow_status(value: Any) -> str:
+    """Normaliza el estado manual de trabajo de una claim."""
+    status = safe_str(value)
+    return status if status in CLAIM_WORKFLOW_STATUSES else "Pendiente"
+
+
+def get_claim_workflow_status(claim: Dict[str, Any]) -> str:
+    """Estado visible de la claim: manual si existe, si no derivado de la puntuación."""
+    manual_status = normalize_workflow_status(claim.get("workflow_status", "Pendiente"))
+
+    # Si el usuario no ha marcado nada manualmente y la claim está completa, mostramos Completada.
+    if manual_status == "Pendiente":
+        try:
+            if calculate_claim_score(claim).get("completed"):
+                return "Completada"
+        except Exception:
+            pass
+
+    return manual_status
+
+
+def set_claim_workflow_status(claim: Dict[str, Any], status: str) -> None:
+    """Actualiza el estado manual de la claim."""
+    claim["workflow_status"] = normalize_workflow_status(status)
+
+
 def uploaded_file_to_attachment(uploaded_file) -> Dict[str, Any]:
     """Convierte un UploadedFile de Streamlit en un registro serializable en JSON."""
     data = uploaded_file.getvalue()
@@ -562,6 +602,8 @@ def empty_claim_record(claim_no: str) -> Dict[str, Any]:
         "amount": "",
         "repair_date": "",
         "submission_date": "",
+        "workflow_status": "Pendiente",
+        "nsc_comment": "",
         "general_comment": "",
         "evaluations": {check.key: new_evaluation(check) for check in ALL_CHECKS},
         "attachments": {
@@ -709,9 +751,12 @@ def normalize_loaded_claim(raw_claim: Any, fallback_claim_no: str = "") -> Optio
         "amount",
         "repair_date",
         "submission_date",
+        "nsc_comment",
         "general_comment",
     ]:
         claim[field] = safe_str(raw_claim.get(field, claim.get(field, "")))
+
+    claim["workflow_status"] = normalize_workflow_status(raw_claim.get("workflow_status", claim.get("workflow_status", "Pendiente")))
 
     raw_evaluations = raw_claim.get("evaluations", {})
     if isinstance(raw_evaluations, dict):
@@ -729,6 +774,7 @@ def serialize_audit_workfile(
     audit_name: str,
     dealer: str,
     auditor: str,
+    audit_mode: str = "",
 ) -> bytes:
     """Genera un archivo JSON descargable para poder continuar la auditoría otro día."""
     payload = {
@@ -739,13 +785,14 @@ def serialize_audit_workfile(
             "audit_name": audit_name or "",
             "dealer": dealer or "",
             "auditor": auditor or "",
+            "audit_mode": (audit_mode or (st.session_state.get("audit_mode", AUDIT_MODES[0]) if "st" in globals() else AUDIT_MODES[0])),
         },
         "claims": claims,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
 
-def load_audit_workfile(uploaded_file) -> Tuple[Dict[str, Dict[str, Any]], str, str, str]:
+def load_audit_workfile(uploaded_file) -> Tuple[Dict[str, Dict[str, Any]], str, str, str, str]:
     """Carga una auditoría de trabajo guardada previamente como JSON."""
     content = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
     if isinstance(content, bytes):
@@ -775,11 +822,16 @@ def load_audit_workfile(uploaded_file) -> Tuple[Dict[str, Dict[str, Any]], str, 
     if not claims:
         raise ValueError("El archivo se pudo abrir, pero no contiene claims válidas.")
 
+    loaded_mode = safe_str(audit.get("audit_mode", AUDIT_MODES[0])) or AUDIT_MODES[0]
+    if loaded_mode not in AUDIT_MODES:
+        loaded_mode = AUDIT_MODES[0]
+
     return (
         claims,
         safe_str(audit.get("audit_name", "Auditoría garantías")) or "Auditoría garantías",
         safe_str(audit.get("dealer", "")),
         safe_str(audit.get("auditor", "")),
+        loaded_mode,
     )
 
 # =============================================================================
@@ -907,8 +959,9 @@ def build_summary_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
             "Puntos piezas viejas": score["old_points"],
             "Resultado /100": score["total_points"],
             "% éxito": score["success_percent"],
-            "Estado": "Completada" if score["completed"] else "Pendiente",
+            "Estado": get_claim_workflow_status(claim),
             "Pendientes": " | ".join(score["pending"]),
+            "Comentario NSC": claim.get("nsc_comment", ""),
             "Comentarios": claim.get("general_comment", ""),
             "Fotos piezas viejas": old_parts_photos_summary(claim),
             "Certificado destrucción": destruction_certificate_summary(claim),
@@ -928,6 +981,7 @@ def build_detail_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
                 "VIN": claim.get("vin", ""),
                 "Modelo": claim.get("model", ""),
                 "Importe": claim.get("amount", ""),
+                "Estado trabajo claim": get_claim_workflow_status(claim),
                 "Bloque": check.block,
                 "Apartado": check.label,
                 "Estado": evaluation.get("status", ""),
@@ -956,8 +1010,95 @@ def build_improvement_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFra
                 "Estado": status,
                 "Puntos perdidos": lost,
                 "Máximo apartado": max_points,
+                "Comentario NSC": claim.get("nsc_comment", ""),
                 "Comentario claim": claim.get("general_comment", ""),
             })
+    return pd.DataFrame(rows)
+
+
+
+def old_parts_evidence_required(claim: Dict[str, Any]) -> bool:
+    """Decide si hay que pedir evidencias de piezas viejas para la claim.
+
+    Si todos los apartados de piezas viejas están en No aplica o Pendiente, no forzamos
+    fotos/certificado. Si el auditor empieza a puntuar piezas viejas como OK/Parcial/NOK
+    o ya ha subido adjuntos, activamos la validación.
+    """
+    attachments = get_claim_attachments(claim)
+    if attachments.get("old_parts_photos") or attachments.get("destruction_certificate"):
+        return True
+
+    for check in OLD_PARTS_CHECKS:
+        evaluation = claim.get("evaluations", {}).get(check.key, {})
+        status = safe_str(evaluation.get("status", ""))
+        if status not in ("", "Pendiente", "N/A"):
+            return True
+
+    return False
+
+
+def destruction_certificate_required(claim: Dict[str, Any]) -> bool:
+    evaluation = claim.get("evaluations", {}).get("old_destruction_certificate", {})
+    status = safe_str(evaluation.get("status", ""))
+    return status not in ("", "Pendiente", "N/A")
+
+
+def build_closing_validation_dataframe(claims: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
+    """Checklist de cierre: avisa de pendientes antes de dar la auditoría por cerrada."""
+    rows = []
+
+    for claim in claims.values():
+        score = calculate_claim_score(claim)
+        claim_no = claim.get("claim_no", "")
+        workflow_status = get_claim_workflow_status(claim)
+
+        if score["pending"]:
+            rows.append({
+                "Claim No.": claim_no,
+                "Tipo aviso": "Puntuación pendiente",
+                "Detalle": "Apartados sin revisar: " + " | ".join(score["pending"]),
+                "Severidad": "Alta",
+                "Estado claim": workflow_status,
+            })
+
+        if score["lost_by_area"] and not safe_str(claim.get("general_comment", "")):
+            rows.append({
+                "Claim No.": claim_no,
+                "Tipo aviso": "Comentario general vacío",
+                "Detalle": "Hay puntos perdidos, pero no hay comentario general generado/escrito.",
+                "Severidad": "Media",
+                "Estado claim": workflow_status,
+            })
+
+        attachments = get_claim_attachments(claim)
+        photos_count = len(attachments.get("old_parts_photos", []))
+        if old_parts_evidence_required(claim) and photos_count < 3:
+            rows.append({
+                "Claim No.": claim_no,
+                "Tipo aviso": "Fotos piezas viejas",
+                "Detalle": f"Hay {photos_count} foto(s) adjunta(s). Recomendado mínimo: 3.",
+                "Severidad": "Media",
+                "Estado claim": workflow_status,
+            })
+
+        if destruction_certificate_required(claim) and not attachments.get("destruction_certificate"):
+            rows.append({
+                "Claim No.": claim_no,
+                "Tipo aviso": "Certificado destrucción",
+                "Detalle": "El apartado de certificado no está marcado como N/A/Pendiente, pero no hay archivo adjunto.",
+                "Severidad": "Media",
+                "Estado claim": workflow_status,
+            })
+
+        if workflow_status in ("Pendiente", "En revisión") and score["completed"]:
+            rows.append({
+                "Claim No.": claim_no,
+                "Tipo aviso": "Estado de trabajo",
+                "Detalle": "La puntuación está completa, pero la claim no está marcada como Completada/Cerrada.",
+                "Severidad": "Baja",
+                "Estado claim": workflow_status,
+            })
+
     return pd.DataFrame(rows)
 
 
@@ -975,6 +1116,7 @@ def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str
     detail_df = build_detail_dataframe(claims)
     improvement_df = build_improvement_dataframe(claims)
     attachments_df = build_attachments_dataframe(claims)
+    closing_df = build_closing_validation_dataframe(claims)
     audit_score = calculate_audit_score(claims)
 
     cover_df = pd.DataFrame([
@@ -994,6 +1136,7 @@ def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str
         detail_df.to_excel(writer, index=False, sheet_name="Detalle apartados")
         improvement_df.to_excel(writer, index=False, sheet_name="Áreas de mejora")
         attachments_df.to_excel(writer, index=False, sheet_name="Adjuntos")
+        closing_df.to_excel(writer, index=False, sheet_name="Validación cierre")
 
         workbook = writer.book
         header_format = workbook.add_format({
@@ -1011,10 +1154,11 @@ def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str
 
         sheet_widths = {
             "Resumen auditoría": [22, 55],
-            "Claims": [18, 24, 22, 18, 14, 20, 20, 14, 14, 16, 45, 60, 42, 34],
-            "Detalle apartados": [18, 24, 22, 18, 14, 28, 30, 26, 18, 14, 14, 45, 80],
-            "Áreas de mejora": [18, 24, 22, 18, 14, 28, 32, 18, 18, 18, 60],
+            "Claims": [18, 24, 22, 18, 14, 20, 20, 14, 14, 16, 45, 50, 60, 42, 34],
+            "Detalle apartados": [18, 24, 22, 18, 14, 18, 28, 30, 26, 18, 14, 14, 45, 80],
+            "Áreas de mejora": [18, 24, 22, 18, 14, 28, 32, 18, 18, 18, 50, 60],
             "Adjuntos": [18, 24, 8, 42, 24, 16, 22],
+            "Validación cierre": [18, 26, 80, 14, 18],
         }
 
         for sheet_name, worksheet in writer.sheets.items():
@@ -1024,6 +1168,7 @@ def export_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str
                 "Detalle apartados": detail_df,
                 "Áreas de mejora": improvement_df,
                 "Adjuntos": attachments_df,
+                "Validación cierre": closing_df,
             }[sheet_name]
 
             rows, cols = df.shape
@@ -1170,10 +1315,10 @@ def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str,
         grade_headers = [
             "Claim No.", "Dealer", "VIN", "Modelo", "Importe",
             "Documentación /58", "Piezas viejas /42", "Total /100", "% éxito",
-            "Resultado", "Pendientes", "Comentarios", "Fotos piezas viejas", "Certificado destrucción",
+            "Resultado", "Estado trabajo", "Pendientes", "Comentario NSC", "Comentarios", "Fotos piezas viejas", "Certificado destrucción",
         ]
         write_headers(grade_ws, 2, grade_headers)
-        set_widths(grade_ws, [20, 24, 24, 18, 14, 18, 18, 14, 14, 16, 48, 60, 42, 34])
+        set_widths(grade_ws, [20, 24, 24, 18, 14, 18, 18, 14, 14, 16, 18, 48, 50, 60, 42, 34])
         grade_ws.freeze_panes(3, 0)
 
         row_idx = 3
@@ -1191,7 +1336,9 @@ def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str,
                 total_points,
                 score["success_percent"] / 100,
                 result_label(total_points),
+                get_claim_workflow_status(claim),
                 " | ".join(score["pending"]),
+                claim.get("nsc_comment", ""),
                 claim.get("general_comment", ""),
                 old_parts_photos_summary(claim),
                 destruction_certificate_summary(claim),
@@ -1359,6 +1506,23 @@ def export_report_card_excel(claims: Dict[str, Dict[str, Any]], audit_name: str,
             attachments_ws.autofilter(0, 0, len(attachments_df), len(attachments_headers) - 1)
 
         # ------------------------------------------------------------------
+        # Validación de cierre
+        # ------------------------------------------------------------------
+        closing_ws = workbook.add_worksheet("Validación cierre")
+        closing_headers = ["Claim No.", "Tipo aviso", "Detalle", "Severidad", "Estado claim"]
+        write_headers(closing_ws, 0, closing_headers)
+        set_widths(closing_ws, [20, 28, 85, 14, 20])
+        closing_ws.freeze_panes(1, 0)
+        closing_df = build_closing_validation_dataframe(claims)
+        if closing_df.empty:
+            write_row(closing_ws, 1, ["", "Sin avisos", "La auditoría no tiene avisos de cierre.", "OK", ""], fmt_body)
+            closing_ws.autofilter(0, 0, 1, len(closing_headers) - 1)
+        else:
+            for row_idx, (_, closing_row) in enumerate(closing_df.iterrows(), start=1):
+                write_row(closing_ws, row_idx, [closing_row.get(header, "") for header in closing_headers], fmt_body)
+            closing_ws.autofilter(0, 0, len(closing_df), len(closing_headers) - 1)
+
+        # ------------------------------------------------------------------
         # Evaluation content
         # ------------------------------------------------------------------
         eval_ws = workbook.add_worksheet("Evaluation content")
@@ -1427,6 +1591,18 @@ def generate_text_report(claims: Dict[str, Dict[str, Any]], audit_name: str, dea
     for _, row in critical_claims.iterrows():
         lines.append(f"- {row['Claim No.']}: {row['Resultado /100']}/100. {safe_str(row['Comentarios'])}")
     lines.append("")
+    closing_df = build_closing_validation_dataframe(claims)
+    lines.append("Validación de cierre")
+    if closing_df.empty:
+        lines.append("No hay avisos de cierre pendientes.")
+    else:
+        high = len(closing_df[closing_df["Severidad"] == "Alta"]) if "Severidad" in closing_df.columns else 0
+        medium = len(closing_df[closing_df["Severidad"] == "Media"]) if "Severidad" in closing_df.columns else 0
+        low = len(closing_df[closing_df["Severidad"] == "Baja"]) if "Severidad" in closing_df.columns else 0
+        lines.append(f"Avisos detectados: {len(closing_df)} (alta: {high}, media: {medium}, baja: {low}).")
+        for _, row in closing_df.head(8).iterrows():
+            lines.append(f"- {row['Claim No.']} · {row['Tipo aviso']}: {row['Detalle']}")
+    lines.append("")
     lines.append("Conclusión")
     lines.append(
         "Se recomienda focalizar el plan de mejora en las áreas con mayor pérdida de puntos, "
@@ -1443,7 +1619,7 @@ def export_audit_package_zip(claims: Dict[str, Dict[str, Any]], audit_name: str,
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
         zip_file.writestr(
             f"{base_name}/{base_name}.json",
-            serialize_audit_workfile(claims, audit_name, dealer, auditor),
+            serialize_audit_workfile(claims, audit_name, dealer, auditor, st.session_state.get("audit_mode", AUDIT_MODES[0])),
         )
         zip_file.writestr(
             f"{base_name}/{base_name}_analitico.xlsx",
@@ -1495,6 +1671,8 @@ def init_state():
         st.session_state.audit_dealer = ""
     if "audit_auditor" not in st.session_state:
         st.session_state.audit_auditor = ""
+    if "audit_mode" not in st.session_state:
+        st.session_state.audit_mode = AUDIT_MODES[0]
 
 
 def build_general_comment_from_observations(claim: Dict[str, Any], include_campaigns: bool = True) -> str:
@@ -1769,16 +1947,81 @@ def sync_uploaded_attachments_from_session_state(claims: Dict[str, Dict[str, Any
         claim["attachments"] = attachments
 
 
+
+def sync_editor_state_from_session_state(claims: Dict[str, Dict[str, Any]]) -> None:
+    """Sincroniza widgets de edición antes de construir descargas.
+
+    Los botones de descarga están en la columna izquierda y se renderizan antes que
+    el editor de la claim. Esta función evita que una exportación se lleve valores
+    de la ejecución anterior si acabas de cambiar un selector o escribir una
+    observación.
+    """
+    if not claims:
+        return
+
+    check_by_key = {check.key: check for check in ALL_CHECKS}
+
+    for claim in claims.values():
+        claim_no = safe_str(claim.get("claim_no", ""))
+        if not claim_no:
+            continue
+
+        dealer_key = f"claim_meta_{claim_no}_dealer"
+        if dealer_key in st.session_state:
+            claim["dealer"] = safe_str(st.session_state.get(dealer_key, ""))
+
+        for field in ["vin", "model", "amount", "repair_date", "submission_date"]:
+            meta_key = f"claim_meta_{claim_no}_{field}"
+            if meta_key in st.session_state:
+                claim[field] = safe_str(st.session_state.get(meta_key, ""))
+
+        workflow_key = f"claim_workflow_status_{claim_no}"
+        if workflow_key in st.session_state:
+            claim["workflow_status"] = normalize_workflow_status(st.session_state.get(workflow_key, "Pendiente"))
+
+        nsc_comment_key = f"nsc_comment_{claim_no}"
+        if nsc_comment_key in st.session_state:
+            claim["nsc_comment"] = safe_str(st.session_state.get(nsc_comment_key, ""))
+
+        general_comment_key = f"general_comment_{claim_no}"
+        if general_comment_key in st.session_state:
+            claim["general_comment"] = safe_str(st.session_state.get(general_comment_key, ""))
+
+        for check_key, check in check_by_key.items():
+            evaluation = claim.get("evaluations", {}).setdefault(check_key, new_evaluation(check))
+
+            select_key = f"select_{claim_no}_{check_key}"
+            if select_key in st.session_state:
+                option = option_from_label(check, safe_str(st.session_state.get(select_key, "")))
+                evaluation["status"] = option.status
+                evaluation["label"] = option.label
+                evaluation["points"] = option.points
+                evaluation["max_points"] = check.max_points
+
+            comment_key = f"comment_{claim_no}_{check_key}"
+            if comment_key in st.session_state:
+                evaluation["comment"] = safe_str(st.session_state.get(comment_key, ""))
+
+
+
 def main():
     st.set_page_config(page_title="Warranty Internal Audit Tool", layout="wide")
     init_state()
     sync_uploaded_attachments_from_session_state(st.session_state.claims)
+    sync_editor_state_from_session_state(st.session_state.claims)
 
     st.title("Warranty Internal Audit Tool")
-    st.caption("Herramienta interna de auditoría de garantías: documentación + piezas viejas = 100 puntos. Campañas solo informativo. Ficha por claim y adjuntos de piezas viejas.")
+    st.caption("Herramienta interna de auditoría de garantías: documentación + piezas viejas = 100 puntos. Campañas solo informativo. Ficha por claim, adjuntos, estados y validación de cierre.")
 
     with st.sidebar:
         st.header("Auditoría")
+
+        st.selectbox(
+            "Modo de trabajo",
+            AUDIT_MODES,
+            key="audit_mode",
+            help="De momento es funcionalmente interno. El modo dealer queda como base para una futura plataforma/Lovable.",
+        )
 
         st.subheader("Guardar / cargar progreso")
         workfile = st.file_uploader(
@@ -1789,12 +2032,13 @@ def main():
         )
         if workfile is not None and st.button("Cargar auditoría guardada", type="primary"):
             try:
-                loaded_claims, loaded_audit_name, loaded_dealer, loaded_auditor = load_audit_workfile(workfile)
+                loaded_claims, loaded_audit_name, loaded_dealer, loaded_auditor, loaded_mode = load_audit_workfile(workfile)
                 st.session_state.claims = loaded_claims
                 st.session_state.selected_claim = next(iter(loaded_claims.keys()))
                 st.session_state.audit_name = loaded_audit_name
                 st.session_state.audit_dealer = loaded_dealer
                 st.session_state.audit_auditor = loaded_auditor
+                st.session_state.audit_mode = loaded_mode
                 st.success(f"Auditoría cargada: {len(loaded_claims)} claims.")
                 st.rerun()
             except Exception as exc:
@@ -1808,6 +2052,7 @@ def main():
                     st.session_state.audit_name,
                     st.session_state.audit_dealer,
                     st.session_state.audit_auditor,
+                    st.session_state.get("audit_mode", AUDIT_MODES[0]),
                 ),
                 file_name=f"{build_audit_file_basename(st.session_state.get('audit_dealer', ''), st.session_state.get('audit_auditor', ''))}.json",
                 mime="application/json",
@@ -1878,6 +2123,7 @@ def main():
     claims: Dict[str, Dict[str, Any]] = st.session_state.claims
     apply_default_dealer_to_blank_claims(claims, dealer)
     sync_uploaded_attachments_from_session_state(claims)
+    sync_editor_state_from_session_state(claims)
 
     if not claims:
         st.info("Sube la checklist de auditoría o añade una claim manual para empezar.")
@@ -1922,9 +2168,16 @@ def main():
         )
         st.session_state.selected_claim = selected_claim
 
+        if st.button("Eliminar claim seleccionada", help="Solo elimina la claim de esta auditoría en curso."):
+            claim_to_delete = st.session_state.selected_claim
+            if claim_to_delete in claims:
+                del claims[claim_to_delete]
+                st.session_state.selected_claim = next(iter(claims.keys()), None)
+                st.rerun()
+
         st.download_button(
             "💾 Guardar progreso editable (.json)",
-            data=serialize_audit_workfile(claims, audit_name, dealer, auditor),
+            data=serialize_audit_workfile(claims, audit_name, dealer, auditor, st.session_state.get("audit_mode", AUDIT_MODES[0])),
             file_name=f"{build_audit_file_basename(st.session_state.get('audit_dealer', ''), st.session_state.get('audit_auditor', ''))}.json",
             mime="application/json",
             help="Este es el archivo que debes subir en 'Cargar auditoría guardada' para continuar editando otro día.",
@@ -1954,6 +2207,12 @@ def main():
             help="Incluye Excel analítico, boletín, informe TXT, JSON de trabajo y los archivos adjuntos reales por claim.",
         )
 
+        closing_df = build_closing_validation_dataframe(claims)
+        if closing_df.empty:
+            st.success("Validación de cierre: OK")
+        else:
+            st.warning(f"Validación de cierre: {len(closing_df)} aviso(s)")
+
     with right:
         claim = claims[st.session_state.selected_claim]
         score = calculate_claim_score(claim)
@@ -1965,7 +2224,57 @@ def main():
         score_cols[0].metric("Documentación", f"{score['doc_points']}/{MAX_DOCUMENT_POINTS}")
         score_cols[1].metric("Piezas viejas", f"{score['old_points']}/{MAX_OLD_PARTS_POINTS}")
         score_cols[2].metric("Resultado claim", f"{score['total_points']}/100")
-        score_cols[3].metric("Estado", "Completada" if score["completed"] else "Pendiente")
+        score_cols[3].metric("Estado", get_claim_workflow_status(claim))
+
+        workflow_key = f"claim_workflow_status_{claim['claim_no']}"
+        pending_workflow_key = f"pending_workflow_status_{claim['claim_no']}"
+        current_workflow_status = get_claim_workflow_status(claim)
+        claim["workflow_status"] = current_workflow_status
+
+        # Los botones de estado escriben en una clave temporal para no modificar
+        # directamente el valor de un widget después de crearlo en la misma ejecución.
+        if pending_workflow_key in st.session_state:
+            current_workflow_status = normalize_workflow_status(st.session_state[pending_workflow_key])
+            claim["workflow_status"] = current_workflow_status
+            st.session_state[workflow_key] = current_workflow_status
+            del st.session_state[pending_workflow_key]
+
+        if workflow_key not in st.session_state or st.session_state[workflow_key] not in CLAIM_WORKFLOW_STATUSES:
+            st.session_state[workflow_key] = current_workflow_status
+
+        workflow_cols = st.columns([1.4, 1, 1, 1.2])
+        with workflow_cols[0]:
+            selected_workflow_status = st.selectbox(
+                "Estado de trabajo",
+                CLAIM_WORKFLOW_STATUSES,
+                index=CLAIM_WORKFLOW_STATUSES.index(st.session_state[workflow_key]),
+                key=workflow_key,
+            )
+            claim["workflow_status"] = normalize_workflow_status(selected_workflow_status)
+        with workflow_cols[1]:
+            if st.button("Marcar completada", use_container_width=True, key=f"mark_completed_{claim['claim_no']}"):
+                claim["workflow_status"] = "Completada"
+                st.session_state[pending_workflow_key] = "Completada"
+                st.rerun()
+        with workflow_cols[2]:
+            if st.button("Requiere aclaración", use_container_width=True, key=f"mark_clarification_{claim['claim_no']}"):
+                claim["workflow_status"] = "Requiere aclaración"
+                st.session_state[pending_workflow_key] = "Requiere aclaración"
+                st.rerun()
+        with workflow_cols[3]:
+            if st.button("Cerrar claim", use_container_width=True, key=f"mark_closed_{claim['claim_no']}"):
+                claim["workflow_status"] = "Cerrada"
+                st.session_state[pending_workflow_key] = "Cerrada"
+                st.rerun()
+
+        nsc_comment_key = f"nsc_comment_{claim['claim_no']}"
+        if nsc_comment_key not in st.session_state:
+            st.session_state[nsc_comment_key] = claim.get("nsc_comment", "")
+        claim["nsc_comment"] = st.text_input(
+            "Comentario interno / seguimiento rápido",
+            key=nsc_comment_key,
+            placeholder="Ej.: revisar fotos, pedir aclaración, OK para cierre...",
+        )
 
         if score["pending"]:
             st.warning("Apartados pendientes: " + ", ".join(score["pending"]))
@@ -2034,6 +2343,14 @@ def main():
                 file_name=f"{export_base_name}_informe.txt",
                 mime="text/plain",
             )
+
+            st.markdown("### Validación de cierre")
+            closing_df = build_closing_validation_dataframe(claims)
+            if closing_df.empty:
+                st.success("Sin avisos de cierre. La auditoría está limpia para exportar/cerrar.")
+            else:
+                st.warning(f"Hay {len(closing_df)} aviso(s) antes de cerrar la auditoría.")
+                st.dataframe(closing_df, use_container_width=True, hide_index=True)
 
         st.divider()
         section_index = section_names.index(st.session_state.active_audit_section)
