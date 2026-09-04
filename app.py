@@ -35,6 +35,7 @@ import os
 import re
 import zipfile
 import unicodedata
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, date
 from io import BytesIO
@@ -1429,6 +1430,81 @@ def restore_ai_outputs_from_payload(payload: Dict[str, Any]) -> None:
     comments = ai_outputs.get("ai_claim_comments_en", {})
     if isinstance(comments, dict):
         st.session_state.ai_claim_comments_en = comments
+
+
+def payload_has_saved_ai_outputs(payload: Dict[str, Any]) -> bool:
+    """Indica si una auditoría trae informe/resumen IA guardado."""
+    ai_outputs = payload.get("ai_outputs", {}) if isinstance(payload, dict) else {}
+    if not isinstance(ai_outputs, dict):
+        return False
+    return any(
+        safe_str(ai_outputs.get(key, ""))
+        for key in ["ai_report_es", "ai_report_en", "ai_action_plan_es", "ai_action_plan_en"]
+    )
+
+
+def extract_text_from_docx_bytes(content: bytes) -> str:
+    """Extrae texto simple de un .docx sin depender de python-docx. Útil para ZIPs antiguos."""
+    try:
+        with zipfile.ZipFile(BytesIO(content), "r") as docx_zip:
+            xml_bytes = docx_zip.read("word/document.xml")
+    except Exception:
+        return ""
+
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception:
+        return ""
+
+    namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    paragraphs = []
+    for paragraph in root.iter(namespace + "p"):
+        pieces = []
+        for node in paragraph.iter(namespace + "t"):
+            if node.text:
+                pieces.append(node.text)
+        line = "".join(pieces).strip()
+        if line:
+            paragraphs.append(line)
+    return "\n".join(paragraphs).strip()
+
+
+def enrich_payload_ai_outputs_from_zip(payload: Dict[str, Any], zip_content: bytes) -> Dict[str, Any]:
+    """
+    Si el JSON no trae ai_outputs pero el ZIP contiene informes ya generados,
+    recupera el texto para mostrarlo en Histórico / Informe sin llamar otra vez a Gemini.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    ai_outputs = payload.get("ai_outputs", {}) if isinstance(payload.get("ai_outputs", {}), dict) else {}
+    ai_outputs = dict(ai_outputs)
+
+    try:
+        with zipfile.ZipFile(BytesIO(zip_content), "r") as zip_file:
+            names = [name for name in zip_file.namelist() if "__macosx" not in name.lower()]
+
+            def read_text_candidate(suffixes: Tuple[str, ...]) -> str:
+                for name in names:
+                    lower = name.lower()
+                    if lower.endswith(suffixes):
+                        raw = zip_file.read(name)
+                        if lower.endswith(".txt"):
+                            return raw.decode("utf-8", errors="replace").strip()
+                        if lower.endswith(".docx"):
+                            return extract_text_from_docx_bytes(raw)
+                return ""
+
+            if not safe_str(ai_outputs.get("ai_report_es", "")):
+                ai_outputs["ai_report_es"] = read_text_candidate(("_es_informe.txt", "_es_informe.docx"))
+            if not safe_str(ai_outputs.get("ai_report_en", "")):
+                ai_outputs["ai_report_en"] = read_text_candidate(("_en_report.txt", "_en_report.docx"))
+    except Exception:
+        pass
+
+    ai_outputs = {key: value for key, value in ai_outputs.items() if value not in (None, "")}
+    if ai_outputs:
+        payload["ai_outputs"] = ai_outputs
+    return ai_outputs
 
 
 def build_audit_manifest(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, audit_date_value: Any = None) -> Dict[str, Any]:
@@ -3382,7 +3458,7 @@ def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, de
         with ai_cols[2]:
             generated_at = get_ai_output("ai_generated_at")
             if generated_at:
-                st.caption(f"Último informe IA: {generated_at}")
+                st.caption(f"Informe IA guardado: {generated_at}. No se genera otro salvo que pulses el botón.")
             else:
                 st.caption("Si no generas con Gemini, se usa el informe básico automático.")
 
@@ -3571,17 +3647,18 @@ def uploaded_audit_file_to_history_entry(uploaded_file: Any) -> Dict[str, Any]:
         payload, json_path = extract_audit_payload_from_zip_bytes(content)
         original_download = content
         original_mime = "application/zip"
+        ai_outputs = enrich_payload_ai_outputs_from_zip(payload, content)
     else:
         payload = parse_audit_workfile_payload(content)
         json_path = file_name
         original_download = content if isinstance(content, bytes) else str(content).encode("utf-8")
         original_mime = "application/json"
+        ai_outputs = payload.get("ai_outputs", {}) if isinstance(payload.get("ai_outputs", {}), dict) else {}
 
     claims, audit_name, dealer, auditor, audit_date_value = load_audit_workfile_from_payload(payload)
     manifest = payload.get("manifest", {}) if isinstance(payload.get("manifest", {}), dict) else {}
     score = calculate_audit_score(claims)
     evidence_count = evidence_count_for_audit(claims)
-    ai_outputs = payload.get("ai_outputs", {}) if isinstance(payload.get("ai_outputs", {}), dict) else {}
     saved_at = safe_str(payload.get("saved_at", "")) or safe_str(manifest.get("saved_at", ""))
     audit_id = "|".join([
         sanitize_for_filename(file_name, "auditoria"),
@@ -3654,8 +3731,14 @@ def load_history_entry_as_active(history_id: str) -> None:
     st.session_state.audit_auditor = auditor
     st.session_state.audit_date = audit_date_value
     st.session_state.selected_claim = next(iter(claims.keys())) if claims else None
-    st.session_state.audit_section_index = 0
     restore_ai_outputs_from_payload(payload)
+    if payload_has_saved_ai_outputs(payload):
+        # Al reabrir una auditoría con informe IA ya guardado, vamos directos a Informe.
+        # No se vuelve a llamar a Gemini hasta que el usuario pulse expresamente "Generar con Gemini".
+        st.session_state.audit_section_index = 3
+        st.session_state.loaded_saved_ai_notice = "Auditoría reabierta con informe/resumen IA guardado. No se ha generado nada nuevo."
+    else:
+        st.session_state.audit_section_index = 0
     st.session_state.app_page = APP_PAGE_ACTIVE
 
 
@@ -3886,6 +3969,11 @@ def main():
                 st.session_state.audit_date = loaded_date
                 st.session_state.selected_claim = next(iter(claims.keys()))
                 restore_ai_outputs_from_payload(payload)
+                if payload_has_saved_ai_outputs(payload):
+                    st.session_state.audit_section_index = 3
+                    st.session_state.loaded_saved_ai_notice = "Auditoría cargada con informe/resumen IA guardado. No se ha generado nada nuevo."
+                else:
+                    st.session_state.audit_section_index = 0
                 st.success(f"Auditoría cargada: {len(claims)} claims.")
                 st.rerun()
             except Exception as exc:
@@ -3903,6 +3991,10 @@ def main():
     if page == APP_PAGE_HISTORY:
         render_history_section()
         st.stop()
+
+    loaded_saved_ai_notice = safe_str(st.session_state.pop("loaded_saved_ai_notice", ""))
+    if loaded_saved_ai_notice:
+        st.success(loaded_saved_ai_notice)
 
     claims: Dict[str, Dict[str, Any]] = st.session_state.claims
     apply_default_dealer_to_blank_claims(claims, safe_str(st.session_state.audit_dealer))
