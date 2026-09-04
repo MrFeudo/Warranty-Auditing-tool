@@ -198,6 +198,85 @@ MAX_TOTAL_POINTS = MAX_DOCUMENT_POINTS + MAX_OLD_PARTS_POINTS
 
 GEMINI_MODEL_DEFAULT = "gemini-2.5-flash"
 
+# =============================================================================
+# CONTEXTO TÉCNICO COMPACTO DE POLÍTICA PARA GEMINI
+# =============================================================================
+
+POLICY_AUDIT_CONTEXT = """
+Use this as internal technical background only. Do not quote, reproduce or attach
+this policy context in the generated report. The report must be based on the
+auditor's observations and the audit evaluation criteria, using this context only
+to write with better technical judgement.
+
+1. Dealer responsibility and auditability
+- Official aftersales services must manage warranty repairs in a timely,
+  complete and professional manner, using trained personnel, approved diagnostic
+  equipment/tools and original or approved spare parts.
+- Warranty records, repair orders, clocking sheets, maintenance data and related
+  documents must remain available for audit or verification by the brand at any
+  time.
+
+2. Repair order and claim description
+- The repair order must exist, be complete, traceable and signed where required.
+- The customer's concern should be recorded objectively and consistently with
+  the repair order, without assuming the technical defect before diagnosis.
+- Claim descriptions should clearly reflect the symptom, diagnosis, cause and
+  repair solution.
+
+3. Technical diagnosis, evidence and mandatory attachments
+- The workshop must verify the customer's complaint through technical diagnosis.
+- Evidence must be clear, focused and sufficient to support the failure,
+  diagnosis and repair performed.
+- Depending on the case, evidence may include photos, videos, diagnostic reports,
+  DTC screenshots or test results from approved tools.
+- Key supporting documents include the signed repair order, technical evidence,
+  vehicle/VIN traceability and odometer/mileage evidence.
+
+4. Labour, standard times and subcontracted work
+- Labour must be aligned with the approved standard operation time/UT.
+- Additional labour must be technically justified with clear breakdown, clocking
+  records and evidence.
+- External/subcontracted work requires suitable supporting documentation and, when
+  applicable, prior approval. Amounts should reflect the real net cost and the
+  applicable brand limits.
+
+5. Claim submission deadlines
+- Warranty claims must be submitted within the applicable deadline after repair
+  completion, using the repair completion/clocking date as the reference.
+- Returned claims must be corrected and resubmitted within the required deadline.
+- When prior approval exists, the applicable submission period may differ.
+- Special safety or powertrain cases may require faster registration and follow-up.
+
+6. Coverage and deductions
+- Warranty covers product, manufacturing or assembly defects within the valid
+  warranty period and conditions.
+- Items linked to wear, maintenance, consumables, misuse, external damage,
+  unapproved parts, missing maintenance, incorrect storage/transport handling or
+  workshop/customer negligence may be excluded.
+- Financial deductions should be clearly linked to the audited finding: for
+  example unsupported labour, unsupported auxiliary material, missing documents,
+  out-of-scope repairs, or claims not covered by warranty.
+
+7. Old parts custody, traceability and destruction
+- Parts replaced and paid under warranty are considered property of the brand and
+  must be available for inspection, analysis, custody or certified destruction.
+- Old parts must be stored in an identified, organised and secure area.
+- Parts should be traceable by claim/repair order, VIN and part reference, and
+  arranged in a way that allows the auditor to locate them quickly.
+- Old parts must be retained during the required custody period and must not be
+  reused.
+- Destruction, when applicable, must follow the defined process and be supported
+  by a destruction certificate/report.
+
+8. How to use this context in the report
+- Do not turn this policy context into new findings.
+- Do not create corrective actions that are not supported by the auditor's notes.
+- Use cautious wording: review, reinforce, verify, standardise, improve
+  consistency, ensure availability, ensure traceability.
+- Avoid accusatory wording such as: failure proves, mandatory sanction, immediate
+  non-compliance, the dealer failed to.
+""".strip()
+
 ACTIVE_DEALERS: List[str] = [
     "ACAI MOTOR MÁLAGA", "ALFAVISA BILBAO", "ALIMOTOR ELCHE", "ANFERPA SEGOVIA",
     "AUTO YALDE CALAHORRA", "AUTO YALDE LOGROÑO", "AUTOCAM MOTOR VILAFRANCA",
@@ -1436,11 +1515,61 @@ def get_secret_value(*names: str) -> str:
     return ""
 
 
+
+def build_ai_action_plan_context(claims: Dict[str, Dict[str, Any]], dealer: str) -> List[Dict[str, Any]]:
+    """
+    Prepara para Gemini un contexto por apartado basado en observaciones reales.
+    No incluye frases tipo "X claims / puntos perdidos" para evitar que la IA
+    copie métricas en el plan de acción. Cada claim puede tener una casuística distinta.
+    """
+    context: List[Dict[str, Any]] = []
+
+    for check in ALL_SCORING_CHECKS:
+        issue_examples = []
+        statuses = []
+
+        for claim in claims.values():
+            evaluation = claim.get("evaluations", {}).get(check.key, {})
+            points = evaluation.get("points")
+            lost = check.max_points if points is None else max(0, check.max_points - int(points or 0))
+            observation_es = evaluation_comment(claim, check)
+
+            if lost > 0 or observation_es:
+                status = safe_str(evaluation.get("status", ""))
+                if status:
+                    statuses.append(status)
+                issue_examples.append({
+                    "claim_hq_id": safe_str(claim.get("hq_claim_no", "")),
+                    "claim_es_id": safe_str(claim.get("local_claim_no", "")),
+                    "dealer": safe_str(claim.get("dealer", "")) or safe_str(dealer),
+                    "status": status,
+                    "points": points,
+                    "max_points": check.max_points,
+                    "observation_es": observation_es,
+                })
+
+        context.append({
+            "group": "Claim" if check.block_key == "document" else "Old part",
+            "item_key": check.key,
+            "parameter_es": check.label_es,
+            "parameter_en": check.label_en,
+            "max_points": check.max_points,
+            "evaluation_criteria_es": check.guidance_es,
+            "evaluation_criteria_en": check.guidance_en,
+            "has_issue": bool(issue_examples),
+            "statuses_detected": sorted(set(statuses)),
+            "claim_observations": issue_examples,
+            "default_followup_es": COUNTERMEASURES.get(check.key, {}).get("es", TEXT["es"]["generic_countermeasure"]),
+            "default_followup_en": COUNTERMEASURES.get(check.key, {}).get("en", TEXT["en"]["generic_countermeasure"]),
+        })
+
+    return context
+
 def build_ai_audit_payload(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> Dict[str, Any]:
     """Prepara un contexto compacto para Gemini. La IA solo redacta/resume; no recalcula puntos."""
     sync_all_claims_from_widget_state(claims)
     audit_score = calculate_audit_score(claims)
-    action_rows_es = build_action_plan_rows(claims, "es")
+    action_plan_context = build_ai_action_plan_context(claims, dealer)
 
     claim_payload = []
     for claim in claims.values():
@@ -1490,15 +1619,22 @@ def build_ai_audit_payload(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             "amount": claim_deduction_amount(claim),
             "reason_es": safe_str(claim.get("deduction_reason", "")),
         }
-        claim_payload.append({
-            "claim_hq_id": safe_str(claim.get("hq_claim_no", "")),
-            "claim_es_id": safe_str(claim.get("local_claim_no", "")),
-            "dealer": safe_str(claim.get("dealer", "")) or dealer,
-            "score": score_for_ai,
-            "deduction": deduction,
-            "automatic_general_comment_es": auto_general_comment(claim, "es"),
-            "observations": observations,
-        })
+        # Para controlar tokens y evitar informes enormes, Gemini solo recibe
+        # claims con observaciones, desviaciones o deducciones. Las claims OK
+        # sin comentarios quedan reflejadas únicamente en las métricas globales.
+        has_written_observation = any(safe_str(item.get("observation_es", "")) for item in observations)
+        has_score_deviation = any(int(item.get("lost_points", 0) or 0) > 0 for item in observations)
+        has_deduction_data = deduction["type"] != "none" or float(deduction["amount"] or 0) > 0 or safe_str(deduction["reason_es"])
+        if has_written_observation or has_score_deviation or has_deduction_data:
+            claim_payload.append({
+                "claim_hq_id": safe_str(claim.get("hq_claim_no", "")),
+                "claim_es_id": safe_str(claim.get("local_claim_no", "")),
+                "dealer": safe_str(claim.get("dealer", "")) or dealer,
+                "score": score_for_ai,
+                "deduction": deduction,
+                "automatic_general_comment_es": auto_general_comment(claim, "es"),
+                "observations": observations,
+            })
 
     return {
         "audit_name": audit_name,
@@ -1513,8 +1649,9 @@ def build_ai_audit_payload(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             "campaigns": "Not included",
         },
         "audit_score": audit_score,
-        "main_improvement_rows_es": action_rows_es,
-        "claims": claim_payload,
+        "data_scope_for_ai": "The claims array intentionally includes only claims with observations, score deviations or deductions. Perfect claims without observations are used only in global scoring.",
+        "action_plan_context": action_plan_context,
+        "claims_with_observations_or_deviations": claim_payload,
     }
 
 
@@ -1543,29 +1680,41 @@ def build_gemini_audit_prompt(payload: Dict[str, Any]) -> str:
     return f"""
 You are an automotive warranty audit assistant for an NSC warranty department.
 
-Your task is to create a professional executive audit report and action plan in Spanish and English.
-Use ONLY the audit data provided below. Do not invent claims, scores, deductions or facts.
+Your task is to create a professional executive audit summary and a follow-up findings table in Spanish and English.
+Use ONLY the audit data provided below, the current audit evaluation criteria, and the compact warranty policy context provided here.
+Do not invent claims, scores, deductions, evidence, causes or facts.
 Do not recalculate the score. Use the provided scores exactly.
+
+WARRANTY POLICY TECHNICAL CONTEXT - INTERNAL BACKGROUND ONLY:
+{POLICY_AUDIT_CONTEXT}
+
+Use the policy context only to improve technical wording and judgement. Do not quote it, reproduce it, attach it, or introduce findings that are not supported by the auditor observations.
 
 IMPORTANT STYLE REQUIREMENTS:
 - Spanish text is for the dealer: clear, professional, direct and improvement-oriented.
 - English text is for HQ: corporate, concise and formal.
 - Summarize repeated observations into meaningful improvement areas.
-- Do not output a raw list like "23 claims with deviation" as the main content.
-- Explain what the pattern means and what action should be taken.
-- Keep the tone constructive, not accusatory.
+- Keep the tone constructive, never accusatory.
 - Manual Spanish observations must be translated naturally into English in the English output.
 - Scoring is rule-based; do not change it.
 - Do not use excessive asterisks or bold Markdown markers. Keep the report readable in plain text too.
 
+CRITICAL FOLLOW-UP TABLE RULE:
+Do NOT write generic metric sentences such as:
+- "Se detectan desviaciones u observaciones en 23 claim(s). Puntos perdidos: 161."
+- "23 claims with deviation. Lost points: 161."
+The follow-up table must be based on the actual written observations for each audited parameter and the audit evaluation criteria.
+Each audited claim may have a different issue. Read the claim-level observations, synthesize the pattern, and propose cautious follow-up wording that responds to those observations.
+Counts and lost points are background context only. They must NOT be used as the main wording in the follow-up table cells.
+
 IMPORTANT CHECKLIST NAMING RULES:
 - Respect the current checklist naming exactly.
-- In Spanish, use the exact Spanish audited parameter names received in the audit data.
-- In English, use the exact English audited parameter names received in the audit data.
+- In Spanish, use the exact Spanish audited parameter names received in action_plan_context.parameter_es.
+- In English, use the exact English audited parameter names received in action_plan_context.parameter_en.
 - Do not rename audited parameters into generic alternatives.
 
-ACTION PLAN STRUCTURE:
-The action plan must follow the audit checklist structure, like an audit scorecard/action plan table.
+FOLLOW-UP TABLE STRUCTURE:
+The follow-up table must follow the audit checklist structure, like an audit scorecard / findings table.
 Return action_plan_rows_es and action_plan_rows_en as arrays with ONE ROW FOR EACH audited parameter, in this exact order:
 1. OR
 2. Pedido piezas / albarán
@@ -1588,16 +1737,32 @@ Each row must contain:
 - group: "Claim" for document checklist items, "Old part" for old parts checklist items.
 - parameter: exact checklist parameter name.
 - evaluation: "X" when there is any deviation, deduction impact or relevant observation for that parameter. Otherwise "V".
-- observations: concise aggregated observation. Empty string if evaluation is "V".
-- countermeasures: concise practical countermeasure. Empty string if evaluation is "V".
+- observations: concise aggregated summary of the actual observations. Empty string if evaluation is "V".
+- countermeasures: concise practical countermeasure directly linked to the summarized observations. Empty string if evaluation is "V".
+
+For rows with evaluation "X":
+- observations must explain the nature of the issue, not the number of affected claims.
+- countermeasures must be specific enough to guide the dealer.
+- If observations are heterogeneous, summarize them as different cases without listing every claim one by one.
+- Mention claim IDs only if it is necessary to clarify a unique or critical case; otherwise summarize the pattern.
 
 Return also action_plan_es and action_plan_en as readable Markdown tables with columns:
 Audited parameters | Evaluation | Observations | Countermeasures
+
+
+CAUTIOUS WORDING RULES:
+- This is not a formal corrective action plan. It is an executive summary of observations and follow-up areas.
+- The Countermeasures column should be written as suggested follow-up / improvement lines, not as imposed sanctions.
+- Use wording such as: revisar, reforzar, asegurar, estandarizar, verificar, mejorar la consistencia / review, reinforce, ensure, standardise, verify, improve consistency.
+- Avoid wording such as: sancionar, incumplimiento grave, obligación inmediata, the dealer failed, mandatory sanction.
+- Do not include claims without observations in narrative sections. They are represented only in global scores.
+- If an item has a low score but no observation, do not invent the reason. State cautiously that the score indicates a deviation without a specific note, only if needed.
 
 REPORT FORMAT:
 - report_es and report_en must be highly readable.
 - Use short plain headings and short bullet points.
 - Recommended structure: Executive summary, Main findings, Main improvement areas, Conclusion.
+- The report may mention global scores and main weak areas, but the action plan must be qualitative and based on observations.
 
 Return ONLY valid JSON with this exact structure:
 {{
@@ -1625,7 +1790,6 @@ For claim_comments_en:
 Audit data JSON:
 {json.dumps(payload, ensure_ascii=False, indent=2, default=json_default_serializer)}
 """.strip()
-
 
 def generate_gemini_audit_outputs(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, api_key: str, model: str = GEMINI_MODEL_DEFAULT) -> Tuple[bool, str]:
     """Llama a Gemini y guarda informe/plan ES-EN en session_state."""
@@ -1777,10 +1941,21 @@ def build_action_plan_rows(claims: Dict[str, Dict[str, Any]], language: str = "e
                     else:
                         entries.append(f"{claim_id}: {status}, no specific observation.")
         if affected_claims:
-            if language == "es":
-                exception = f"{affected_claims} claim(s) con desviación u observación. Puntos perdidos: {total_lost}."
+            if entries:
+                preview_entries = []
+                seen_preview = set()
+                for entry in entries:
+                    # Quitamos el identificador de claim para obtener un resumen más útil.
+                    text_after_claim = entry.split(":", 1)[1].strip() if ":" in entry else entry
+                    norm_preview = normalize_text(text_after_claim)
+                    if norm_preview and norm_preview not in seen_preview:
+                        preview_entries.append(text_after_claim)
+                        seen_preview.add(norm_preview)
+                    if len(preview_entries) >= 3:
+                        break
+                exception = " / ".join(preview_entries)
             else:
-                exception = f"{affected_claims} claim(s) with deviation or observation. Lost points: {total_lost}."
+                exception = TEXT[language]["generic_countermeasure"]
             rows.append({
                 "block": block_label(check.block_key, language),
                 "parameter": check_label(check, language),
@@ -1901,18 +2076,16 @@ def build_action_plan_scorecard_rows(claims: Dict[str, Dict[str, Any]], language
                 if norm and norm not in seen:
                     unique_comments.append(comment)
                     seen.add(norm)
-            if language == "es":
-                observation = f"Se detectan desviaciones u observaciones en {affected_claims} claim(s)."
-                if total_lost:
-                    observation += f" Puntos perdidos: {total_lost}."
-                if unique_comments:
-                    observation += " " + " / ".join(unique_comments[:3])
+            if unique_comments:
+                if len(unique_comments) == 1:
+                    observation = unique_comments[0]
+                else:
+                    observation = " / ".join(unique_comments[:4])
             else:
-                observation = f"Deviations or observations were identified in {affected_claims} claim(s)."
-                if total_lost:
-                    observation += f" Lost points: {total_lost}."
-                if unique_comments:
-                    observation += " " + " / ".join(unique_comments[:3])
+                if language == "es":
+                    observation = "El apartado no cumple completamente el criterio de auditoría, aunque no se ha registrado una observación específica."
+                else:
+                    observation = "The item does not fully meet the audit criterion, although no specific observation has been recorded."
             countermeasure = COUNTERMEASURES.get(check.key, {}).get(language, TEXT[language]["generic_countermeasure"])
         else:
             observation = ""
@@ -2315,7 +2488,7 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
         # Improvement of claim issues III - página 3 / plan de acción
         # ------------------------------------------------------------------
         imp_ws = workbook.add_worksheet("Improvement of claim issues III")
-        imp_ws.merge_range("A1:E1", "Action Plan" if language == "en" else "Plan de acción", fmt_title)
+        imp_ws.merge_range("A1:E1", "Summary of observations and follow-up areas" if language == "en" else "Resumen de observaciones y áreas de seguimiento", fmt_title)
         set_widths(imp_ws, [14, 34, 14, 85, 85])
 
         imp_headers = [
@@ -2857,12 +3030,12 @@ def render_comments_editor(claim: Dict[str, Any]):
 
 
 def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, base_name: str, audit_date_value: Any = None):
-    st.subheader("Informe y plan de acción")
+    st.subheader("Informe y resumen de observaciones")
 
     with st.expander("✨ Generación con Gemini", expanded=not bool(get_ai_report_for_language("es"))):
         st.caption(
             "Gemini no cambia las puntuaciones. Solo redacta el informe ejecutivo, "
-            "resume las observaciones, traduce al inglés y propone un plan de acción con la estructura de la checklist."
+            "resume las observaciones, traduce al inglés y genera una tabla de seguimiento con la estructura de la checklist."
         )
         secret_key = get_secret_value("GEMINI_API_KEY", "GOOGLE_API_KEY")
         if secret_key:
@@ -2903,7 +3076,7 @@ def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, de
             else:
                 st.caption("Si no generas con Gemini, se usa el informe básico automático.")
 
-    tabs = st.tabs(["Informe español", "Report English", "Plan acción ES", "Action plan EN"])
+    tabs = st.tabs(["Informe español", "Report English", "Seguimiento ES", "Follow-up EN"])
     with tabs[0]:
         report_es = generate_text_report(claims, audit_name, dealer, auditor, "es", audit_date_value)
         st.markdown(report_es)
