@@ -2490,6 +2490,15 @@ def add_docx_table(doc, rows: List[List[Any]], header: bool = True, font_size: f
     doc.add_paragraph()
 
 
+
+def python_docx_available() -> bool:
+    """Comprueba si python-docx está instalado antes de mostrar/generar descargas Word."""
+    try:
+        import docx  # noqa: F401
+        return True
+    except Exception:
+        return False
+
 def export_word_report_docx(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, language: str = "es", audit_date_value: Any = None) -> bytes:
     """Genera un informe Word presentable con resumen, plan de acción y firma."""
     try:
@@ -2883,11 +2892,27 @@ def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, de
     with tabs[0]:
         report_es = generate_text_report(claims, audit_name, dealer, auditor, "es", audit_date_value)
         st.markdown(report_es)
-        st.download_button("Descargar informe ES .docx", data=export_word_report_docx(claims, audit_name, dealer, auditor, "es", audit_date_value), file_name=f"{base_name}_ES_informe.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        if python_docx_available():
+            st.download_button(
+                "Descargar informe ES .docx",
+                data=export_word_report_docx(claims, audit_name, dealer, auditor, "es", audit_date_value),
+                file_name=f"{base_name}_ES_informe.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        else:
+            st.warning("Para descargar el informe Word, añade `python-docx` al requirements.txt y reinicia la app.")
     with tabs[1]:
         report_en = generate_text_report(claims, audit_name, dealer, auditor, "en", audit_date_value)
         st.markdown(report_en)
-        st.download_button("Download EN report .docx", data=export_word_report_docx(claims, audit_name, dealer, auditor, "en", audit_date_value), file_name=f"{base_name}_EN_report.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        if python_docx_available():
+            st.download_button(
+                "Download EN report .docx",
+                data=export_word_report_docx(claims, audit_name, dealer, auditor, "en", audit_date_value),
+                file_name=f"{base_name}_EN_report.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        else:
+            st.warning("To download the Word report, add `python-docx` to requirements.txt and restart the app.")
     with tabs[2]:
         action_rows_es = build_action_plan_scorecard_rows(claims, "es")
         st.dataframe(pd.DataFrame(action_rows_es).rename(columns={
@@ -3078,7 +3103,15 @@ def main():
         st.download_button("🇪🇸 Boletín ES para dealer", data=export_scorecard_excel(claims, audit_name, dealer, auditor, "es", audit_date_value), file_name=f"{base_name}_ES_boletin.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.download_button("🇬🇧 Scorecard EN para HQ", data=export_scorecard_excel(claims, audit_name, dealer, auditor, "en", audit_date_value), file_name=f"{base_name}_EN_scorecard.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.download_button("Exportar analítico ES", data=export_analytical_excel(claims, audit_name, dealer, auditor, "es", audit_date_value), file_name=f"{base_name}_ES_analitico.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.download_button("Exportar paquete ES+EN (.zip)", data=export_bilingual_package_zip(claims, audit_name, dealer, auditor, audit_date_value), file_name=f"{base_name}_ES_EN.zip", mime="application/zip")
+        if python_docx_available():
+            st.download_button(
+                "Exportar paquete ES+EN (.zip)",
+                data=export_bilingual_package_zip(claims, audit_name, dealer, auditor, audit_date_value),
+                file_name=f"{base_name}_ES_EN.zip",
+                mime="application/zip",
+            )
+        else:
+            st.warning("El ZIP incluye informes Word. Añade `python-docx` al requirements.txt y reinicia la app para habilitar esta descarga.")
 
     with right:
         claim = claims[st.session_state.selected_claim]
