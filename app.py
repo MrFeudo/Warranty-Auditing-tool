@@ -3,7 +3,7 @@
 Warranty Audit Assistant - versión interna bilingüe
 
 Instalación:
-    py -m pip install streamlit pandas openpyxl xlsxwriter google-genai
+    py -m pip install streamlit pandas openpyxl xlsxwriter google-genai python-docx
 
 Ejecución:
     streamlit run app.py
@@ -33,7 +33,7 @@ import re
 import zipfile
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -461,6 +461,37 @@ def sanitize_for_filename(value: Any, fallback: str = "item") -> str:
 def build_audit_file_basename(dealer: str, auditor: str, when: Optional[datetime] = None) -> str:
     when = when or datetime.now()
     return f"{sanitize_for_filename(dealer, 'Dealer')}_{when.strftime('%Y%m%d')}_{sanitize_for_filename(auditor, 'Auditor')}"
+
+
+
+def parse_audit_date(value: Any) -> date:
+    """Devuelve una fecha válida para la auditoría."""
+    if isinstance(value, date):
+        return value
+    text = safe_str(value)
+    if text:
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(text, fmt).date()
+            except Exception:
+                pass
+    return datetime.now().date()
+
+
+def audit_date_to_text(value: Any, language: str = "es") -> str:
+    audit_date = parse_audit_date(value)
+    if language == "en":
+        return audit_date.strftime("%Y-%m-%d")
+    return audit_date.strftime("%d/%m/%Y")
+
+
+def build_audit_file_basename_from_date(dealer: str, auditor: str, audit_date_value: Any = None) -> str:
+    audit_date = parse_audit_date(audit_date_value)
+    return build_audit_file_basename(
+        dealer,
+        auditor,
+        datetime.combine(audit_date, datetime.min.time()),
+    )
 
 
 
@@ -1103,19 +1134,25 @@ def normalize_loaded_claim(raw_claim: Any, fallback: str = "") -> Optional[Dict[
     return claim
 
 
-def serialize_audit_workfile(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> bytes:
+def serialize_audit_workfile(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, audit_date_value: Any = None) -> bytes:
     sync_all_claims_from_widget_state(claims)
+    audit_date = parse_audit_date(audit_date_value).isoformat()
     payload = {
         "file_type": "warranty_audit_workfile",
-        "version": 2,
+        "version": 3,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
-        "audit": {"audit_name": audit_name or "", "dealer": dealer or "", "auditor": auditor or ""},
+        "audit": {
+            "audit_name": audit_name or "",
+            "dealer": dealer or "",
+            "auditor": auditor or "",
+            "audit_date": audit_date,
+        },
         "claims": claims,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
 
-def load_audit_workfile(uploaded_file) -> Tuple[Dict[str, Dict[str, Any]], str, str, str]:
+def load_audit_workfile(uploaded_file) -> Tuple[Dict[str, Dict[str, Any]], str, str, str, date]:
     content = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
     if isinstance(content, bytes):
         content = content.decode("utf-8")
@@ -1137,6 +1174,7 @@ def load_audit_workfile(uploaded_file) -> Tuple[Dict[str, Dict[str, Any]], str, 
         safe_str(audit.get("audit_name", "Auditoría garantías")) or "Auditoría garantías",
         safe_str(audit.get("dealer", "")),
         safe_str(audit.get("auditor", "")),
+        parse_audit_date(audit.get("audit_date", datetime.now().date().isoformat())),
     )
 
 
@@ -2022,7 +2060,7 @@ def build_detail_dataframe(claims: Dict[str, Dict[str, Any]], language: str = "e
     return pd.DataFrame(rows)
 
 
-def export_analytical_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, language: str = "es") -> bytes:
+def export_analytical_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, language: str = "es", audit_date_value: Any = None) -> bytes:
     output = BytesIO()
     t = TEXT[language]
     audit_score = calculate_audit_score(claims)
@@ -2036,6 +2074,7 @@ def export_analytical_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, 
         {"Campo" if language == "es" else "Field": t["report_title"], "Valor" if language == "es" else "Value": audit_name},
         {"Campo" if language == "es" else "Field": t["dealer"], "Valor" if language == "es" else "Value": dealer},
         {"Campo" if language == "es" else "Field": "Auditor", "Valor" if language == "es" else "Value": auditor},
+        {"Campo" if language == "es" else "Field": "Fecha auditoría" if language == "es" else "Audit date", "Valor" if language == "es" else "Value": audit_date_to_text(audit_date_value, language)},
         {"Campo" if language == "es" else "Field": "Fecha exportación" if language == "es" else "Export date", "Valor" if language == "es" else "Value": datetime.now().strftime("%Y-%m-%d %H:%M")},
         {"Campo" if language == "es" else "Field": "Resultado", "Valor" if language == "es" else "Value": f"{audit_score['success_percent']:.1f}% ({audit_score['total_points']}/{audit_score['max_points']})"},
         {"Campo" if language == "es" else "Field": "Deducción total registrada" if language == "es" else "Total registered deduction", "Valor" if language == "es" else "Value": f"{sum(claim_deduction_amount(c) for c in claims.values()):.2f}"},
@@ -2077,7 +2116,7 @@ def export_analytical_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, 
     return output.getvalue()
 
 
-def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, language: str = "es") -> bytes:
+def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, language: str = "es", audit_date_value: Any = None) -> bytes:
     output = BytesIO()
     workbook = None
     t = TEXT[language]
@@ -2178,6 +2217,7 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             ["Audit name" if language == "en" else "Auditoría", audit_name or ""],
             [t["dealer"], dealer or ""],
             ["Auditor", auditor or ""],
+            ["Audit date" if language == "en" else "Fecha auditoría", audit_date_to_text(audit_date_value, language)],
             ["Export date" if language == "en" else "Fecha exportación", datetime.now().strftime("%Y-%m-%d %H:%M")],
             ["Scoring rule" if language == "en" else "Regla de puntuación", "Claim document checklist I = 58 / Claim old parts checklist II = 42 / Total = 100"],
             ["N/A rule" if language == "en" else "Regla N/A", "No aplica = maximum score" if language == "en" else "No aplica = puntuación máxima del apartado"],
@@ -2324,7 +2364,7 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             workbook.close()
 
 
-def generate_text_report(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, language: str = "es") -> str:
+def generate_text_report(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, language: str = "es", audit_date_value: Any = None) -> str:
     ai_report = get_ai_report_for_language(language)
     if ai_report:
         return ai_report
@@ -2337,6 +2377,7 @@ def generate_text_report(claims: Dict[str, Dict[str, Any]], audit_name: str, dea
     lines = []
     lines.append(f"{t['report_title']}: {audit_name or 'Warranty audit'}")
     lines.append(f"{t['dealer']}: {dealer or ('No informado' if language == 'es' else 'Not reported')}")
+    lines.append(f"{'Fecha auditoría' if language == 'es' else 'Audit date'}: {audit_date_to_text(audit_date_value, language)}")
     lines.append(f"Auditor: {auditor or ('No informado' if language == 'es' else 'Not reported')}")
     lines.append("")
     lines.append(t["executive_summary"])
@@ -2386,17 +2427,167 @@ def generate_text_report(claims: Dict[str, Dict[str, Any]], audit_name: str, dea
     return "\n".join(lines)
 
 
-def export_bilingual_package_zip(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str) -> bytes:
+def clean_markdown_inline(text: Any) -> str:
+    """Limpieza sencilla para que el Word no muestre marcas Markdown."""
+    value = safe_str(text)
+    value = re.sub(r"\*\*(.*?)\*\*", r"\1", value)
+    value = re.sub(r"__(.*?)__", r"\1", value)
+    value = re.sub(r"`([^`]*)`", r"\1", value)
+    return value.strip()
+
+
+def add_markdown_like_text_to_doc(doc, text: str, language: str = "es") -> None:
+    """Convierte un texto Markdown/plain sencillo a párrafos y bullet points en Word."""
+    heading_markers = {
+        "es": ["resumen ejecutivo", "principales hallazgos", "principales areas", "principales áreas", "conclusion", "conclusión", "resultado por bloque", "claims con menor puntuacion", "claims con menor puntuación"],
+        "en": ["executive summary", "main findings", "main improvement areas", "conclusion", "result by section", "lowest scoring claims"],
+    }
+    markers = heading_markers.get(language, heading_markers["es"])
+
+    for raw_line in safe_str(text).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # Quitar títulos principales repetidos tipo "Informe de auditoría: ..." porque el Word ya lleva portada/cabecera.
+        low = normalize_text(line)
+        if low.startswith("informe de auditoria") or low.startswith("audit report") or low.startswith("dealer") or low.startswith("auditor") or low.startswith("fecha auditoria") or low.startswith("audit date"):
+            continue
+
+        if line.startswith("###"):
+            doc.add_heading(clean_markdown_inline(line.lstrip("# ")), level=3)
+        elif line.startswith("##"):
+            doc.add_heading(clean_markdown_inline(line.lstrip("# ")), level=2)
+        elif line.startswith("#"):
+            doc.add_heading(clean_markdown_inline(line.lstrip("# ")), level=1)
+        elif any(low == marker or low.startswith(marker + " ") for marker in markers):
+            doc.add_heading(clean_markdown_inline(line.rstrip(":")), level=2)
+        elif re.match(r"^[-*]\s+", line):
+            doc.add_paragraph(clean_markdown_inline(re.sub(r"^[-*]\s+", "", line)), style="List Bullet")
+        elif re.match(r"^\d+[.)]\s+", line):
+            doc.add_paragraph(clean_markdown_inline(re.sub(r"^\d+[.)]\s+", "", line)), style="List Number")
+        else:
+            doc.add_paragraph(clean_markdown_inline(line))
+
+
+def add_docx_table(doc, rows: List[List[Any]], header: bool = True, font_size: float = 9.0) -> None:
+    if not rows:
+        return
+    from docx.shared import Pt
+
+    table = doc.add_table(rows=0, cols=len(rows[0]))
+    table.style = "Table Grid"
+    for row_index, row_values in enumerate(rows):
+        cells = table.add_row().cells
+        for col_index, value in enumerate(row_values):
+            cell_text = clean_markdown_inline(value)
+            cells[col_index].text = cell_text
+            for paragraph in cells[col_index].paragraphs:
+                for run in paragraph.runs:
+                    run.font.size = Pt(font_size)
+                    if header and row_index == 0:
+                        run.bold = True
+    doc.add_paragraph()
+
+
+def export_word_report_docx(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, language: str = "es", audit_date_value: Any = None) -> bytes:
+    """Genera un informe Word presentable con resumen, plan de acción y firma."""
+    try:
+        from docx import Document
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.shared import Cm, Pt
+    except Exception as exc:
+        raise RuntimeError("Para generar Word añade python-docx al requirements.txt") from exc
+
+    sync_all_claims_from_widget_state(claims)
+    t = TEXT[language]
+    audit_score = calculate_audit_score(claims)
+    report_text = generate_text_report(claims, audit_name, dealer, auditor, language, audit_date_value)
+    action_rows = build_action_plan_scorecard_rows(claims, language)
+
+    doc = Document()
+    section = doc.sections[0]
+    section.top_margin = Cm(1.8)
+    section.bottom_margin = Cm(1.6)
+    section.left_margin = Cm(1.7)
+    section.right_margin = Cm(1.7)
+
+    styles = doc.styles
+    styles["Normal"].font.name = "Aptos"
+    styles["Normal"].font.size = Pt(10.5)
+    for style_name in ["Title", "Heading 1", "Heading 2", "Heading 3"]:
+        try:
+            styles[style_name].font.name = "Aptos Display"
+        except Exception:
+            pass
+
+    title_text = "Informe de auditoría de garantías" if language == "es" else "Warranty audit report"
+    subtitle_text = audit_name or ("Auditoría garantías" if language == "es" else "Warranty audit")
+
+    title = doc.add_heading(title_text, level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subtitle = doc.add_paragraph(subtitle_text)
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    meta_rows = [
+        [t["dealer"], dealer or ("No informado" if language == "es" else "Not reported")],
+        ["Fecha auditoría" if language == "es" else "Audit date", audit_date_to_text(audit_date_value, language)],
+        ["Auditor / firma" if language == "es" else "Auditor / signature", auditor or ("No informado" if language == "es" else "Not reported")],
+        ["Resultado global" if language == "es" else "Global result", f"{audit_score['success_percent']:.1f}% ({audit_score['total_points']}/{audit_score['max_points']})"],
+        [TEXT[language]["document_section"], f"{audit_score['doc_points']}/{audit_score['claims'] * MAX_DOCUMENT_POINTS}"],
+        [TEXT[language]["old_parts_section"], f"{audit_score['old_points']}/{audit_score['claims'] * MAX_OLD_PARTS_POINTS}"],
+    ]
+    add_docx_table(doc, [["Campo" if language == "es" else "Field", "Valor" if language == "es" else "Value"], *meta_rows], font_size=9.5)
+
+    doc.add_heading("Resumen ejecutivo" if language == "es" else "Executive summary", level=1)
+    add_markdown_like_text_to_doc(doc, report_text, language)
+
+    doc.add_page_break()
+    doc.add_heading("Plan de acción" if language == "es" else "Action plan", level=1)
+    if language == "es":
+        headers = ["Grupo", "Parámetros auditados", "Evaluación", "Observaciones", "Contramedidas"]
+    else:
+        headers = ["Group", "Audited parameters", "Evaluation", "Observations", "Countermeasures"]
+    plan_table_rows = [headers]
+    for item in action_rows:
+        plan_table_rows.append([
+            item.get("group", ""),
+            item.get("parameter", ""),
+            item.get("evaluation", ""),
+            item.get("observations", ""),
+            item.get("countermeasures", ""),
+        ])
+    add_docx_table(doc, plan_table_rows, font_size=8.5)
+
+    doc.add_paragraph()
+    doc.add_heading("Firma" if language == "es" else "Signature", level=2)
+    signature = doc.add_paragraph()
+    signature.add_run(auditor or ("Auditor" if language == "en" else "Auditor")).bold = True
+    signature.add_run("\n")
+    signature.add_run(("NSC Warranty" if language == "en" else "NSC Warranty"))
+    signature.add_run("\n")
+    signature.add_run(("Fecha: " if language == "es" else "Date: ") + audit_date_to_text(audit_date_value, language))
+
+    footer = section.footer.paragraphs[0]
+    footer.text = f"{title_text} · {dealer or 'Dealer'} · {audit_date_to_text(audit_date_value, language)}"
+    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
     output = BytesIO()
-    base_name = build_audit_file_basename(dealer, auditor)
+    doc.save(output)
+    return output.getvalue()
+
+
+def export_bilingual_package_zip(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, audit_date_value: Any = None) -> bytes:
+    output = BytesIO()
+    base_name = build_audit_file_basename_from_date(dealer, auditor, audit_date_value)
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-        zip_file.writestr(f"{base_name}/{base_name}.json", serialize_audit_workfile(claims, audit_name, dealer, auditor))
-        zip_file.writestr(f"{base_name}/{base_name}_ES_boletin.xlsx", export_scorecard_excel(claims, audit_name, dealer, auditor, "es"))
-        zip_file.writestr(f"{base_name}/{base_name}_EN_scorecard.xlsx", export_scorecard_excel(claims, audit_name, dealer, auditor, "en"))
-        zip_file.writestr(f"{base_name}/{base_name}_ES_informe.txt", generate_text_report(claims, audit_name, dealer, auditor, "es").encode("utf-8"))
-        zip_file.writestr(f"{base_name}/{base_name}_EN_report.txt", generate_text_report(claims, audit_name, dealer, auditor, "en").encode("utf-8"))
-        zip_file.writestr(f"{base_name}/{base_name}_ES_analitico.xlsx", export_analytical_excel(claims, audit_name, dealer, auditor, "es"))
-        zip_file.writestr(f"{base_name}/{base_name}_EN_analytical.xlsx", export_analytical_excel(claims, audit_name, dealer, auditor, "en"))
+        zip_file.writestr(f"{base_name}/{base_name}.json", serialize_audit_workfile(claims, audit_name, dealer, auditor, audit_date_value))
+        zip_file.writestr(f"{base_name}/{base_name}_ES_boletin.xlsx", export_scorecard_excel(claims, audit_name, dealer, auditor, "es", audit_date_value))
+        zip_file.writestr(f"{base_name}/{base_name}_EN_scorecard.xlsx", export_scorecard_excel(claims, audit_name, dealer, auditor, "en", audit_date_value))
+        zip_file.writestr(f"{base_name}/{base_name}_ES_informe.docx", export_word_report_docx(claims, audit_name, dealer, auditor, "es", audit_date_value))
+        zip_file.writestr(f"{base_name}/{base_name}_EN_report.docx", export_word_report_docx(claims, audit_name, dealer, auditor, "en", audit_date_value))
+        zip_file.writestr(f"{base_name}/{base_name}_ES_analitico.xlsx", export_analytical_excel(claims, audit_name, dealer, auditor, "es", audit_date_value))
+        zip_file.writestr(f"{base_name}/{base_name}_EN_analytical.xlsx", export_analytical_excel(claims, audit_name, dealer, auditor, "en", audit_date_value))
     return output.getvalue()
 
 
@@ -2411,6 +2602,7 @@ def init_state():
     st.session_state.setdefault("audit_name", "Auditoría garantías")
     st.session_state.setdefault("audit_dealer", "")
     st.session_state.setdefault("audit_auditor", "")
+    st.session_state.setdefault("audit_date", datetime.now().date())
     st.session_state.setdefault("audit_section_index", 0)
     st.session_state.setdefault("claim_paste_editor_version", 0)
 
@@ -2640,7 +2832,7 @@ def render_comments_editor(claim: Dict[str, Any]):
         )
 
 
-def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, base_name: str):
+def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, base_name: str, audit_date_value: Any = None):
     st.subheader("Informe y plan de acción")
 
     with st.expander("✨ Generación con Gemini", expanded=not bool(get_ai_report_for_language("es"))):
@@ -2689,13 +2881,13 @@ def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, de
 
     tabs = st.tabs(["Informe español", "Report English", "Plan acción ES", "Action plan EN"])
     with tabs[0]:
-        report_es = generate_text_report(claims, audit_name, dealer, auditor, "es")
+        report_es = generate_text_report(claims, audit_name, dealer, auditor, "es", audit_date_value)
         st.markdown(report_es)
-        st.download_button("Descargar informe ES .txt", data=report_es.encode("utf-8"), file_name=f"{base_name}_ES_informe.txt", mime="text/plain")
+        st.download_button("Descargar informe ES .docx", data=export_word_report_docx(claims, audit_name, dealer, auditor, "es", audit_date_value), file_name=f"{base_name}_ES_informe.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     with tabs[1]:
-        report_en = generate_text_report(claims, audit_name, dealer, auditor, "en")
+        report_en = generate_text_report(claims, audit_name, dealer, auditor, "en", audit_date_value)
         st.markdown(report_en)
-        st.download_button("Download EN report .txt", data=report_en.encode("utf-8"), file_name=f"{base_name}_EN_report.txt", mime="text/plain")
+        st.download_button("Download EN report .docx", data=export_word_report_docx(claims, audit_name, dealer, auditor, "en", audit_date_value), file_name=f"{base_name}_EN_report.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     with tabs[2]:
         action_rows_es = build_action_plan_scorecard_rows(claims, "es")
         st.dataframe(pd.DataFrame(action_rows_es).rename(columns={
@@ -2808,6 +3000,10 @@ def main():
     with st.sidebar:
         st.header("Auditoría")
         st.session_state.audit_name = st.text_input("Nombre auditoría", value=st.session_state.audit_name)
+        st.session_state.audit_date = st.date_input(
+            "Fecha auditoría",
+            value=parse_audit_date(st.session_state.get("audit_date", datetime.now().date())),
+        )
         dealer_options = get_dealer_options(st.session_state.audit_dealer)
         if st.session_state.audit_dealer not in dealer_options:
             dealer_options.insert(1, st.session_state.audit_dealer)
@@ -2816,18 +3012,20 @@ def main():
         dealer = safe_str(st.session_state.audit_dealer)
         auditor = safe_str(st.session_state.audit_auditor)
         audit_name = safe_str(st.session_state.audit_name)
-        base_name = build_audit_file_basename(dealer, auditor)
+        audit_date_value = parse_audit_date(st.session_state.get("audit_date", datetime.now().date()))
+        base_name = build_audit_file_basename_from_date(dealer, auditor, audit_date_value)
 
         st.divider()
         st.subheader("Cargar / continuar")
         workfile = st.file_uploader("Cargar auditoría guardada (.json)", type=["json"], key="workfile_upload")
         if workfile is not None and st.button("Cargar JSON"):
             try:
-                claims, loaded_name, loaded_dealer, loaded_auditor = load_audit_workfile(workfile)
+                claims, loaded_name, loaded_dealer, loaded_auditor, loaded_date = load_audit_workfile(workfile)
                 st.session_state.claims = claims
                 st.session_state.audit_name = loaded_name
                 st.session_state.audit_dealer = loaded_dealer
                 st.session_state.audit_auditor = loaded_auditor
+                st.session_state.audit_date = loaded_date
                 st.session_state.selected_claim = next(iter(claims.keys()))
                 st.success(f"Auditoría cargada: {len(claims)} claims.")
                 st.rerun()
@@ -2876,11 +3074,11 @@ def main():
         selected_claim = st.selectbox("Seleccionar claim", claim_options, index=claim_options.index(st.session_state.selected_claim), format_func=display_claim_option)
         st.session_state.selected_claim = selected_claim
 
-        st.download_button("💾 Guardar progreso editable (.json)", data=serialize_audit_workfile(claims, audit_name, dealer, auditor), file_name=f"{base_name}.json", mime="application/json")
-        st.download_button("🇪🇸 Boletín ES para dealer", data=export_scorecard_excel(claims, audit_name, dealer, auditor, "es"), file_name=f"{base_name}_ES_boletin.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.download_button("🇬🇧 Scorecard EN para HQ", data=export_scorecard_excel(claims, audit_name, dealer, auditor, "en"), file_name=f"{base_name}_EN_scorecard.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.download_button("Exportar analítico ES", data=export_analytical_excel(claims, audit_name, dealer, auditor, "es"), file_name=f"{base_name}_ES_analitico.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.download_button("Exportar paquete ES+EN (.zip)", data=export_bilingual_package_zip(claims, audit_name, dealer, auditor), file_name=f"{base_name}_ES_EN.zip", mime="application/zip")
+        st.download_button("💾 Guardar progreso editable (.json)", data=serialize_audit_workfile(claims, audit_name, dealer, auditor, audit_date_value), file_name=f"{base_name}.json", mime="application/json")
+        st.download_button("🇪🇸 Boletín ES para dealer", data=export_scorecard_excel(claims, audit_name, dealer, auditor, "es", audit_date_value), file_name=f"{base_name}_ES_boletin.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("🇬🇧 Scorecard EN para HQ", data=export_scorecard_excel(claims, audit_name, dealer, auditor, "en", audit_date_value), file_name=f"{base_name}_EN_scorecard.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("Exportar analítico ES", data=export_analytical_excel(claims, audit_name, dealer, auditor, "es", audit_date_value), file_name=f"{base_name}_ES_analitico.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("Exportar paquete ES+EN (.zip)", data=export_bilingual_package_zip(claims, audit_name, dealer, auditor, audit_date_value), file_name=f"{base_name}_ES_EN.zip", mime="application/zip")
 
     with right:
         claim = claims[st.session_state.selected_claim]
@@ -2931,7 +3129,7 @@ def main():
         elif selected_section == "Comentarios":
             render_comments_editor(claim)
         elif selected_section == "Informe":
-            render_report_section(claims, audit_name, dealer, auditor, base_name)
+            render_report_section(claims, audit_name, dealer, auditor, base_name, audit_date_value)
 
         st.divider()
         nav_section_cols = st.columns([1, 1, 2])
