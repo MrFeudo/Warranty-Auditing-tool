@@ -23,10 +23,12 @@ Qué hace:
 - Rellena la hoja/page 3 "Improvement of claim issues III" con las observaciones de los campos.
 - En exportaciones EN, traduce las observaciones con un glosario local de auditoría.
 - Permite registrar deducción parcial o total. El botón "No es garantía" pone la claim a 0/100 y marca deducción total.
+- Permite adjuntar hasta 2 evidencias por claim y apartado, incluyéndolas en el ZIP final.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -197,6 +199,7 @@ MAX_OLD_PARTS_POINTS = sum(check.max_points for check in OLD_PARTS_CHECKS)
 MAX_TOTAL_POINTS = MAX_DOCUMENT_POINTS + MAX_OLD_PARTS_POINTS
 
 GEMINI_MODEL_DEFAULT = "gemini-2.5-flash"
+MAX_EVIDENCE_FILES_PER_CHECK = 2
 
 # =============================================================================
 # CONTEXTO TÉCNICO COMPACTO DE POLÍTICA PARA GEMINI
@@ -352,6 +355,7 @@ TEXT = {
         "result": "Resultado",
         "pending": "Pendientes",
         "comments": "Comentarios",
+        "evidences": "Evidencias",
         "action_plan_title": "Plan de mejora",
         "auditable_list": "Lista de parámetros auditables",
         "exception_comments": "Excepciones/comentarios",
@@ -401,6 +405,7 @@ TEXT = {
         "result": "Result",
         "pending": "Pending items",
         "comments": "Comments",
+        "evidences": "Evidence files",
         "action_plan_title": "Improvement plan",
         "auditable_list": "Auditable parameter list",
         "exception_comments": "Exceptions/comments",
@@ -540,6 +545,128 @@ def sanitize_for_filename(value: Any, fallback: str = "item") -> str:
 def build_audit_file_basename(dealer: str, auditor: str, when: Optional[datetime] = None) -> str:
     when = when or datetime.now()
     return f"{sanitize_for_filename(dealer, 'Dealer')}_{when.strftime('%Y%m%d')}_{sanitize_for_filename(auditor, 'Auditor')}"
+
+
+
+def normalize_evidence_filename(filename: Any, fallback: str = "evidence.bin") -> str:
+    """Nombre seguro para guardar evidencias dentro del ZIP."""
+    raw = safe_str(filename) or fallback
+    name = sanitize_for_filename(raw, fallback)
+    # Evitar nombres raros tipo solo puntos/espacios.
+    name = name.strip(". _-") or fallback
+    return name[:140]
+
+
+def uploaded_file_to_evidence_record(uploaded_file: Any) -> Optional[Dict[str, Any]]:
+    """Convierte un UploadedFile de Streamlit en un registro JSON/ZIP seguro."""
+    if uploaded_file is None:
+        return None
+    try:
+        content = uploaded_file.getvalue()
+    except Exception:
+        try:
+            content = uploaded_file.read()
+        except Exception:
+            content = b""
+    if not content:
+        return None
+    filename = normalize_evidence_filename(getattr(uploaded_file, "name", "evidence.bin"))
+    return {
+        "filename": filename,
+        "content_type": safe_str(getattr(uploaded_file, "type", "")),
+        "size": int(len(content)),
+        "uploaded_at": datetime.now().isoformat(timespec="seconds"),
+        "data_b64": base64.b64encode(content).decode("ascii"),
+    }
+
+
+def normalize_evidence_record(raw: Any) -> Optional[Dict[str, Any]]:
+    """Normaliza evidencias cargadas desde el JSON editable."""
+    if not isinstance(raw, dict):
+        return None
+    data_b64 = safe_str(raw.get("data_b64", ""))
+    if not data_b64:
+        return None
+    filename = normalize_evidence_filename(raw.get("filename", "evidence.bin"))
+    try:
+        size = int(raw.get("size", 0) or 0)
+    except Exception:
+        size = 0
+    return {
+        "filename": filename,
+        "content_type": safe_str(raw.get("content_type", "")),
+        "size": size,
+        "uploaded_at": safe_str(raw.get("uploaded_at", "")),
+        "data_b64": data_b64,
+    }
+
+
+def get_check_evidences(claim: Dict[str, Any], check_key: str) -> List[Dict[str, Any]]:
+    evidences = claim.setdefault("evidences", {})
+    raw_items = evidences.get(check_key, [])
+    if not isinstance(raw_items, list):
+        raw_items = []
+    clean_items = []
+    for item in raw_items[:MAX_EVIDENCE_FILES_PER_CHECK]:
+        normalized = normalize_evidence_record(item)
+        if normalized:
+            clean_items.append(normalized)
+    evidences[check_key] = clean_items
+    return clean_items
+
+
+def evidence_count_for_claim(claim: Dict[str, Any]) -> int:
+    total = 0
+    evidences = claim.get("evidences", {})
+    if isinstance(evidences, dict):
+        for check_key in evidences:
+            total += len(get_check_evidences(claim, check_key))
+    return total
+
+
+def evidence_count_for_audit(claims: Dict[str, Dict[str, Any]]) -> int:
+    return sum(evidence_count_for_claim(claim) for claim in claims.values())
+
+
+def evidence_folder_name(claim: Dict[str, Any], check: AuditCheck) -> str:
+    local = sanitize_for_filename(claim.get("local_claim_no", ""), "SIN_ES")
+    hq = sanitize_for_filename(claim.get("hq_claim_no", ""), "SIN_HQ")
+    apartado = sanitize_for_filename(check.label_es, check.key)
+    return f"{local}_{hq}_{apartado}"
+
+
+def evidence_zip_path(base_name: str, claim: Dict[str, Any], check: AuditCheck, filename: str) -> str:
+    folder = evidence_folder_name(claim, check)
+    return f"{base_name}/Evidencias/{folder}/{normalize_evidence_filename(filename)}"
+
+
+def add_evidences_to_zip(zip_file: zipfile.ZipFile, base_name: str, claims: Dict[str, Dict[str, Any]]) -> int:
+    """Añade al ZIP las evidencias guardadas en cada claim/apartado."""
+    total = 0
+    for claim in claims.values():
+        for check in ALL_CHECKS:
+            records = get_check_evidences(claim, check.key)
+            if not records:
+                continue
+            used_names = set()
+            for idx, record in enumerate(records[:MAX_EVIDENCE_FILES_PER_CHECK], start=1):
+                filename = normalize_evidence_filename(record.get("filename", f"evidence_{idx}.bin"))
+                base, ext = os.path.splitext(filename)
+                candidate = filename
+                counter = 2
+                while candidate.lower() in used_names:
+                    candidate = f"{base}_{counter}{ext}"
+                    counter += 1
+                used_names.add(candidate.lower())
+                try:
+                    content = base64.b64decode(safe_str(record.get("data_b64", "")), validate=True)
+                except Exception:
+                    continue
+                if not content:
+                    continue
+                zip_file.writestr(evidence_zip_path(base_name, claim, check, candidate), content)
+                total += 1
+    return total
 
 
 
@@ -1116,6 +1243,7 @@ def empty_claim_record(claim_no: str = "", local_claim_no: str = "", hq_claim_no
         "submission_date": "",
         "general_comment": "",
         "internal_comment": "",
+        "evidences": {},
         "evaluations": {check.key: new_evaluation(check) for check in ALL_CHECKS},
     }
 
@@ -1223,6 +1351,22 @@ def normalize_loaded_claim(raw_claim: Any, fallback: str = "") -> Optional[Dict[
         for check in ALL_CHECKS:
             if check.key in raw_evaluations:
                 claim["evaluations"][check.key] = normalize_loaded_evaluation(check, raw_evaluations[check.key])
+
+    raw_evidences = raw_claim.get("evidences", {})
+    if isinstance(raw_evidences, dict):
+        clean_evidences = {}
+        for check in ALL_CHECKS:
+            records = raw_evidences.get(check.key, [])
+            if not isinstance(records, list):
+                continue
+            normalized_records = []
+            for item in records[:MAX_EVIDENCE_FILES_PER_CHECK]:
+                normalized = normalize_evidence_record(item)
+                if normalized:
+                    normalized_records.append(normalized)
+            if normalized_records:
+                clean_evidences[check.key] = normalized_records
+        claim["evidences"] = clean_evidences
     return claim
 
 
@@ -1231,7 +1375,7 @@ def serialize_audit_workfile(claims: Dict[str, Dict[str, Any]], audit_name: str,
     audit_date = parse_audit_date(audit_date_value).isoformat()
     payload = {
         "file_type": "warranty_audit_workfile",
-        "version": 3,
+        "version": 4,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
         "audit": {
             "audit_name": audit_name or "",
@@ -2211,6 +2355,7 @@ def build_summary_dataframe(claims: Dict[str, Dict[str, Any]], language: str = "
             t["result"]: result_label(score["total_points"], language),
             t["pending"]: " | ".join(pending_items_for_language(claim, language)),
             t["comments"]: general_comment_for_export(claim, language),
+            t["evidences"]: evidence_count_for_claim(claim),
         })
     return pd.DataFrame(rows)
 
@@ -2785,6 +2930,7 @@ def export_bilingual_package_zip(claims: Dict[str, Dict[str, Any]], audit_name: 
         zip_file.writestr(f"{base_name}/{base_name}_EN_report.docx", export_word_report_docx(claims, audit_name, dealer, auditor, "en", audit_date_value))
         zip_file.writestr(f"{base_name}/{base_name}_ES_analitico.xlsx", export_analytical_excel(claims, audit_name, dealer, auditor, "es", audit_date_value))
         zip_file.writestr(f"{base_name}/{base_name}_EN_analytical.xlsx", export_analytical_excel(claims, audit_name, dealer, auditor, "en", audit_date_value))
+        add_evidences_to_zip(zip_file, base_name, claims)
     return output.getvalue()
 
 
@@ -2802,6 +2948,7 @@ def init_state():
     st.session_state.setdefault("audit_date", datetime.now().date())
     st.session_state.setdefault("audit_section_index", 0)
     st.session_state.setdefault("claim_paste_editor_version", 0)
+    st.session_state.setdefault("evidence_uploader_version", 0)
 
 
 def clamp_index(index: Any, max_len: int) -> int:
@@ -2966,6 +3113,55 @@ def render_deduction_editor(claim: Dict[str, Any]):
             st.info("Deducción total seleccionada. Si conoces el importe de la claim, informa el importe a deducir.")
 
 
+
+def render_evidence_uploader(claim: Dict[str, Any], check: AuditCheck):
+    """Permite adjuntar hasta 2 evidencias por claim y apartado auditado."""
+    claim_key = make_claim_key(claim.get("local_claim_no"), claim.get("hq_claim_no"), claim.get("claim_no"))
+    evidences = get_check_evidences(claim, check.key)
+    evaluation = claim.get("evaluations", {}).get(check.key, {})
+    has_observation_context = bool(evaluation_comment(claim, check)) or safe_str(evaluation.get("option_key", "ok")) not in ("ok", "na")
+
+    with st.expander(f"📎 Evidencias del apartado ({len(evidences)}/{MAX_EVIDENCE_FILES_PER_CHECK})", expanded=bool(evidences)):
+        st.caption(
+            "Opcional. Sube como máximo 2 archivos para justificar este apartado. "
+            "Al exportar el ZIP se guardarán en una carpeta de evidencias por claim y apartado."
+        )
+        if not has_observation_context and not evidences:
+            st.caption("Tip: normalmente se usa cuando el apartado tiene observación, desviación o deducción asociada.")
+
+        uploader_key = f"evidence_upload_{st.session_state.get('evidence_uploader_version', 0)}_{claim_key}_{check.key}"
+        uploaded_files = st.file_uploader(
+            "Subir evidencias",
+            accept_multiple_files=True,
+            key=uploader_key,
+            label_visibility="collapsed",
+            help="Seleccionar archivos aquí reemplaza las evidencias guardadas para este apartado. Máximo 2.",
+        )
+        if uploaded_files:
+            if len(uploaded_files) > MAX_EVIDENCE_FILES_PER_CHECK:
+                st.warning(f"Solo se guardan los primeros {MAX_EVIDENCE_FILES_PER_CHECK} archivos de este apartado.")
+            records = []
+            for uploaded in uploaded_files[:MAX_EVIDENCE_FILES_PER_CHECK]:
+                record = uploaded_file_to_evidence_record(uploaded)
+                if record:
+                    records.append(record)
+            claim.setdefault("evidences", {})[check.key] = records
+            evidences = get_check_evidences(claim, check.key)
+            st.success(f"Guardadas {len(evidences)} evidencia(s) para este apartado.")
+
+        evidences = get_check_evidences(claim, check.key)
+        if evidences:
+            st.caption("Se guardará en el ZIP dentro de:")
+            st.code(f"Evidencias/{evidence_folder_name(claim, check)}/", language="text")
+            for idx, evidence in enumerate(evidences, start=1):
+                size_kb = int(round((evidence.get("size", 0) or 0) / 1024))
+                size_text = f" · {size_kb} KB" if size_kb else ""
+                st.write(f"{idx}. {evidence.get('filename', 'evidence.bin')}{size_text}")
+            if st.button("Eliminar evidencias de este apartado", key=f"clear_evidence_{claim_key}_{check.key}"):
+                claim.setdefault("evidences", {})[check.key] = []
+                st.session_state.evidence_uploader_version = st.session_state.get("evidence_uploader_version", 0) + 1
+                st.rerun()
+
 def render_check_editor(claim: Dict[str, Any], checks: List[AuditCheck]):
     claim_key = make_claim_key(claim.get("local_claim_no"), claim.get("hq_claim_no"), claim.get("claim_no"))
     for check in checks:
@@ -2975,7 +3171,7 @@ def render_check_editor(claim: Dict[str, Any], checks: List[AuditCheck]):
         current_label = option_display(current_option, "es")
         current_index = labels.index(current_label) if current_label in labels else 0
         with st.container(border=True):
-            cols = st.columns([2.2, 1.2, 2.8])
+            cols = st.columns([2.0, 1.1, 2.4, 1.7])
             with cols[0]:
                 st.markdown(f"**{check.label_es}**")
                 st.caption(f"Máximo: {check.max_points} puntos · {check.guidance_es}")
@@ -2995,6 +3191,8 @@ def render_check_editor(claim: Dict[str, Any], checks: List[AuditCheck]):
                 if comment_key not in st.session_state:
                     st.session_state[comment_key] = evaluation.get("comment", "")
                 evaluation["comment"] = st.text_area("Observación del apartado", key=comment_key, height=85)
+            with cols[3]:
+                render_evidence_uploader(claim, check)
 
     refresh_claim_general_comment(claim)
 
@@ -3278,7 +3476,7 @@ def main():
     with left:
         st.subheader("Claims")
         summary_df = build_summary_dataframe(claims, "es")
-        compact_cols = [TEXT["es"]["claim_no"], TEXT["es"]["other_id"], TEXT["es"]["dealer"], TEXT["es"]["deduction_amount"], TEXT["es"]["doc_score"], TEXT["es"]["old_score"], TEXT["es"]["total_score"], TEXT["es"]["result"]]
+        compact_cols = [TEXT["es"]["claim_no"], TEXT["es"]["other_id"], TEXT["es"]["dealer"], TEXT["es"]["deduction_amount"], TEXT["es"].get("evidences", "Evidencias"), TEXT["es"]["doc_score"], TEXT["es"]["old_score"], TEXT["es"]["total_score"], TEXT["es"]["result"]]
         st.dataframe(summary_df[[col for col in compact_cols if col in summary_df.columns]], use_container_width=True, hide_index=True)
 
         claim_options = list(claims.keys())
@@ -3290,7 +3488,7 @@ def main():
         st.divider()
         st.subheader("Descargas")
 
-        st.caption("Recomendado para cerrar la auditoría: incluye Excel ES/EN, Word ES/EN, analíticos y JSON de trabajo.")
+        st.caption(f"Recomendado para cerrar la auditoría: incluye Excel ES/EN, Word ES/EN, analíticos, JSON de trabajo y evidencias adjuntas ({evidence_count_for_audit(claims)} archivo(s)).")
         if python_docx_available():
             st.download_button(
                 "📦 Descargar paquete completo (.zip)",
@@ -3299,7 +3497,7 @@ def main():
                 mime="application/zip",
                 use_container_width=True,
                 type="primary",
-                help="Usa este para archivar o enviar la auditoría completa. Dentro van boletín ES, scorecard EN, informes Word, analíticos y JSON.",
+                help="Usa este para archivar o enviar la auditoría completa. Dentro van boletín ES, scorecard EN, informes Word, analíticos, JSON y carpeta Evidencias.",
             )
         else:
             st.warning("El paquete completo incluye informes Word. Añade `python-docx` al requirements.txt y reinicia la app para habilitar esta descarga.")
