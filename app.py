@@ -494,6 +494,19 @@ def build_audit_file_basename_from_date(dealer: str, auditor: str, audit_date_va
     )
 
 
+def audit_signature_lines(auditor: str, audit_date_value: Any = None, language: str = "es") -> List[str]:
+    """Firma fija del informe Word."""
+    date_text = audit_date_to_text(audit_date_value, language)
+    return [
+        safe_str(auditor) or "Nombre Auditor",
+        "Senior Aftersales Warranty Specialist",
+        "Omoda Motors Spain",
+        date_text,
+    ]
+
+
+def audit_signature_text(auditor: str, audit_date_value: Any = None, language: str = "es") -> str:
+    return "\n".join(audit_signature_lines(auditor, audit_date_value, language))
 
 
 def parse_amount_value(value: Any) -> float:
@@ -1672,7 +1685,7 @@ def clear_ai_outputs() -> None:
     for key in [
         "ai_report_es", "ai_report_en", "ai_action_plan_es", "ai_action_plan_en",
         "ai_action_plan_rows_es", "ai_action_plan_rows_en",
-        "ai_claim_comments_en", "ai_generated_at", "ai_model_used",
+        "ai_claim_comments_en", "ai_generated_at",
     ]:
         if key in st.session_state:
             del st.session_state[key]
@@ -2541,7 +2554,7 @@ def export_word_report_docx(claims: Dict[str, Dict[str, Any]], audit_name: str, 
     meta_rows = [
         [t["dealer"], dealer or ("No informado" if language == "es" else "Not reported")],
         ["Fecha auditoría" if language == "es" else "Audit date", audit_date_to_text(audit_date_value, language)],
-        ["Auditor / firma" if language == "es" else "Auditor / signature", auditor or ("No informado" if language == "es" else "Not reported")],
+        ["Firma" if language == "es" else "Signature", audit_signature_text(auditor, audit_date_value, language)],
         ["Resultado global" if language == "es" else "Global result", f"{audit_score['success_percent']:.1f}% ({audit_score['total_points']}/{audit_score['max_points']})"],
         [TEXT[language]["document_section"], f"{audit_score['doc_points']}/{audit_score['claims'] * MAX_DOCUMENT_POINTS}"],
         [TEXT[language]["old_parts_section"], f"{audit_score['old_points']}/{audit_score['claims'] * MAX_OLD_PARTS_POINTS}"],
@@ -2571,11 +2584,13 @@ def export_word_report_docx(claims: Dict[str, Dict[str, Any]], audit_name: str, 
     doc.add_paragraph()
     doc.add_heading("Firma" if language == "es" else "Signature", level=2)
     signature = doc.add_paragraph()
-    signature.add_run(auditor or ("Auditor" if language == "en" else "Auditor")).bold = True
-    signature.add_run("\n")
-    signature.add_run(("NSC Warranty" if language == "en" else "NSC Warranty"))
-    signature.add_run("\n")
-    signature.add_run(("Fecha: " if language == "es" else "Date: ") + audit_date_to_text(audit_date_value, language))
+    signature_lines = audit_signature_lines(auditor, audit_date_value, language)
+    for line_index, line in enumerate(signature_lines):
+        run = signature.add_run(line)
+        if line_index == 0:
+            run.bold = True
+        if line_index < len(signature_lines) - 1:
+            signature.add_run("\n")
 
     footer = section.footer.paragraphs[0]
     footer.text = f"{title_text} · {dealer or 'Dealer'} · {audit_date_to_text(audit_date_value, language)}"
@@ -3099,19 +3114,59 @@ def main():
         selected_claim = st.selectbox("Seleccionar claim", claim_options, index=claim_options.index(st.session_state.selected_claim), format_func=display_claim_option)
         st.session_state.selected_claim = selected_claim
 
-        st.download_button("💾 Guardar progreso editable (.json)", data=serialize_audit_workfile(claims, audit_name, dealer, auditor, audit_date_value), file_name=f"{base_name}.json", mime="application/json")
-        st.download_button("🇪🇸 Boletín ES para dealer", data=export_scorecard_excel(claims, audit_name, dealer, auditor, "es", audit_date_value), file_name=f"{base_name}_ES_boletin.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.download_button("🇬🇧 Scorecard EN para HQ", data=export_scorecard_excel(claims, audit_name, dealer, auditor, "en", audit_date_value), file_name=f"{base_name}_EN_scorecard.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.download_button("Exportar analítico ES", data=export_analytical_excel(claims, audit_name, dealer, auditor, "es", audit_date_value), file_name=f"{base_name}_ES_analitico.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.divider()
+        st.subheader("Descargas")
+
+        st.caption("Recomendado para cerrar la auditoría: incluye Excel ES/EN, Word ES/EN, analíticos y JSON de trabajo.")
         if python_docx_available():
             st.download_button(
-                "Exportar paquete ES+EN (.zip)",
+                "📦 Descargar paquete completo (.zip)",
                 data=export_bilingual_package_zip(claims, audit_name, dealer, auditor, audit_date_value),
                 file_name=f"{base_name}_ES_EN.zip",
                 mime="application/zip",
+                use_container_width=True,
+                type="primary",
+                help="Usa este para archivar o enviar la auditoría completa. Dentro van boletín ES, scorecard EN, informes Word, analíticos y JSON.",
             )
         else:
-            st.warning("El ZIP incluye informes Word. Añade `python-docx` al requirements.txt y reinicia la app para habilitar esta descarga.")
+            st.warning("El paquete completo incluye informes Word. Añade `python-docx` al requirements.txt y reinicia la app para habilitar esta descarga.")
+
+        st.caption("Para continuar otro día: guarda solo el archivo editable de trabajo.")
+        st.download_button(
+            "💾 Guardar progreso editable (JSON)",
+            data=serialize_audit_workfile(claims, audit_name, dealer, auditor, audit_date_value),
+            file_name=f"{base_name}.json",
+            mime="application/json",
+            use_container_width=True,
+            help="Este archivo sirve para cargar la auditoría más adelante y seguir editando.",
+        )
+
+        with st.expander("Descargas individuales", expanded=False):
+            st.caption("Usa estos botones solo si necesitas sacar un archivo concreto.")
+            st.download_button(
+                "🇪🇸 Excel dealer: boletín ES",
+                data=export_scorecard_excel(claims, audit_name, dealer, auditor, "es", audit_date_value),
+                file_name=f"{base_name}_ES_boletin.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                help="Excel para enviar al dealer. Usa la claim española/CO como identificador principal.",
+            )
+            st.download_button(
+                "🇬🇧 Excel HQ: scorecard EN",
+                data=export_scorecard_excel(claims, audit_name, dealer, auditor, "en", audit_date_value),
+                file_name=f"{base_name}_EN_scorecard.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                help="Excel para HQ. Usa la claim HQ/IDMS como identificador principal.",
+            )
+            st.download_button(
+                "📊 Excel analítico ES",
+                data=export_analytical_excel(claims, audit_name, dealer, auditor, "es", audit_date_value),
+                file_name=f"{base_name}_ES_analitico.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                help="Detalle por claim y apartado. Útil para análisis o Power BI.",
+            )
 
     with right:
         claim = claims[st.session_state.selected_claim]
