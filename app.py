@@ -23,7 +23,8 @@ Qué hace:
 - Rellena la hoja/page 3 "Improvement of claim issues III" con las observaciones de los campos.
 - En exportaciones EN, traduce las observaciones con un glosario local de auditoría.
 - Permite registrar deducción parcial o total. El botón "No es garantía" pone la claim a 0/100 y marca deducción total.
-- Permite adjuntar hasta 2 evidencias por claim y apartado, incluyéndolas en el ZIP final.
+- Permite adjuntar hasta 2 evidencias por claim y apartado, guardándolas en el JSON editable y en el ZIP final.
+- Guarda las evidencias originales dentro del JSON editable y las exporta ordenadas en el ZIP final.
 """
 
 from __future__ import annotations
@@ -557,6 +558,16 @@ def normalize_evidence_filename(filename: Any, fallback: str = "evidence.bin") -
     return name[:140]
 
 
+def maybe_compress_image_evidence(content: bytes, filename: str, content_type: str) -> Tuple[bytes, str, str, bool, str]:
+    """
+    Compresión desactivada.
+
+    Conserva el archivo original exactamente como se sube para que la evidencia
+    del JSON editable y la evidencia exportada en ZIP sean la misma.
+    """
+    return content, filename, content_type, False, ""
+
+
 def uploaded_file_to_evidence_record(uploaded_file: Any) -> Optional[Dict[str, Any]]:
     """Convierte un UploadedFile de Streamlit en un registro JSON/ZIP seguro."""
     if uploaded_file is None:
@@ -570,13 +581,27 @@ def uploaded_file_to_evidence_record(uploaded_file: Any) -> Optional[Dict[str, A
             content = b""
     if not content:
         return None
-    filename = normalize_evidence_filename(getattr(uploaded_file, "name", "evidence.bin"))
+
+    original_filename = normalize_evidence_filename(getattr(uploaded_file, "name", "evidence.bin"))
+    original_content_type = safe_str(getattr(uploaded_file, "type", ""))
+    original_size = int(len(content))
+
+    stored_content, stored_filename, stored_content_type, compressed, compression_note = maybe_compress_image_evidence(
+        content,
+        original_filename,
+        original_content_type,
+    )
+
     return {
-        "filename": filename,
-        "content_type": safe_str(getattr(uploaded_file, "type", "")),
-        "size": int(len(content)),
+        "filename": stored_filename,
+        "original_filename": original_filename,
+        "content_type": stored_content_type,
+        "size": int(len(stored_content)),
+        "original_size": original_size,
+        "compressed": bool(compressed),
+        "compression_note": compression_note,
         "uploaded_at": datetime.now().isoformat(timespec="seconds"),
-        "data_b64": base64.b64encode(content).decode("ascii"),
+        "data_b64": base64.b64encode(stored_content).decode("ascii"),
     }
 
 
@@ -592,10 +617,18 @@ def normalize_evidence_record(raw: Any) -> Optional[Dict[str, Any]]:
         size = int(raw.get("size", 0) or 0)
     except Exception:
         size = 0
+    try:
+        original_size = int(raw.get("original_size", size) or size)
+    except Exception:
+        original_size = size
     return {
         "filename": filename,
+        "original_filename": normalize_evidence_filename(raw.get("original_filename", filename)),
         "content_type": safe_str(raw.get("content_type", "")),
         "size": size,
+        "original_size": original_size,
+        "compressed": bool(raw.get("compressed", False)),
+        "compression_note": safe_str(raw.get("compression_note", "")),
         "uploaded_at": safe_str(raw.get("uploaded_at", "")),
         "data_b64": data_b64,
     }
@@ -1370,12 +1403,62 @@ def normalize_loaded_claim(raw_claim: Any, fallback: str = "") -> Optional[Dict[
     return claim
 
 
+def collect_ai_outputs_for_workfile() -> Dict[str, Any]:
+    """Guarda los textos IA dentro del JSON para poder reabrir una auditoría completa."""
+    outputs: Dict[str, Any] = {}
+    scalar_keys = ["ai_report_es", "ai_report_en", "ai_action_plan_es", "ai_action_plan_en", "ai_generated_at"]
+    for key in scalar_keys:
+        value = get_streamlit_state_value(key, "")
+        if safe_str(value):
+            outputs[key] = safe_str(value)
+    comments = get_streamlit_state_value("ai_claim_comments_en", {})
+    if isinstance(comments, dict) and comments:
+        outputs["ai_claim_comments_en"] = comments
+    return outputs
+
+
+def restore_ai_outputs_from_payload(payload: Dict[str, Any]) -> None:
+    """Restaura el informe/plan IA guardado en un JSON histórico, si existe."""
+    clear_ai_outputs()
+    ai_outputs = payload.get("ai_outputs", {}) if isinstance(payload, dict) else {}
+    if not isinstance(ai_outputs, dict):
+        return
+    for key in ["ai_report_es", "ai_report_en", "ai_action_plan_es", "ai_action_plan_en", "ai_generated_at"]:
+        if safe_str(ai_outputs.get(key, "")):
+            st.session_state[key] = safe_str(ai_outputs.get(key, ""))
+    comments = ai_outputs.get("ai_claim_comments_en", {})
+    if isinstance(comments, dict):
+        st.session_state.ai_claim_comments_en = comments
+
+
+def build_audit_manifest(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, audit_date_value: Any = None) -> Dict[str, Any]:
+    """Resumen ligero para poder montar un histórico sin base de datos."""
+    audit_score = calculate_audit_score(claims)
+    return {
+        "file_type": "warranty_audit_manifest",
+        "version": 1,
+        "audit_name": audit_name or "Auditoría garantías",
+        "dealer": dealer or "",
+        "auditor": auditor or "",
+        "audit_date": parse_audit_date(audit_date_value).isoformat(),
+        "claims_count": int(audit_score.get("claims", 0)),
+        "completed_claims": int(audit_score.get("completed_claims", 0)),
+        "score_percent": float(audit_score.get("success_percent", 0) or 0),
+        "total_points": int(audit_score.get("total_points", 0)),
+        "max_points": int(audit_score.get("max_points", 0)),
+        "evidence_count": int(evidence_count_for_audit(claims)),
+        "has_ai_report": bool(get_ai_report_for_language("es") or get_ai_report_for_language("en")),
+        "has_ai_action_summary": bool(get_ai_action_plan_for_language("es") or get_ai_action_plan_for_language("en")),
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
 def serialize_audit_workfile(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, audit_date_value: Any = None) -> bytes:
     sync_all_claims_from_widget_state(claims)
     audit_date = parse_audit_date(audit_date_value).isoformat()
     payload = {
         "file_type": "warranty_audit_workfile",
-        "version": 4,
+        "version": 5,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
         "audit": {
             "audit_name": audit_name or "",
@@ -1383,16 +1466,24 @@ def serialize_audit_workfile(claims: Dict[str, Dict[str, Any]], audit_name: str,
             "auditor": auditor or "",
             "audit_date": audit_date,
         },
+        "manifest": build_audit_manifest(claims, audit_name, dealer, auditor, audit_date_value),
+        "ai_outputs": collect_ai_outputs_for_workfile(),
         "claims": claims,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
 
-def load_audit_workfile(uploaded_file) -> Tuple[Dict[str, Dict[str, Any]], str, str, str, date]:
-    content = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+def parse_audit_workfile_payload(content: Any) -> Dict[str, Any]:
+    """Lee el JSON editable desde bytes/texto y valida que sea una auditoría de la app."""
     if isinstance(content, bytes):
         content = content.decode("utf-8")
     payload = json.loads(content)
+    if not isinstance(payload, dict) or payload.get("file_type") != "warranty_audit_workfile":
+        raise ValueError("El archivo no parece una auditoría de trabajo generada por esta app.")
+    return payload
+
+
+def load_audit_workfile_from_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, Any]], str, str, str, date]:
     if not isinstance(payload, dict) or payload.get("file_type") != "warranty_audit_workfile":
         raise ValueError("El archivo no parece una auditoría de trabajo generada por esta app.")
     audit = payload.get("audit", {}) if isinstance(payload.get("audit", {}), dict) else {}
@@ -1412,6 +1503,12 @@ def load_audit_workfile(uploaded_file) -> Tuple[Dict[str, Dict[str, Any]], str, 
         safe_str(audit.get("auditor", "")),
         parse_audit_date(audit.get("audit_date", datetime.now().date().isoformat())),
     )
+
+
+def load_audit_workfile(uploaded_file) -> Tuple[Dict[str, Dict[str, Any]], str, str, str, date]:
+    content = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+    payload = parse_audit_workfile_payload(content)
+    return load_audit_workfile_from_payload(payload)
 
 
 # =============================================================================
@@ -2920,9 +3017,14 @@ def export_word_report_docx(claims: Dict[str, Dict[str, Any]], audit_name: str, 
 
 
 def export_bilingual_package_zip(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, audit_date_value: Any = None) -> bytes:
+    sync_all_claims_from_widget_state(claims)
     output = BytesIO()
     base_name = build_audit_file_basename_from_date(dealer, auditor, audit_date_value)
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        zip_file.writestr(
+            f"{base_name}/audit_manifest.json",
+            json.dumps(build_audit_manifest(claims, audit_name, dealer, auditor, audit_date_value), ensure_ascii=False, indent=2).encode("utf-8"),
+        )
         zip_file.writestr(f"{base_name}/{base_name}.json", serialize_audit_workfile(claims, audit_name, dealer, auditor, audit_date_value))
         zip_file.writestr(f"{base_name}/{base_name}_ES_boletin.xlsx", export_scorecard_excel(claims, audit_name, dealer, auditor, "es", audit_date_value))
         zip_file.writestr(f"{base_name}/{base_name}_EN_scorecard.xlsx", export_scorecard_excel(claims, audit_name, dealer, auditor, "en", audit_date_value))
@@ -2949,6 +3051,9 @@ def init_state():
     st.session_state.setdefault("audit_section_index", 0)
     st.session_state.setdefault("claim_paste_editor_version", 0)
     st.session_state.setdefault("evidence_uploader_version", 0)
+    st.session_state.setdefault("history_uploader_version", 0)
+    st.session_state.setdefault("audit_history_library", {})
+    st.session_state.setdefault("app_page", "📝 Auditoría activa")
 
 
 def clamp_index(index: Any, max_len: int) -> int:
@@ -3124,7 +3229,8 @@ def render_evidence_uploader(claim: Dict[str, Any], check: AuditCheck):
     with st.expander(f"📎 Evidencias del apartado ({len(evidences)}/{MAX_EVIDENCE_FILES_PER_CHECK})", expanded=bool(evidences)):
         st.caption(
             "Opcional. Sube como máximo 2 archivos para justificar este apartado. "
-            "Al exportar el ZIP se guardarán en una carpeta de evidencias por claim y apartado."
+            "Se guardan dentro del JSON editable y también se exportan ordenadas en el ZIP. "
+            "No se comprimen: se conserva el archivo original."
         )
         if not has_observation_context and not evidences:
             st.caption("Tip: normalmente se usa cuando el apartado tiene observación, desviación o deducción asociada.")
@@ -3155,8 +3261,14 @@ def render_evidence_uploader(claim: Dict[str, Any], check: AuditCheck):
             st.code(f"Evidencias/{evidence_folder_name(claim, check)}/", language="text")
             for idx, evidence in enumerate(evidences, start=1):
                 size_kb = int(round((evidence.get("size", 0) or 0) / 1024))
+                original_kb = int(round((evidence.get("original_size", evidence.get("size", 0)) or 0) / 1024))
                 size_text = f" · {size_kb} KB" if size_kb else ""
+                if evidence.get("compressed") and original_kb and original_kb > size_kb:
+                    size_text += f" (archivo guardado anteriormente comprimido desde {original_kb} KB)"
                 st.write(f"{idx}. {evidence.get('filename', 'evidence.bin')}{size_text}")
+                note = safe_str(evidence.get("compression_note", ""))
+                if note:
+                    st.caption(note)
             if st.button("Eliminar evidencias de este apartado", key=f"clear_evidence_{claim_key}_{check.key}"):
                 claim.setdefault("evidences", {})[check.key] = []
                 st.session_state.evidence_uploader_version = st.session_state.get("evidence_uploader_version", 0) + 1
@@ -3401,6 +3513,339 @@ def render_claim_paste_loader(dealer: str, show_title: bool = True):
     with claim_table_cols[2]:
         st.caption("Tip: pega tres columnas desde Excel: HQ/IDMS · España/Dealer · Dealer/instalación.")
 
+
+# =============================================================================
+# HISTÓRICO MANUAL INTELIGENTE (SIN BASE DE DATOS)
+# =============================================================================
+
+APP_PAGE_ACTIVE = "📝 Auditoría activa"
+APP_PAGE_HISTORY = "📚 Histórico / Reabrir"
+APP_PAGES = [APP_PAGE_ACTIVE, APP_PAGE_HISTORY]
+
+
+def clear_active_audit_widget_state() -> None:
+    """Limpia widgets de la auditoría activa para que una auditoría reabierta no herede valores viejos."""
+    prefixes = (
+        "claim_meta_",
+        "select_",
+        "comment_",
+        "deduction_type_",
+        "deduction_amount_",
+        "deduction_reason_",
+        "general_comment_",
+        "evidence_upload_",
+        "clear_evidence_",
+        "not_warranty_",
+    )
+    for key in list(st.session_state.keys()):
+        if key.startswith(prefixes):
+            del st.session_state[key]
+    if "audit_section_radio" in st.session_state:
+        del st.session_state["audit_section_radio"]
+
+
+def extract_audit_payload_from_zip_bytes(content: bytes) -> Tuple[Dict[str, Any], str]:
+    """Busca dentro de un ZIP el JSON editable de auditoría."""
+    with zipfile.ZipFile(BytesIO(content), "r") as zip_file:
+        json_names = [
+            name for name in zip_file.namelist()
+            if name.lower().endswith(".json") and "__macosx" not in name.lower()
+        ]
+        # Preferimos el JSON de trabajo antes que el manifest.
+        preferred = [name for name in json_names if not name.lower().endswith("audit_manifest.json")]
+        for name in preferred + json_names:
+            try:
+                payload = parse_audit_workfile_payload(zip_file.read(name))
+                return payload, name
+            except Exception:
+                continue
+    raise ValueError("No encuentro dentro del ZIP un JSON editable de auditoría generado por esta app.")
+
+
+def uploaded_audit_file_to_history_entry(uploaded_file: Any) -> Dict[str, Any]:
+    """Convierte un ZIP/JSON subido en una entrada temporal de histórico."""
+    file_name = safe_str(getattr(uploaded_file, "name", "auditoria")) or "auditoria"
+    content = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+    is_zip = file_name.lower().endswith(".zip")
+    if is_zip:
+        payload, json_path = extract_audit_payload_from_zip_bytes(content)
+        original_download = content
+        original_mime = "application/zip"
+    else:
+        payload = parse_audit_workfile_payload(content)
+        json_path = file_name
+        original_download = content if isinstance(content, bytes) else str(content).encode("utf-8")
+        original_mime = "application/json"
+
+    claims, audit_name, dealer, auditor, audit_date_value = load_audit_workfile_from_payload(payload)
+    manifest = payload.get("manifest", {}) if isinstance(payload.get("manifest", {}), dict) else {}
+    score = calculate_audit_score(claims)
+    evidence_count = evidence_count_for_audit(claims)
+    ai_outputs = payload.get("ai_outputs", {}) if isinstance(payload.get("ai_outputs", {}), dict) else {}
+    saved_at = safe_str(payload.get("saved_at", "")) or safe_str(manifest.get("saved_at", ""))
+    audit_id = "|".join([
+        sanitize_for_filename(file_name, "auditoria"),
+        sanitize_for_filename(dealer, "dealer"),
+        parse_audit_date(audit_date_value).isoformat(),
+        safe_str(saved_at) or datetime.now().isoformat(timespec="seconds"),
+    ])
+
+    return {
+        "history_id": audit_id,
+        "source_name": file_name,
+        "source_type": "ZIP" if is_zip else "JSON",
+        "json_path": json_path,
+        "payload": payload,
+        "claims": claims,
+        "download_bytes": original_download,
+        "download_mime": original_mime,
+        "audit_name": audit_name,
+        "dealer": dealer,
+        "auditor": auditor,
+        "audit_date": parse_audit_date(audit_date_value),
+        "claims_count": int(score.get("claims", 0)),
+        "completed_claims": int(score.get("completed_claims", 0)),
+        "score_percent": float(score.get("success_percent", 0) or 0),
+        "score_text": f"{float(score.get('success_percent', 0) or 0):.1f}%",
+        "points_text": f"{score.get('total_points', 0)}/{score.get('max_points', 0)}",
+        "evidence_count": int(evidence_count),
+        "has_ai_report": bool(ai_outputs.get("ai_report_es") or ai_outputs.get("ai_report_en") or manifest.get("has_ai_report")),
+        "has_ai_action_summary": bool(ai_outputs.get("ai_action_plan_es") or ai_outputs.get("ai_action_plan_en") or manifest.get("has_ai_action_summary")),
+        "saved_at": saved_at,
+    }
+
+
+def add_uploaded_files_to_history(uploaded_files: List[Any]) -> Tuple[int, List[str]]:
+    """Carga varios ZIP/JSON al histórico temporal de la sesión."""
+    loaded = 0
+    errors: List[str] = []
+    library = st.session_state.setdefault("audit_history_library", {})
+    for uploaded in uploaded_files or []:
+        try:
+            entry = uploaded_audit_file_to_history_entry(uploaded)
+            library[entry["history_id"]] = entry
+            loaded += 1
+        except Exception as exc:
+            errors.append(f"{safe_str(getattr(uploaded, 'name', 'archivo'))}: {exc}")
+    return loaded, errors
+
+
+def history_entry_label(history_id: str) -> str:
+    entry = st.session_state.get("audit_history_library", {}).get(history_id, {})
+    if not entry:
+        return history_id
+    return (
+        f"{entry.get('audit_date')} · {entry.get('dealer') or 'Dealer no informado'} · "
+        f"{entry.get('score_text', '')} · {entry.get('claims_count', 0)} claims · {entry.get('source_name', '')}"
+    )
+
+
+def load_history_entry_as_active(history_id: str) -> None:
+    """Abre una auditoría del histórico temporal como auditoría activa editable."""
+    entry = st.session_state.get("audit_history_library", {}).get(history_id)
+    if not entry:
+        return
+    payload = entry.get("payload", {})
+    claims, audit_name, dealer, auditor, audit_date_value = load_audit_workfile_from_payload(payload)
+    clear_active_audit_widget_state()
+    st.session_state.claims = claims
+    st.session_state.audit_name = audit_name
+    st.session_state.audit_dealer = dealer
+    st.session_state.audit_auditor = auditor
+    st.session_state.audit_date = audit_date_value
+    st.session_state.selected_claim = next(iter(claims.keys())) if claims else None
+    st.session_state.audit_section_index = 0
+    restore_ai_outputs_from_payload(payload)
+    st.session_state.app_page = APP_PAGE_ACTIVE
+
+
+def history_records_dataframe(entries: List[Dict[str, Any]]) -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "Fecha auditoría": item.get("audit_date"),
+            "Dealer": item.get("dealer", ""),
+            "Auditor": item.get("auditor", ""),
+            "Claims": item.get("claims_count", 0),
+            "Completadas": item.get("completed_claims", 0),
+            "Resultado": item.get("score_text", ""),
+            "Puntos": item.get("points_text", ""),
+            "Evidencias": item.get("evidence_count", 0),
+            "Informe IA": "Sí" if item.get("has_ai_report") else "No",
+            "Plan/seguimiento IA": "Sí" if item.get("has_ai_action_summary") else "No",
+            "Archivo": item.get("source_name", ""),
+        }
+        for item in entries
+    ])
+
+
+def render_history_section() -> None:
+    st.subheader("📚 Histórico / Reabrir auditoría")
+    st.info(
+        "Este histórico es manual y temporal: subes ZIP/JSON de auditorías anteriores, "
+        "la app los lee y puedes abrirlos para revisar o editar. Para conservar algo, descarga siempre el ZIP completo."
+    )
+
+    uploaded_key = f"history_upload_{st.session_state.get('history_uploader_version', 0)}"
+    uploaded_files = st.file_uploader(
+        "Subir auditorías anteriores (.zip o .json)",
+        type=["zip", "json"],
+        accept_multiple_files=True,
+        key=uploaded_key,
+        help="Puedes subir varios ZIPs completos. Cada ZIP debe contener el JSON editable generado por esta app.",
+    )
+    history_cols = st.columns([1, 1, 3])
+    with history_cols[0]:
+        if st.button("Leer histórico", type="primary", use_container_width=True, disabled=not bool(uploaded_files)):
+            loaded, errors = add_uploaded_files_to_history(uploaded_files or [])
+            if loaded:
+                st.success(f"Cargadas {loaded} auditoría(s) al histórico temporal.")
+            for error in errors:
+                st.error(error)
+    with history_cols[1]:
+        if st.button("Vaciar histórico", use_container_width=True):
+            st.session_state.audit_history_library = {}
+            st.session_state.history_uploader_version = st.session_state.get("history_uploader_version", 0) + 1
+            st.rerun()
+    with history_cols[2]:
+        st.caption("El histórico cargado vive solo en esta sesión de Streamlit. Tus archivos maestros siguen siendo los ZIP que guardas tú.")
+
+    library = st.session_state.get("audit_history_library", {})
+    if not library:
+        st.warning("Todavía no hay auditorías cargadas en el histórico temporal.")
+        return
+
+    entries = list(library.values())
+    entries.sort(key=lambda item: (item.get("audit_date", date.min), item.get("dealer", "")), reverse=True)
+
+    filter_cols = st.columns([2, 1.4])
+    with filter_cols[0]:
+        text_filter = st.text_input(
+            "Buscar por dealer, auditor, claim o archivo",
+            key="history_text_filter",
+            placeholder="Ej.: ACAI, VIAN, CO2026, Pablo...",
+        )
+    all_dates = [item.get("audit_date") for item in entries if isinstance(item.get("audit_date"), date)]
+    min_date = min(all_dates) if all_dates else datetime.now().date()
+    max_date = max(all_dates) if all_dates else datetime.now().date()
+    with filter_cols[1]:
+        date_range = st.date_input(
+            "Rango de fecha auditoría",
+            value=(min_date, max_date),
+            key="history_date_range",
+        )
+
+    date_start, date_end = min_date, max_date
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        date_start = parse_audit_date(date_range[0])
+        date_end = parse_audit_date(date_range[1])
+    elif isinstance(date_range, date):
+        date_start = date_end = date_range
+
+    query = normalize_text(text_filter)
+    filtered_entries = []
+    for item in entries:
+        audit_date_value = item.get("audit_date")
+        if isinstance(audit_date_value, date) and not (date_start <= audit_date_value <= date_end):
+            continue
+        if query:
+            claims_text = " ".join(
+                f"{claim_identifier(claim, 'es')} {claim_identifier(claim, 'en')} {claim.get('dealer', '')} {claim.get('vin', '')}"
+                for claim in item.get("claims", {}).values()
+            )
+            haystack = normalize_text(
+                " ".join([
+                    item.get("audit_name", ""),
+                    item.get("dealer", ""),
+                    item.get("auditor", ""),
+                    item.get("source_name", ""),
+                    claims_text,
+                ])
+            )
+            if query not in haystack:
+                continue
+        filtered_entries.append(item)
+
+    st.dataframe(history_records_dataframe(filtered_entries), use_container_width=True, hide_index=True)
+    if not filtered_entries:
+        st.warning("No hay auditorías que coincidan con esos filtros.")
+        return
+
+    filtered_ids = [item["history_id"] for item in filtered_entries]
+    selected_history_id = st.selectbox(
+        "Seleccionar auditoría del histórico",
+        filtered_ids,
+        format_func=history_entry_label,
+        key="selected_history_entry",
+    )
+    entry = library.get(selected_history_id, {})
+    if not entry:
+        return
+
+    st.divider()
+    st.markdown("### Vista previa")
+    preview_cols = st.columns(5)
+    preview_cols[0].metric("Dealer", entry.get("dealer") or "—")
+    preview_cols[1].metric("Fecha", audit_date_to_text(entry.get("audit_date"), "es"))
+    preview_cols[2].metric("Claims", entry.get("claims_count", 0))
+    preview_cols[3].metric("Resultado", entry.get("score_text", ""))
+    preview_cols[4].metric("Evidencias", entry.get("evidence_count", 0))
+
+    claims = entry.get("claims", {})
+    if claims:
+        preview_rows = []
+        for claim in claims.values():
+            score = calculate_claim_score(claim)
+            preview_rows.append({
+                "Claim dealer / España": claim_identifier(claim, "es"),
+                "Identificador HQ / IDMS": claim_other_identifier(claim, "es"),
+                "Dealer": claim.get("dealer", ""),
+                "Evidencias": evidence_count_for_claim(claim),
+                "Total /100": score.get("total_points", 0),
+                "Resultado": result_label(score.get("total_points", 0), "es"),
+                "Comentarios": auto_general_comment(claim, "es"),
+            })
+        st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+
+    ai_outputs = entry.get("payload", {}).get("ai_outputs", {}) if isinstance(entry.get("payload", {}).get("ai_outputs", {}), dict) else {}
+    if ai_outputs:
+        report_tab, plan_tab = st.tabs(["Informe guardado", "Resumen/seguimiento guardado"])
+        with report_tab:
+            report_text = safe_str(ai_outputs.get("ai_report_es", "")) or safe_str(ai_outputs.get("ai_report_en", ""))
+            if report_text:
+                st.markdown(report_text)
+            else:
+                st.caption("Esta auditoría no guarda informe IA en el JSON.")
+        with plan_tab:
+            plan_text = safe_str(ai_outputs.get("ai_action_plan_es", "")) or safe_str(ai_outputs.get("ai_action_plan_en", ""))
+            if plan_text:
+                st.markdown(plan_text)
+            else:
+                st.caption("Esta auditoría no guarda resumen/seguimiento IA en el JSON.")
+    else:
+        st.caption("Este archivo no contiene textos IA guardados. Puedes abrirlo, generar el informe y volver a guardar el ZIP completo.")
+
+    action_cols = st.columns([1, 1, 2])
+    with action_cols[0]:
+        st.button(
+            "Abrir para editar",
+            type="primary",
+            use_container_width=True,
+            on_click=load_history_entry_as_active,
+            args=(selected_history_id,),
+            help="Carga esta auditoría como auditoría activa. Los cambios no se guardan hasta que descargues un nuevo ZIP/JSON.",
+        )
+    with action_cols[1]:
+        extension = "zip" if entry.get("source_type") == "ZIP" else "json"
+        st.download_button(
+            f"Descargar {entry.get('source_type', 'archivo')} original",
+            data=entry.get("download_bytes", b""),
+            file_name=entry.get("source_name") or f"auditoria.{extension}",
+            mime=entry.get("download_mime", "application/octet-stream"),
+            use_container_width=True,
+        )
+    with action_cols[2]:
+        st.caption("Para regenerar Word/Excel/ZIP con cambios, primero ábrela para editar y usa las descargas de la auditoría activa.")
+
 def main():
     st.set_page_config(page_title="Warranty Audit Assistant", page_icon="🧾", layout="wide")
     init_state()
@@ -3431,13 +3876,16 @@ def main():
         workfile = st.file_uploader("Cargar auditoría guardada (.json)", type=["json"], key="workfile_upload")
         if workfile is not None and st.button("Cargar JSON"):
             try:
-                claims, loaded_name, loaded_dealer, loaded_auditor, loaded_date = load_audit_workfile(workfile)
+                payload = parse_audit_workfile_payload(workfile.getvalue())
+                claims, loaded_name, loaded_dealer, loaded_auditor, loaded_date = load_audit_workfile_from_payload(payload)
+                clear_active_audit_widget_state()
                 st.session_state.claims = claims
                 st.session_state.audit_name = loaded_name
                 st.session_state.audit_dealer = loaded_dealer
                 st.session_state.audit_auditor = loaded_auditor
                 st.session_state.audit_date = loaded_date
                 st.session_state.selected_claim = next(iter(claims.keys()))
+                restore_ai_outputs_from_payload(payload)
                 st.success(f"Auditoría cargada: {len(claims)} claims.")
                 st.rerun()
             except Exception as exc:
@@ -3450,12 +3898,18 @@ def main():
         st.write(f"Total: **{MAX_TOTAL_POINTS}**")
         st.caption("Por defecto: OK / máximo. No aplica = máximo del apartado.")
 
+    page = st.radio("Vista", APP_PAGES, horizontal=True, key="app_page", label_visibility="collapsed")
+    st.divider()
+    if page == APP_PAGE_HISTORY:
+        render_history_section()
+        st.stop()
+
     claims: Dict[str, Dict[str, Any]] = st.session_state.claims
     apply_default_dealer_to_blank_claims(claims, safe_str(st.session_state.audit_dealer))
     sync_all_claims_from_widget_state(claims)
 
     if not claims:
-        st.info("Pega la lista de claims, con dealer si aplica, en la tabla de abajo para empezar.")
+        st.info("Pega la lista de claims, con dealer si aplica, en la tabla de abajo para empezar. Si quieres reabrir una auditoría anterior, entra en 📚 Histórico / Reabrir.")
         render_claim_paste_loader(dealer, show_title=True)
         st.stop()
 
@@ -3502,14 +3956,14 @@ def main():
         else:
             st.warning("El paquete completo incluye informes Word. Añade `python-docx` al requirements.txt y reinicia la app para habilitar esta descarga.")
 
-        st.caption("Para continuar otro día: guarda solo el archivo editable de trabajo.")
+        st.caption("Para continuar otro día: guarda el JSON editable. Incluye también las evidencias adjuntas, por eso puede pesar más si hay muchas fotos.")
         st.download_button(
             "💾 Guardar progreso editable (JSON)",
             data=serialize_audit_workfile(claims, audit_name, dealer, auditor, audit_date_value),
             file_name=f"{base_name}.json",
             mime="application/json",
             use_container_width=True,
-            help="Este archivo sirve para cargar la auditoría más adelante y seguir editando.",
+            help="Este archivo sirve para cargar la auditoría más adelante y seguir editando. Incluye las evidencias adjuntas dentro del propio JSON.",
         )
 
         with st.expander("Descargas individuales", expanded=False):
