@@ -203,6 +203,9 @@ MAX_TOTAL_POINTS = MAX_DOCUMENT_POINTS + MAX_OLD_PARTS_POINTS
 GEMINI_MODEL_DEFAULT = "gemini-2.5-flash"
 MAX_EVIDENCE_FILES_PER_CHECK = 2
 
+NOT_WARRANTY_COMMENT_ES = "No corresponde a una reparación cubierta por garantía."
+NOT_WARRANTY_DEDUCTION_REASON_ES = "No corresponde a una reparación cubierta por garantía. Deducción del importe completo de la claim."
+
 # =============================================================================
 # CONTEXTO TÉCNICO COMPACTO DE POLÍTICA PARA GEMINI
 # =============================================================================
@@ -801,22 +804,112 @@ def has_deduction(claim: Dict[str, Any]) -> bool:
     return safe_str(claim.get("deduction_type", "none")) != "none" or claim_deduction_amount(claim) > 0
 
 
+def is_generic_not_warranty_comment(text: Any) -> bool:
+    """Detecta el comentario automático antiguo de 'No es garantía' para no repetirlo en todos los apartados."""
+    normalized = normalize_text(text)
+    if not normalized:
+        return False
+    generic_variants = [
+        normalize_text(NOT_WARRANTY_COMMENT_ES),
+        normalize_text(NOT_WARRANTY_DEDUCTION_REASON_ES),
+        normalize_text("No corresponde a una reparacion cubierta por garantia."),
+        normalize_text("No corresponde a una reparacion cubierta por garantia. Deduccion del importe completo de la claim."),
+        normalize_text("No es garantía"),
+        normalize_text("No es garantia"),
+        normalize_text("Not covered by warranty"),
+        normalize_text("This does not correspond to a repair covered by warranty."),
+    ]
+    return any(variant and normalized == variant for variant in generic_variants)
+
+
+def claim_raw_total_points(claim: Dict[str, Any]) -> int:
+    total = 0
+    for check in ALL_SCORING_CHECKS:
+        points = claim.get("evaluations", {}).get(check.key, {}).get("points")
+        if points is None:
+            continue
+        try:
+            total += int(points or 0)
+        except Exception:
+            pass
+    return total
+
+
+def is_not_warranty_claim(claim: Dict[str, Any]) -> bool:
+    """Identifica las claims marcadas como no cubiertas por garantía."""
+    dtype = safe_str(claim.get("deduction_type", "none")).lower()
+    reason_norm = normalize_text(claim.get("deduction_reason", ""))
+    reason_says_not_warranty = (
+        "no corresponde a una reparacion cubierta por garantia" in reason_norm
+        or "no es garantia" in reason_norm
+        or "not covered by warranty" in reason_norm
+        or "repair covered by warranty" in reason_norm
+    )
+    all_zero = claim_raw_total_points(claim) == 0
+    return bool(reason_says_not_warranty or (dtype == "total" and all_zero))
+
+
+def not_warranty_reason(claim: Dict[str, Any], language: str = "es") -> str:
+    """Motivo compacto para claims no cubiertas; evita repetir el mismo texto por cada apartado."""
+    reason = claim_deduction_reason(claim, language)
+    if reason and not is_generic_not_warranty_comment(reason):
+        return reason
+
+    comments = []
+    seen = set()
+    for check in ALL_SCORING_CHECKS:
+        raw_comment = safe_str(claim.get("evaluations", {}).get(check.key, {}).get("comment", ""))
+        if not raw_comment or is_generic_not_warranty_comment(raw_comment):
+            continue
+        comment = comment_for_language(raw_comment, language)
+        norm = normalize_text(comment)
+        if norm and norm not in seen:
+            comments.append(comment)
+            seen.add(norm)
+    if comments:
+        return " / ".join(comments[:4])
+
+    return (
+        "No corresponde a una reparación cubierta por garantía."
+        if language == "es"
+        else "The claim does not correspond to a repair covered by warranty."
+    )
+
+
+def not_warranty_claims_summary(claims: Dict[str, Dict[str, Any]], language: str = "es") -> List[str]:
+    rows = []
+    for claim in claims.values():
+        if not is_not_warranty_claim(claim):
+            continue
+        claim_id = claim_identifier(claim, language)
+        other_id = claim_other_identifier(claim, language)
+        ids = claim_id
+        if other_id:
+            ids = f"{claim_id} / {other_id}" if claim_id else other_id
+        reason = not_warranty_reason(claim, language)
+        rows.append(f"{ids}: {reason}" if ids else reason)
+    return rows
+
+
 def mark_claim_as_not_warranty(claim: Dict[str, Any]) -> None:
-    """Marca la claim como no garantía: todos los apartados puntuables a 0 y deducción total."""
+    """Marca la claim como no garantía: 0/100 y deducción total, sin repetir el comentario en todos los apartados."""
     for check in ALL_SCORING_CHECKS:
         evaluation = claim.setdefault("evaluations", {}).setdefault(check.key, new_evaluation(check))
         evaluation["option_key"] = "nok"
         evaluation["status"] = "NOK"
         evaluation["points"] = 0
         evaluation["max_points"] = check.max_points
-        if not safe_str(evaluation.get("comment", "")):
-            evaluation["comment"] = "No corresponde a una reparación cubierta por garantía."
+        # En versiones anteriores se escribía el mismo texto en todos los apartados.
+        # Lo evitamos para que el informe no salga inflado con repeticiones.
+        if is_generic_not_warranty_comment(evaluation.get("comment", "")):
+            evaluation["comment"] = ""
 
     claim["deduction_type"] = "total"
     amount = parse_amount_value(claim.get("amount", ""))
     claim["deduction_amount"] = amount
-    claim["deduction_reason"] = "No corresponde a una reparación cubierta por garantía. Deducción del importe completo de la claim."
-    claim["general_comment"] = build_general_comment_from_observations(claim, include_campaigns=False, language="es") or claim["deduction_reason"]
+    if not safe_str(claim.get("deduction_reason", "")) or is_generic_not_warranty_comment(claim.get("deduction_reason", "")):
+        claim["deduction_reason"] = NOT_WARRANTY_DEDUCTION_REASON_ES
+    claim["general_comment"] = not_warranty_reason(claim, "es")
 
 
 def mark_claim_as_not_warranty_callback(claim_key: str) -> None:
@@ -827,7 +920,8 @@ def mark_claim_as_not_warranty_callback(claim_key: str) -> None:
     # Sincronizar widgets de selectbox/text_area antes del siguiente rerun.
     for check in ALL_SCORING_CHECKS:
         st.session_state[f"select_{claim_key}_{check.key}"] = option_display(option_from_key(check, "nok"), "es")
-        st.session_state[f"comment_{claim_key}_{check.key}"] = claim["evaluations"][check.key].get("comment", "")
+        current_comment = claim["evaluations"][check.key].get("comment", "")
+        st.session_state[f"comment_{claim_key}_{check.key}"] = "" if is_generic_not_warranty_comment(current_comment) else current_comment
     st.session_state[f"deduction_type_{claim_key}"] = "total"
     st.session_state[f"deduction_amount_{claim_key}"] = parse_amount_value(claim.get("amount", ""))
     st.session_state[f"deduction_reason_{claim_key}"] = claim.get("deduction_reason", "")
@@ -1412,6 +1506,12 @@ def collect_ai_outputs_for_workfile() -> Dict[str, Any]:
         value = get_streamlit_state_value(key, "")
         if safe_str(value):
             outputs[key] = safe_str(value)
+
+    for key in ["ai_action_plan_rows_es", "ai_action_plan_rows_en"]:
+        value = get_streamlit_state_value(key, [])
+        if isinstance(value, list) and value:
+            outputs[key] = value
+
     comments = get_streamlit_state_value("ai_claim_comments_en", {})
     if isinstance(comments, dict) and comments:
         outputs["ai_claim_comments_en"] = comments
@@ -1427,6 +1527,12 @@ def restore_ai_outputs_from_payload(payload: Dict[str, Any]) -> None:
     for key in ["ai_report_es", "ai_report_en", "ai_action_plan_es", "ai_action_plan_en", "ai_generated_at"]:
         if safe_str(ai_outputs.get(key, "")):
             st.session_state[key] = safe_str(ai_outputs.get(key, ""))
+
+    for key in ["ai_action_plan_rows_es", "ai_action_plan_rows_en"]:
+        value = ai_outputs.get(key, [])
+        if isinstance(value, list):
+            st.session_state[key] = value
+
     comments = ai_outputs.get("ai_claim_comments_en", {})
     if isinstance(comments, dict):
         st.session_state.ai_claim_comments_en = comments
@@ -1437,10 +1543,9 @@ def payload_has_saved_ai_outputs(payload: Dict[str, Any]) -> bool:
     ai_outputs = payload.get("ai_outputs", {}) if isinstance(payload, dict) else {}
     if not isinstance(ai_outputs, dict):
         return False
-    return any(
-        safe_str(ai_outputs.get(key, ""))
-        for key in ["ai_report_es", "ai_report_en", "ai_action_plan_es", "ai_action_plan_en"]
-    )
+    if any(safe_str(ai_outputs.get(key, "")) for key in ["ai_report_es", "ai_report_en", "ai_action_plan_es", "ai_action_plan_en"]):
+        return True
+    return any(isinstance(ai_outputs.get(key, []), list) and ai_outputs.get(key, []) for key in ["ai_action_plan_rows_es", "ai_action_plan_rows_en"])
 
 
 def extract_text_from_docx_bytes(content: bytes) -> str:
@@ -1725,7 +1830,10 @@ def read_claims_from_uploaded_excel(uploaded_file) -> Dict[str, Dict[str, Any]]:
 
 
 def evaluation_comment(claim: Dict[str, Any], check: AuditCheck) -> str:
-    return safe_str(claim.get("evaluations", {}).get(check.key, {}).get("comment", ""))
+    comment = safe_str(claim.get("evaluations", {}).get(check.key, {}).get("comment", ""))
+    if is_not_warranty_claim(claim) and is_generic_not_warranty_comment(comment):
+        return ""
+    return comment
 
 
 def build_general_comment_from_observations(claim: Dict[str, Any], include_campaigns: bool = True, language: str = "es") -> str:
@@ -1747,8 +1855,11 @@ def build_general_comment_from_observations(claim: Dict[str, Any], include_campa
 def auto_general_comment(claim: Dict[str, Any], language: str = "es") -> str:
     """
     Comentario general calculado automáticamente a partir de las observaciones
-    de los apartados. Si no hay observaciones, usa el motivo de deducción si existe.
+    de los apartados. Si la claim está marcada como no garantía, se resume una sola vez.
     """
+    if is_not_warranty_claim(claim):
+        return not_warranty_reason(claim, language)
+
     generated = build_general_comment_from_observations(
         claim,
         include_campaigns=False,
@@ -1836,8 +1947,8 @@ def get_secret_value(*names: str) -> str:
 def build_ai_action_plan_context(claims: Dict[str, Dict[str, Any]], dealer: str) -> List[Dict[str, Any]]:
     """
     Prepara para Gemini un contexto por apartado basado en observaciones reales.
-    No incluye frases tipo "X claims / puntos perdidos" para evitar que la IA
-    copie métricas en el plan de acción. Cada claim puede tener una casuística distinta.
+    Las claims marcadas como no garantía se tratan aparte para no contaminar todos
+    los apartados con el mismo 0/100.
     """
     context: List[Dict[str, Any]] = []
 
@@ -1846,6 +1957,9 @@ def build_ai_action_plan_context(claims: Dict[str, Dict[str, Any]], dealer: str)
         statuses = []
 
         for claim in claims.values():
+            if is_not_warranty_claim(claim):
+                continue
+
             evaluation = claim.get("evaluations", {}).get(check.key, {})
             points = evaluation.get("points")
             lost = check.max_points if points is None else max(0, check.max_points - int(points or 0))
@@ -1889,11 +2003,9 @@ def build_ai_audit_payload(claims: Dict[str, Dict[str, Any]], audit_name: str, d
     action_plan_context = build_ai_action_plan_context(claims, dealer)
 
     claim_payload = []
+    not_warranty_payload = []
     for claim in claims.values():
         score = calculate_claim_score(claim)
-        # calculate_claim_score incluye objetos AuditCheck dentro de lost_by_area,
-        # y esos objetos no se pueden convertir directamente a JSON para Gemini.
-        # Creamos una versión limpia y serializable del score para el prompt.
         score_for_ai = {
             "doc_points": int(score.get("doc_points", 0)),
             "old_points": int(score.get("old_points", 0)),
@@ -1913,6 +2025,29 @@ def build_ai_audit_payload(claims: Dict[str, Dict[str, Any]], audit_name: str, d
                 for item_check, lost_points, status in score.get("lost_by_area", [])
             ],
         }
+
+        deduction = {
+            "type": safe_str(claim.get("deduction_type", "none")) or "none",
+            "amount": claim_deduction_amount(claim),
+            "reason_es": safe_str(claim.get("deduction_reason", "")),
+        }
+
+        if is_not_warranty_claim(claim):
+            not_warranty_payload.append({
+                "claim_hq_id": safe_str(claim.get("hq_claim_no", "")),
+                "claim_es_id": safe_str(claim.get("local_claim_no", "")),
+                "dealer": safe_str(claim.get("dealer", "")) or dealer,
+                "score": {
+                    "doc_points": score_for_ai["doc_points"],
+                    "old_points": score_for_ai["old_points"],
+                    "total_points": score_for_ai["total_points"],
+                    "success_percent": score_for_ai["success_percent"],
+                },
+                "deduction": deduction,
+                "reason_es": not_warranty_reason(claim, "es"),
+            })
+            continue
+
         observations = []
         for check in ALL_SCORING_CHECKS:
             evaluation = claim.get("evaluations", {}).get(check.key, {})
@@ -1931,14 +2066,7 @@ def build_ai_audit_payload(claims: Dict[str, Dict[str, Any]], audit_name: str, d
                     "lost_points": lost,
                     "observation_es": comment,
                 })
-        deduction = {
-            "type": safe_str(claim.get("deduction_type", "none")) or "none",
-            "amount": claim_deduction_amount(claim),
-            "reason_es": safe_str(claim.get("deduction_reason", "")),
-        }
-        # Para controlar tokens y evitar informes enormes, Gemini solo recibe
-        # claims con observaciones, desviaciones o deducciones. Las claims OK
-        # sin comentarios quedan reflejadas únicamente en las métricas globales.
+
         has_written_observation = any(safe_str(item.get("observation_es", "")) for item in observations)
         has_score_deviation = any(int(item.get("lost_points", 0) or 0) > 0 for item in observations)
         has_deduction_data = deduction["type"] != "none" or float(deduction["amount"] or 0) > 0 or safe_str(deduction["reason_es"])
@@ -1966,11 +2094,11 @@ def build_ai_audit_payload(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             "campaigns": "Not included",
         },
         "audit_score": audit_score,
-        "data_scope_for_ai": "The claims array intentionally includes only claims with observations, score deviations or deductions. Perfect claims without observations are used only in global scoring.",
+        "data_scope_for_ai": "The regular claims array intentionally includes only claims with observations, score deviations or deductions. Claims marked as not covered by warranty are separated in not_warranty_claims and must not be expanded as deviations in every checklist item.",
         "action_plan_context": action_plan_context,
+        "not_warranty_claims": not_warranty_payload,
         "claims_with_observations_or_deviations": claim_payload,
     }
-
 
 def extract_json_object(text: str) -> Dict[str, Any]:
     """Intenta extraer JSON aunque el modelo lo devuelva dentro de ```json."""
@@ -1997,7 +2125,7 @@ def build_gemini_audit_prompt(payload: Dict[str, Any]) -> str:
     return f"""
 You are an automotive warranty audit assistant for an NSC warranty department.
 
-Your task is to create a professional executive audit summary and a follow-up findings table in Spanish and English.
+Your task is to create a professional executive audit summary and structured follow-up findings in Spanish and English.
 Use ONLY the audit data provided below, the current audit evaluation criteria, and the compact warranty policy context provided here.
 Do not invent claims, scores, deductions, evidence, causes or facts.
 Do not recalculate the score. Use the provided scores exactly.
@@ -2016,6 +2144,14 @@ IMPORTANT STYLE REQUIREMENTS:
 - Scoring is rule-based; do not change it.
 - Do not use excessive asterisks or bold Markdown markers. Keep the report readable in plain text too.
 
+CRITICAL NOT-COVERED-BY-WARRANTY RULE:
+- Claims in not_warranty_claims must be handled in a separate report section.
+- Do NOT expand a not-covered claim into all checklist parameters.
+- Do NOT write the same sentence repeatedly for OR, evidence, labour, VIN, old parts, etc.
+- In Spanish, add a section titled exactly: "Reclamaciones no cubiertas por garantía" when not_warranty_claims is not empty.
+- In English, add a section titled exactly: "Claims not covered by warranty" when not_warranty_claims is not empty.
+- Summarize the reason_es field. If it is generic, state only that the claim does not correspond to a warranty-covered repair.
+
 CRITICAL FOLLOW-UP TABLE RULE:
 Do NOT write generic metric sentences such as:
 - "Se detectan desviaciones u observaciones en 23 claim(s). Puntos perdidos: 161."
@@ -2030,8 +2166,7 @@ IMPORTANT CHECKLIST NAMING RULES:
 - In English, use the exact English audited parameter names received in action_plan_context.parameter_en.
 - Do not rename audited parameters into generic alternatives.
 
-FOLLOW-UP TABLE STRUCTURE:
-The follow-up table must follow the audit checklist structure, like an audit scorecard / findings table.
+FOLLOW-UP ROWS STRUCTURE:
 Return action_plan_rows_es and action_plan_rows_en as arrays with ONE ROW FOR EACH audited parameter, in this exact order:
 1. OR
 2. Pedido piezas / albarán
@@ -2053,23 +2188,19 @@ For English rows, use the exact English checklist names from the audit data.
 Each row must contain:
 - group: "Claim" for document checklist items, "Old part" for old parts checklist items.
 - parameter: exact checklist parameter name.
-- evaluation: "X" when there is any deviation, deduction impact or relevant observation for that parameter. Otherwise "V".
+- evaluation: "X" when there is any deviation or relevant observation for that parameter in action_plan_context. Otherwise "V".
 - observations: concise aggregated summary of the actual observations. Empty string if evaluation is "V".
-- countermeasures: concise practical countermeasure directly linked to the summarized observations. Empty string if evaluation is "V".
+- countermeasures: concise practical follow-up suggestion directly linked to the summarized observations. Empty string if evaluation is "V".
 
 For rows with evaluation "X":
 - observations must explain the nature of the issue, not the number of affected claims.
-- countermeasures must be specific enough to guide the dealer.
+- countermeasures must be specific enough to guide the dealer, but cautious.
 - If observations are heterogeneous, summarize them as different cases without listing every claim one by one.
 - Mention claim IDs only if it is necessary to clarify a unique or critical case; otherwise summarize the pattern.
 
-Return also action_plan_es and action_plan_en as readable Markdown tables with columns:
-Audited parameters | Evaluation | Observations | Countermeasures
-
-
 CAUTIOUS WORDING RULES:
 - This is not a formal corrective action plan. It is an executive summary of observations and follow-up areas.
-- The Countermeasures column should be written as suggested follow-up / improvement lines, not as imposed sanctions.
+- The countermeasures field should be written as suggested follow-up / improvement lines, not as imposed sanctions.
 - Use wording such as: revisar, reforzar, asegurar, estandarizar, verificar, mejorar la consistencia / review, reinforce, ensure, standardise, verify, improve consistency.
 - Avoid wording such as: sancionar, incumplimiento grave, obligación inmediata, the dealer failed, mandatory sanction.
 - Do not include claims without observations in narrative sections. They are represented only in global scores.
@@ -2078,15 +2209,13 @@ CAUTIOUS WORDING RULES:
 REPORT FORMAT:
 - report_es and report_en must be highly readable.
 - Use short plain headings and short bullet points.
-- Recommended structure: Executive summary, Main findings, Main improvement areas, Conclusion.
-- The report may mention global scores and main weak areas, but the action plan must be qualitative and based on observations.
+- Recommended structure: Executive summary, Claims not covered by warranty if applicable, Main findings, Main improvement areas, Conclusion.
+- The report may mention global scores and main weak areas, but the follow-up rows must be qualitative and based on observations.
 
-Return ONLY valid JSON with this exact structure:
+Return ONLY valid JSON with this exact structure. Do not include Markdown fences or explanatory text outside JSON:
 {{
   "report_es": "Texto completo del informe ejecutivo en español",
   "report_en": "Full executive report in English",
-  "action_plan_es": "Tabla markdown del plan de acción en español",
-  "action_plan_en": "Markdown table of the action plan in English",
   "action_plan_rows_es": [
     {{"group": "Claim", "parameter": "OR", "evaluation": "V", "observations": "", "countermeasures": ""}}
   ],
@@ -2101,12 +2230,37 @@ Return ONLY valid JSON with this exact structure:
 For claim_comments_en:
 - Use the HQ claim ID when available.
 - If the HQ ID is empty, use the Spanish claim ID.
-- Include one entry for every claim that has observations or deductions.
+- Include one entry for every regular claim that has observations or deductions and for every claim in not_warranty_claims.
 - Keep each claim comment concise but clear.
 
 Audit data JSON:
 {json.dumps(payload, ensure_ascii=False, indent=2, default=json_default_serializer)}
 """.strip()
+
+
+def action_plan_rows_to_markdown(rows: List[Dict[str, Any]], language: str = "es") -> str:
+    """Convierte las filas estructuradas de Gemini en una tabla Markdown local, reduciendo tokens de salida."""
+    clean_rows = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        clean_rows.append({
+            "parameter": safe_str(row.get("parameter", "")),
+            "evaluation": "X" if safe_str(row.get("evaluation", "")).upper() == "X" else "V",
+            "observations": safe_str(row.get("observations", "")),
+            "countermeasures": safe_str(row.get("countermeasures", "")),
+        })
+    if not clean_rows:
+        return ""
+
+    headers = ["Audited parameters", "Evaluation", "Observations", "Countermeasures"]
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
+    for row in clean_rows:
+        values = [row["parameter"], row["evaluation"], row["observations"], row["countermeasures"]]
+        escaped = [value.replace("|", "\\|").replace("\n", "<br>") for value in values]
+        lines.append("| " + " | ".join(escaped) + " |")
+    return "\n".join(lines)
+
 
 def generate_gemini_audit_outputs(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, api_key: str, model: str = GEMINI_MODEL_DEFAULT) -> Tuple[bool, str]:
     """Llama a Gemini y guarda informe/plan ES-EN en session_state."""
@@ -2132,11 +2286,14 @@ def generate_gemini_audit_outputs(claims: Dict[str, Dict[str, Any]], audit_name:
             "model": model or GEMINI_MODEL_DEFAULT,
             "contents": prompt,
         }
-        # Temperatura baja: más determinista, rápida y menos propensa a inventar formato.
+        # Temperatura baja y respuesta JSON para reducir variabilidad y errores de parseo.
         if types is not None:
-            request_kwargs["config"] = types.GenerateContentConfig(temperature=0.15)
+            try:
+                request_kwargs["config"] = types.GenerateContentConfig(temperature=0.15, response_mime_type="application/json")
+            except TypeError:
+                request_kwargs["config"] = types.GenerateContentConfig(temperature=0.15)
         else:
-            request_kwargs["config"] = {"temperature": 0.15}
+            request_kwargs["config"] = {"temperature": 0.15, "response_mime_type": "application/json"}
         response = client.models.generate_content(**request_kwargs)
         raw_text = getattr(response, "text", "") or ""
     except Exception as exc:
@@ -2144,29 +2301,31 @@ def generate_gemini_audit_outputs(claims: Dict[str, Dict[str, Any]], audit_name:
 
     parsed = extract_json_object(raw_text)
     if not parsed:
-        return False, "Gemini respondió, pero no se pudo interpretar como JSON. Prueba otra vez."
+        st.session_state.ai_last_raw_response = raw_text[:4000] if raw_text else ""
+        return False, "Gemini respondió, pero no se pudo interpretar como JSON. He guardado la respuesta bruta para diagnóstico; prueba otra vez o reduce observaciones si la auditoría es muy grande."
 
     st.session_state.ai_report_es = safe_str(parsed.get("report_es", ""))
     st.session_state.ai_report_en = safe_str(parsed.get("report_en", ""))
-    st.session_state.ai_action_plan_es = safe_str(parsed.get("action_plan_es", ""))
-    st.session_state.ai_action_plan_en = safe_str(parsed.get("action_plan_en", ""))
 
     rows_es = parsed.get("action_plan_rows_es", [])
     rows_en = parsed.get("action_plan_rows_en", [])
     st.session_state.ai_action_plan_rows_es = rows_es if isinstance(rows_es, list) else []
     st.session_state.ai_action_plan_rows_en = rows_en if isinstance(rows_en, list) else []
 
+    # Ya no pedimos a Gemini una tabla Markdown duplicada: la montamos aquí desde filas estructuradas.
+    st.session_state.ai_action_plan_es = safe_str(parsed.get("action_plan_es", "")) or action_plan_rows_to_markdown(st.session_state.ai_action_plan_rows_es, "es")
+    st.session_state.ai_action_plan_en = safe_str(parsed.get("action_plan_en", "")) or action_plan_rows_to_markdown(st.session_state.ai_action_plan_rows_en, "en")
+
     claim_comments = parsed.get("claim_comments_en", {})
     st.session_state.ai_claim_comments_en = claim_comments if isinstance(claim_comments, dict) else {}
     st.session_state.ai_generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return True, "Informe ejecutivo, plan de acción y traducciones EN generadas con Gemini."
-
+    return True, "Informe ejecutivo, resumen de seguimiento y traducciones EN generadas con Gemini."
 
 def clear_ai_outputs() -> None:
     for key in [
         "ai_report_es", "ai_report_en", "ai_action_plan_es", "ai_action_plan_en",
         "ai_action_plan_rows_es", "ai_action_plan_rows_en",
-        "ai_claim_comments_en", "ai_generated_at",
+        "ai_claim_comments_en", "ai_generated_at", "ai_last_raw_response",
     ]:
         if key in st.session_state:
             del st.session_state[key]
@@ -2241,6 +2400,8 @@ def build_action_plan_rows(claims: Dict[str, Dict[str, Any]], language: str = "e
         total_lost = 0
         affected_claims = 0
         for claim in claims.values():
+            if is_not_warranty_claim(claim):
+                continue
             evaluation = claim.get("evaluations", {}).get(check.key, {})
             points = evaluation.get("points")
             status = status_for_language(evaluation.get("status", ""), language) or ("Pendiente" if language == "es" else "Pending")
@@ -2258,21 +2419,24 @@ def build_action_plan_rows(claims: Dict[str, Dict[str, Any]], language: str = "e
                     else:
                         entries.append(f"{claim_id}: {status}, no specific observation.")
         if affected_claims:
-            if entries:
-                preview_entries = []
-                seen_preview = set()
-                for entry in entries:
-                    # Quitamos el identificador de claim para obtener un resumen más útil.
-                    text_after_claim = entry.split(":", 1)[1].strip() if ":" in entry else entry
-                    norm_preview = normalize_text(text_after_claim)
-                    if norm_preview and norm_preview not in seen_preview:
-                        preview_entries.append(text_after_claim)
-                        seen_preview.add(norm_preview)
-                    if len(preview_entries) >= 3:
-                        break
-                exception = " / ".join(preview_entries)
+            unique_summaries = []
+            seen_preview = set()
+            for entry in entries:
+                text_after_claim = entry.split(":", 1)[1].strip() if ":" in entry else entry
+                norm_preview = normalize_text(text_after_claim)
+                if norm_preview and norm_preview not in seen_preview:
+                    unique_summaries.append(text_after_claim)
+                    seen_preview.add(norm_preview)
+                if len(unique_summaries) >= 4:
+                    break
+            if unique_summaries:
+                exception = " / ".join(unique_summaries)
             else:
-                exception = TEXT[language]["generic_countermeasure"]
+                exception = (
+                    "El apartado presenta desviación, sin observación específica registrada."
+                    if language == "es"
+                    else "The item shows a deviation, with no specific observation recorded."
+                )
             rows.append({
                 "block": block_label(check.block_key, language),
                 "parameter": check_label(check, language),
@@ -2282,7 +2446,31 @@ def build_action_plan_rows(claims: Dict[str, Dict[str, Any]], language: str = "e
                 "lost_points": total_lost,
                 "affected_claims": affected_claims,
             })
-    # Ajustes económicos / deducciones: no forman parte de la puntuación, pero sí del plan de acción.
+
+    # Claims no cubiertas por garantía: se tratan como hallazgo separado, no como 15 desviaciones repetidas.
+    no_warranty_entries = not_warranty_claims_summary(claims, language)
+    if no_warranty_entries:
+        if language == "es":
+            parameter = "Reclamaciones no cubiertas por garantía"
+            block = "Cobertura de garantía"
+            exception = "Se han detectado reclamaciones que no corresponden a reparaciones cubiertas por garantía."
+            countermeasure = "Revisar la cobertura antes de tramitar la claim y documentar de forma clara el motivo cuando la reparación no proceda como garantía."
+        else:
+            parameter = "Claims not covered by warranty"
+            block = "Warranty coverage"
+            exception = "Claims have been identified that do not correspond to warranty-covered repairs."
+            countermeasure = "Review warranty coverage before claim submission and clearly document the reason when the repair should not be processed as warranty."
+        rows.append({
+            "block": block,
+            "parameter": parameter,
+            "exception": exception,
+            "observations": "\n".join(no_warranty_entries),
+            "countermeasure": countermeasure,
+            "lost_points": 0,
+            "affected_claims": len(no_warranty_entries),
+        })
+
+    # Ajustes económicos / deducciones: no forman parte de la puntuación, pero sí del resumen.
     deduction_entries = []
     total_deduction = 0.0
     affected_deductions = 0
@@ -2302,13 +2490,13 @@ def build_action_plan_rows(claims: Dict[str, Dict[str, Any]], language: str = "e
                 deduction_entries.append(f"{claim_id}: {label} - {amount_text}.")
     if affected_deductions:
         if language == "es":
-            exception = f"{affected_deductions} claim(s) con deducción registrada. Importe deducido informado: {total_deduction:.2f}."
-            countermeasure = "Revisar el importe reclamado y comunicar claramente al dealer la deducción aplicada y su motivo."
+            exception = "Se registran ajustes económicos asociados a las observaciones de auditoría."
+            countermeasure = "Asegurar que cualquier ajuste económico quede vinculado a una observación clara y trazable."
             parameter = "Deducción / ajuste económico"
             block = "Coste de garantía"
         else:
-            exception = f"{affected_deductions} claim(s) with registered deduction. Reported deducted amount: {total_deduction:.2f}."
-            countermeasure = "Review the claimed amount and clearly communicate the applied deduction and its reason to the dealer."
+            exception = "Financial adjustments are recorded in relation to the audit observations."
+            countermeasure = "Ensure any financial adjustment is linked to a clear and traceable audit observation."
             parameter = "Deduction / financial adjustment"
             block = "Warranty cost"
         rows.append({
@@ -2371,6 +2559,8 @@ def build_action_plan_scorecard_rows(claims: Dict[str, Dict[str, Any]], language
         total_lost = 0
         affected_claims = 0
         for claim in claims.values():
+            if is_not_warranty_claim(claim):
+                continue
             evaluation = claim.get("evaluations", {}).get(check.key, {})
             points = evaluation.get("points")
             lost = check.max_points if points is None else max(0, check.max_points - int(points or 0))
@@ -2875,8 +3065,8 @@ def generate_text_report(claims: Dict[str, Dict[str, Any]], audit_name: str, dea
 
     t = TEXT[language]
     audit_score = calculate_audit_score(claims)
-    action_rows = build_action_plan_rows(claims, language)
-    summary_df = build_summary_dataframe(claims, language)
+    action_rows = [row for row in build_action_plan_rows(claims, language) if row.get("parameter") not in ("Deducción / ajuste económico", "Deduction / financial adjustment")]
+    no_warranty_rows = not_warranty_claims_summary(claims, language)
 
     lines = []
     lines.append(f"{t['report_title']}: {audit_name or 'Warranty audit'}")
@@ -2905,27 +3095,53 @@ def generate_text_report(claims: Dict[str, Dict[str, Any]], audit_name: str, dea
     else:
         lines.append(f"- Claim documentation: {audit_score['doc_points']}/{audit_score['claims'] * MAX_DOCUMENT_POINTS} points.")
         lines.append(f"- Old parts: {audit_score['old_points']}/{audit_score['claims'] * MAX_OLD_PARTS_POINTS} points.")
+
+    if no_warranty_rows:
+        lines.append("")
+        lines.append("Reclamaciones no cubiertas por garantía" if language == "es" else "Claims not covered by warranty")
+        if language == "es":
+            lines.append("Se han detectado reclamaciones que no corresponden a reparaciones cubiertas por garantía. Estas se resumen de forma separada para no duplicar el mismo motivo en todos los apartados de la checklist.")
+        else:
+            lines.append("Claims have been identified that do not correspond to warranty-covered repairs. They are summarised separately to avoid repeating the same reason across all checklist items.")
+        for item in no_warranty_rows:
+            lines.append(f"- {item}")
+
     lines.append("")
     lines.append(t["improvement_areas"])
-    if not action_rows:
+    regular_rows = [row for row in action_rows if row.get("parameter") not in ("Reclamaciones no cubiertas por garantía", "Claims not covered by warranty")]
+    if not regular_rows:
         lines.append(t["no_deviations"] + ".")
     else:
-        for item in sorted(action_rows, key=lambda row: row["lost_points"], reverse=True)[:8]:
+        for item in sorted(regular_rows, key=lambda row: row.get("lost_points", 0), reverse=True)[:8]:
             lines.append(f"- {item['parameter']}: {item['exception']}")
+
+    # Claims con menor puntuación: excluimos las no cubiertas para no repetir 15 veces el mismo motivo.
+    scored_regular_claims = []
+    for claim in claims.values():
+        if is_not_warranty_claim(claim):
+            continue
+        score = calculate_claim_score(claim)
+        scored_regular_claims.append((score["total_points"], claim))
+
     lines.append("")
     lines.append(t["lowest_claims"])
-    if not summary_df.empty:
-        score_col = t["total_score"]
-        claim_col = t["claim_no"]
-        comments_col = t["comments"]
-        for _, row in summary_df.sort_values(score_col, ascending=True).head(5).iterrows():
-            lines.append(f"- {row[claim_col]}: {row[score_col]}/100. {safe_str(row[comments_col])}")
+    if scored_regular_claims:
+        for total_points, claim in sorted(scored_regular_claims, key=lambda item: item[0])[:5]:
+            comment = general_comment_for_export(claim, language)
+            claim_id = claim_identifier(claim, language)
+            if comment:
+                lines.append(f"- {claim_id}: {total_points}/100. {comment}")
+            else:
+                lines.append(f"- {claim_id}: {total_points}/100.")
+    else:
+        lines.append("No hay claims con desviaciones puntuables fuera de las reclamaciones no cubiertas por garantía." if language == "es" else "There are no score deviations outside the claims not covered by warranty.")
+
     lines.append("")
     lines.append(t["conclusion"])
     if language == "es":
-        lines.append("Se recomienda focalizar el plan de mejora en las áreas con mayor pérdida de puntos y reforzar la revisión previa de la documentación antes del envío de claims.")
+        lines.append("Se recomienda focalizar el seguimiento en las observaciones realmente detectadas durante la auditoría, diferenciando las reclamaciones no cubiertas por garantía de las desviaciones documentales o de gestión de piezas.")
     else:
-        lines.append("It is recommended to focus the improvement plan on the areas with the highest lost points and reinforce documentation review before claim submission.")
+        lines.append("It is recommended to focus follow-up on the observations actually identified during the audit, separating claims not covered by warranty from documentation or old-parts management findings.")
     lines.append("")
     lines.append(t["not_translated_note"])
     return "\n".join(lines)
@@ -3451,6 +3667,10 @@ def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, de
                     st.rerun()
                 else:
                     st.error(message)
+                    raw_ai = get_ai_output("ai_last_raw_response")
+                    if raw_ai:
+                        with st.expander("Ver respuesta bruta de Gemini", expanded=False):
+                            st.code(raw_ai[:4000])
         with ai_cols[1]:
             if st.button("Borrar texto IA", use_container_width=True):
                 clear_ai_outputs()
