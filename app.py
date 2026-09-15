@@ -3676,8 +3676,18 @@ def load_persistent_audit(file_id: str, audit_id: str = "") -> None:
     )
     st.session_state.autosave_pending = False
     st.session_state.autosave_error = ""
-    st.session_state.app_page = APP_PAGE_ACTIVE
+    request_app_page(APP_PAGE_ACTIVE)
     st.session_state.audit_section_index = 0
+
+
+def request_app_page(page: str) -> None:
+    """
+    Solicita un cambio de vista para el siguiente rerun.
+
+    No modificamos directamente `app_page` después de haber creado el radio
+    de Streamlit, porque eso provoca StreamlitWidgetAlreadyInstantiatedError.
+    """
+    st.session_state["_pending_app_page"] = page
 
 
 def start_new_audit() -> None:
@@ -3697,7 +3707,7 @@ def start_new_audit() -> None:
     st.session_state.autosave_pending = False
     st.session_state.autosave_error = ""
     st.session_state.audit_section_index = 0
-    st.session_state.app_page = APP_PAGE_ACTIVE
+    request_app_page(APP_PAGE_ACTIVE)
 
 
 def render_autosave_status(
@@ -3767,6 +3777,14 @@ def persistent_audit_label(item: Dict[str, Any]) -> str:
     return f"{audit_date} · {dealer} · {status} · {score_text}"
 
 
+def load_persistent_audit_callback(file_id: str, audit_id: str = "") -> None:
+    try:
+        load_persistent_audit(file_id, audit_id)
+        st.session_state["_persistent_load_error"] = ""
+    except Exception as exc:
+        st.session_state["_persistent_load_error"] = safe_str(exc)
+
+
 def render_persistent_audits() -> None:
     st.subheader("☁️ Mis auditorías guardadas")
     st.caption(
@@ -3776,9 +3794,12 @@ def render_persistent_audits() -> None:
 
     top_cols = st.columns([1, 1, 3])
     with top_cols[0]:
-        if st.button("➕ Nueva auditoría", type="primary", use_container_width=True):
-            start_new_audit()
-            st.rerun()
+        st.button(
+            "➕ Nueva auditoría",
+            type="primary",
+            use_container_width=True,
+            on_click=start_new_audit,
+        )
     with top_cols[1]:
         refresh = st.button("🔄 Actualizar", use_container_width=True)
     with top_cols[2]:
@@ -3837,15 +3858,20 @@ def render_persistent_audits() -> None:
     )
     selected_meta = selected.get("metadata", {}) if isinstance(selected.get("metadata"), dict) else {}
 
-    if st.button("📂 Abrir para continuar", type="primary", use_container_width=True):
-        try:
-            load_persistent_audit(
-                selected_id,
-                safe_str(selected_meta.get("audit_id", "")),
-            )
-            st.rerun()
-        except Exception as exc:
-            st.error(f"No se pudo abrir la auditoría: {exc}")
+    load_error = safe_str(st.session_state.pop("_persistent_load_error", ""))
+    if load_error:
+        st.error(f"No se pudo abrir la auditoría: {load_error}")
+
+    st.button(
+        "📂 Abrir para continuar",
+        type="primary",
+        use_container_width=True,
+        on_click=load_persistent_audit_callback,
+        args=(
+            selected_id,
+            safe_str(selected_meta.get("audit_id", "")),
+        ),
+    )
 
 
 
@@ -3875,6 +3901,7 @@ def init_state():
     st.session_state.setdefault("history_uploader_version", 0)
     st.session_state.setdefault("audit_history_library", {})
     st.session_state.setdefault("app_page", "📝 Auditoría activa")
+    st.session_state.setdefault("_pending_app_page", "")
 
 
 def clamp_index(index: Any, max_len: int) -> int:
@@ -4492,7 +4519,7 @@ def load_history_entry_as_active(history_id: str) -> None:
         st.session_state.loaded_saved_ai_notice = "Auditoría reabierta con informe/resumen IA guardado. No se ha generado nada nuevo."
     else:
         st.session_state.audit_section_index = 0
-    st.session_state.app_page = APP_PAGE_ACTIVE
+    request_app_page(APP_PAGE_ACTIVE)
 
 
 def history_records_dataframe(entries: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -4744,7 +4771,7 @@ def main():
 
         st.divider()
         if st.button("☁️ Ver mis auditorías", use_container_width=True):
-            st.session_state.app_page = APP_PAGE_PERSISTENT
+            request_app_page(APP_PAGE_PERSISTENT)
             st.rerun()
 
         st.divider()
@@ -4753,6 +4780,12 @@ def main():
         st.write(f"Piezas viejas: **{MAX_OLD_PARTS_POINTS}**")
         st.write(f"Total: **{MAX_TOTAL_POINTS}**")
         st.caption("Por defecto: OK / máximo. No aplica = máximo del apartado.")
+
+    pending_page = safe_str(st.session_state.get("_pending_app_page", ""))
+    if pending_page:
+        if pending_page in APP_PAGES:
+            st.session_state["app_page"] = pending_page
+        st.session_state["_pending_app_page"] = ""
 
     page = st.radio("Vista", APP_PAGES, horizontal=True, key="app_page", label_visibility="collapsed")
     st.divider()
