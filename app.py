@@ -30,9 +30,13 @@ Qué hace:
 from __future__ import annotations
 
 import base64
+import gzip
+import hashlib
 import json
 import os
 import re
+import time
+import uuid
 import zipfile
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -42,6 +46,7 @@ from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import requests
 import streamlit as st
 
 
@@ -1639,8 +1644,10 @@ def serialize_audit_workfile(claims: Dict[str, Dict[str, Any]], audit_name: str,
     audit_date = parse_audit_date(audit_date_value).isoformat()
     payload = {
         "file_type": "warranty_audit_workfile",
-        "version": 5,
+        "version": 6,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "audit_id": safe_str(get_streamlit_state_value("current_audit_id", "")),
+        "owner": safe_str(get_streamlit_state_value("authenticated_user", "")),
         "audit": {
             "audit_name": audit_name or "",
             "dealer": dealer or "",
@@ -3328,12 +3335,457 @@ def export_bilingual_package_zip(claims: Dict[str, Dict[str, Any]], audit_name: 
     return output.getvalue()
 
 
+
+# =============================================================================
+# AUTENTICACIÓN + AUTOGUARDADO PERSISTENTE
+# =============================================================================
+
+AUTOSAVE_API_TIMEOUT = 45
+AUTOSAVE_MAX_MB = 45
+
+
+def get_required_secret(name: str, default: str = "") -> str:
+    """Lee un secreto de Streamlit o variable de entorno."""
+    value = get_secret_value(name)
+    return safe_str(value) or safe_str(default)
+
+
+def persistent_backend_configured() -> bool:
+    return bool(
+        get_required_secret("AUDIT_DRIVE_API_URL")
+        and get_required_secret("AUDIT_DRIVE_API_TOKEN")
+    )
+
+
+def ensure_audit_id() -> str:
+    audit_id = safe_str(st.session_state.get("current_audit_id", ""))
+    if not audit_id:
+        audit_id = f"AUD-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}"
+        st.session_state.current_audit_id = audit_id
+    return audit_id
+
+
+def audit_login_gate() -> None:
+    """
+    Login monousuario sencillo.
+    Las credenciales viven en Streamlit Secrets, nunca en el código.
+    """
+    configured_user = get_required_secret("AUDIT_USERNAME")
+    configured_password = get_required_secret("AUDIT_PASSWORD")
+
+    if not configured_user or not configured_password:
+        st.error(
+            "Falta configurar `AUDIT_USERNAME` y `AUDIT_PASSWORD` "
+            "en los Secrets de Streamlit."
+        )
+        st.stop()
+
+    if st.session_state.get("authenticated", False):
+        st.session_state.authenticated_user = configured_user
+        return
+
+    st.title("🔐 Warranty Audit Assistant")
+    st.caption("Acceso privado a tus auditorías.")
+
+    with st.form("audit_login_form"):
+        username = st.text_input("Usuario")
+        password = st.text_input("Contraseña", type="password")
+        submitted = st.form_submit_button("Entrar", type="primary", use_container_width=True)
+
+    if submitted:
+        if username == configured_user and password == configured_password:
+            st.session_state.authenticated = True
+            st.session_state.authenticated_user = configured_user
+            st.rerun()
+        else:
+            st.error("Usuario o contraseña incorrectos.")
+
+    st.stop()
+
+
+def audit_api_request(action: str, **payload) -> Dict[str, Any]:
+    """
+    Habla con el Google Apps Script que guarda los JSON en tu Drive personal.
+    """
+    url = get_required_secret("AUDIT_DRIVE_API_URL")
+    token = get_required_secret("AUDIT_DRIVE_API_TOKEN")
+
+    if not url or not token:
+        raise RuntimeError(
+            "Autoguardado no configurado: faltan AUDIT_DRIVE_API_URL "
+            "o AUDIT_DRIVE_API_TOKEN."
+        )
+
+    body = {
+        "token": token,
+        "action": action,
+        "owner": safe_str(st.session_state.get("authenticated_user", "")),
+    }
+    body.update(payload)
+
+    response = requests.post(
+        url,
+        json=body,
+        timeout=AUTOSAVE_API_TIMEOUT,
+    )
+    response.raise_for_status()
+
+    try:
+        result = response.json()
+    except Exception as exc:
+        raise RuntimeError("El servicio de Drive devolvió una respuesta no válida.") from exc
+
+    if not result.get("ok"):
+        raise RuntimeError(safe_str(result.get("error", "Error desconocido de Drive.")))
+
+    return result
+
+
+def build_autosave_metadata(
+    claims: Dict[str, Dict[str, Any]],
+    audit_name: str,
+    dealer: str,
+    auditor: str,
+    audit_date_value: Any,
+) -> Dict[str, Any]:
+    score = calculate_audit_score(claims)
+    completed = bool(
+        score.get("claims", 0)
+        and score.get("completed_claims", 0) == score.get("claims", 0)
+    )
+    return {
+        "audit_id": ensure_audit_id(),
+        "owner": safe_str(st.session_state.get("authenticated_user", "")),
+        "audit_name": safe_str(audit_name) or "Auditoría garantías",
+        "dealer": safe_str(dealer),
+        "auditor": safe_str(auditor),
+        "audit_date": parse_audit_date(audit_date_value).isoformat(),
+        "claims_count": int(score.get("claims", 0)),
+        "completed_claims": int(score.get("completed_claims", 0)),
+        "score_percent": float(score.get("success_percent", 0) or 0),
+        "status": "Completada" if completed else "En curso",
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def autosave_current_audit(
+    claims: Dict[str, Dict[str, Any]],
+    audit_name: str,
+    dealer: str,
+    auditor: str,
+    audit_date_value: Any,
+    force: bool = False,
+) -> bool:
+    """
+    Guarda una copia completa y editable de la auditoría en Drive.
+
+    - Se calcula un hash para no escribir si nada ha cambiado.
+    - Si falla la red, la sesión queda marcada como pendiente y se reintenta
+      en el siguiente rerun.
+    - Incluye evidencias, porque usa el mismo JSON editable de la app.
+    """
+    if not claims:
+        return False
+
+    if not persistent_backend_configured():
+        st.session_state.autosave_pending = True
+        st.session_state.autosave_error = "Backend de Drive no configurado."
+        return False
+
+    ensure_audit_id()
+    sync_all_claims_from_widget_state(claims)
+
+    content = serialize_audit_workfile(
+        claims,
+        audit_name,
+        dealer,
+        auditor,
+        audit_date_value,
+    )
+    digest = hashlib.sha256(content).hexdigest()
+
+    if (
+        not force
+        and not st.session_state.get("autosave_pending", False)
+        and digest == st.session_state.get("autosave_last_hash", "")
+    ):
+        return True
+
+    size_mb = len(content) / (1024 * 1024)
+    if size_mb > AUTOSAVE_MAX_MB:
+        st.session_state.autosave_pending = True
+        st.session_state.autosave_error = (
+            f"El JSON de trabajo pesa {size_mb:.1f} MB. "
+            f"El autoguardado admite hasta {AUTOSAVE_MAX_MB} MB. "
+            "Descarga el JSON manualmente para conservar todas las evidencias."
+        )
+        return False
+
+    # GZIP reduce mucho el peso del JSON y de los textos. Las fotos JPG/PNG
+    # apenas se comprimen más, pero seguimos conservándolas completas.
+    compressed = gzip.compress(content, compresslevel=5)
+    encoded = base64.b64encode(compressed).decode("ascii")
+    metadata = build_autosave_metadata(
+        claims,
+        audit_name,
+        dealer,
+        auditor,
+        audit_date_value,
+    )
+
+    try:
+        result = audit_api_request(
+            "save",
+            audit_id=metadata["audit_id"],
+            filename=f"{metadata['audit_id']}.json",
+            content_gzip_b64=encoded,
+            metadata=metadata,
+        )
+        st.session_state.autosave_last_hash = digest
+        st.session_state.autosave_last_success = safe_str(
+            result.get("saved_at", metadata["saved_at"])
+        )
+        st.session_state.autosave_pending = False
+        st.session_state.autosave_error = ""
+        st.session_state.autosave_file_id = safe_str(result.get("file_id", ""))
+        return True
+
+    except Exception as exc:
+        st.session_state.autosave_pending = True
+        st.session_state.autosave_error = safe_str(exc)
+        return False
+
+
+def list_persistent_audits() -> List[Dict[str, Any]]:
+    if not persistent_backend_configured():
+        return []
+    result = audit_api_request("list")
+    audits = result.get("audits", [])
+    return audits if isinstance(audits, list) else []
+
+
+def load_persistent_audit(file_id: str, audit_id: str = "") -> None:
+    result = audit_api_request("load", file_id=file_id)
+    encoded = safe_str(result.get("content_gzip_b64", ""))
+    if not encoded:
+        raise ValueError("Drive no devolvió el contenido de la auditoría.")
+
+    try:
+        content = gzip.decompress(base64.b64decode(encoded))
+    except Exception as exc:
+        raise ValueError("No se pudo descomprimir la auditoría guardada.") from exc
+
+    payload = parse_audit_workfile_payload(content)
+    claims, audit_name, dealer, auditor, audit_date_value = load_audit_workfile_from_payload(payload)
+
+    clear_active_audit_widget_state()
+    st.session_state.claims = claims
+    st.session_state.audit_name = audit_name
+    st.session_state.audit_dealer = dealer
+    st.session_state.audit_auditor = auditor
+    st.session_state.audit_date = audit_date_value
+    st.session_state.selected_claim = next(iter(claims.keys())) if claims else None
+    st.session_state.current_audit_id = (
+        safe_str(payload.get("audit_id", ""))
+        or safe_str(audit_id)
+        or ensure_audit_id()
+    )
+    restore_ai_outputs_from_payload(payload)
+
+    # El archivo recién cargado es la referencia persistente actual.
+    st.session_state.autosave_last_hash = hashlib.sha256(content).hexdigest()
+    st.session_state.autosave_last_success = safe_str(
+        payload.get("saved_at", datetime.now().isoformat(timespec="seconds"))
+    )
+    st.session_state.autosave_pending = False
+    st.session_state.autosave_error = ""
+    st.session_state.app_page = APP_PAGE_ACTIVE
+    st.session_state.audit_section_index = 0
+
+
+def start_new_audit() -> None:
+    clear_active_audit_widget_state()
+    clear_ai_outputs()
+    st.session_state.claims = {}
+    st.session_state.selected_claim = None
+    st.session_state.audit_name = "Auditoría garantías"
+    st.session_state.audit_dealer = ""
+    st.session_state.audit_auditor = safe_str(
+        st.session_state.get("authenticated_user", "")
+    )
+    st.session_state.audit_date = datetime.now().date()
+    st.session_state.current_audit_id = ""
+    st.session_state.autosave_last_hash = ""
+    st.session_state.autosave_last_success = ""
+    st.session_state.autosave_pending = False
+    st.session_state.autosave_error = ""
+    st.session_state.audit_section_index = 0
+    st.session_state.app_page = APP_PAGE_ACTIVE
+
+
+def render_autosave_status(
+    claims: Dict[str, Dict[str, Any]],
+    audit_name: str,
+    dealer: str,
+    auditor: str,
+    audit_date_value: Any,
+) -> None:
+    st.sidebar.divider()
+    st.sidebar.subheader("💾 Autoguardado")
+
+    if not persistent_backend_configured():
+        st.sidebar.error("Drive no configurado.")
+        return
+
+    last_success = safe_str(st.session_state.get("autosave_last_success", ""))
+    pending = bool(st.session_state.get("autosave_pending", False))
+    error = safe_str(st.session_state.get("autosave_error", ""))
+
+    if pending:
+        st.sidebar.warning("⚠️ Cambios pendientes de sincronizar.")
+        if error:
+            st.sidebar.caption(error)
+    elif last_success:
+        try:
+            parsed = datetime.fromisoformat(last_success.replace("Z", "+00:00"))
+            st.sidebar.success(f"✅ Guardado: {parsed.strftime('%H:%M:%S')}")
+        except Exception:
+            st.sidebar.success(f"✅ Guardado: {last_success}")
+    else:
+        st.sidebar.caption("Aún no se ha creado el primer autoguardado.")
+
+    if st.sidebar.button(
+        "💾 Guardar ahora",
+        use_container_width=True,
+        disabled=not bool(claims),
+    ):
+        ok = autosave_current_audit(
+            claims,
+            audit_name,
+            dealer,
+            auditor,
+            audit_date_value,
+            force=True,
+        )
+        if ok:
+            st.sidebar.success("Guardado manual completado.")
+        else:
+            st.sidebar.error("No se pudo sincronizar. Se reintentará.")
+
+    st.sidebar.caption(
+        "El JSON descargable sigue siendo tu copia de seguridad manual."
+    )
+
+
+def persistent_audit_label(item: Dict[str, Any]) -> str:
+    meta = item.get("metadata", {}) if isinstance(item.get("metadata"), dict) else {}
+    audit_date = safe_str(meta.get("audit_date", ""))
+    dealer = safe_str(meta.get("dealer", "")) or "Dealer no informado"
+    status = safe_str(meta.get("status", "")) or "En curso"
+    score = meta.get("score_percent", 0)
+    try:
+        score_text = f"{float(score):.1f}%"
+    except Exception:
+        score_text = ""
+    return f"{audit_date} · {dealer} · {status} · {score_text}"
+
+
+def render_persistent_audits() -> None:
+    st.subheader("☁️ Mis auditorías guardadas")
+    st.caption(
+        "Estas auditorías están guardadas de forma persistente en tu Google Drive. "
+        "Puedes cerrar el navegador y volver a abrirlas más adelante."
+    )
+
+    top_cols = st.columns([1, 1, 3])
+    with top_cols[0]:
+        if st.button("➕ Nueva auditoría", type="primary", use_container_width=True):
+            start_new_audit()
+            st.rerun()
+    with top_cols[1]:
+        refresh = st.button("🔄 Actualizar", use_container_width=True)
+    with top_cols[2]:
+        st.caption(
+            f"Perfil: {safe_str(st.session_state.get('authenticated_user', ''))}"
+        )
+
+    try:
+        audits = list_persistent_audits()
+    except Exception as exc:
+        st.error(f"No se pudo leer el registro de auditorías: {exc}")
+        return
+
+    if not audits:
+        st.info("Todavía no hay auditorías guardadas en Drive.")
+        return
+
+    # Orden más reciente primero.
+    audits.sort(
+        key=lambda item: safe_str(item.get("modified_at", "")),
+        reverse=True,
+    )
+
+    rows = []
+    for item in audits:
+        meta = item.get("metadata", {}) if isinstance(item.get("metadata"), dict) else {}
+        rows.append({
+            "Fecha": meta.get("audit_date", ""),
+            "Dealer": meta.get("dealer", ""),
+            "Auditoría": meta.get("audit_name", ""),
+            "Estado": meta.get("status", ""),
+            "Claims": meta.get("claims_count", 0),
+            "Completadas": meta.get("completed_claims", 0),
+            "Resultado": (
+                f"{float(meta.get('score_percent', 0) or 0):.1f}%"
+                if meta.get("score_percent", "") != ""
+                else ""
+            ),
+            "Último guardado": item.get("modified_at", ""),
+        })
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    ids = [safe_str(item.get("file_id", "")) for item in audits]
+    selected_id = st.selectbox(
+        "Abrir auditoría",
+        ids,
+        format_func=lambda file_id: persistent_audit_label(
+            next((x for x in audits if safe_str(x.get("file_id", "")) == file_id), {})
+        ),
+    )
+
+    selected = next(
+        (x for x in audits if safe_str(x.get("file_id", "")) == selected_id),
+        {},
+    )
+    selected_meta = selected.get("metadata", {}) if isinstance(selected.get("metadata"), dict) else {}
+
+    if st.button("📂 Abrir para continuar", type="primary", use_container_width=True):
+        try:
+            load_persistent_audit(
+                selected_id,
+                safe_str(selected_meta.get("audit_id", "")),
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(f"No se pudo abrir la auditoría: {exc}")
+
+
+
 # =============================================================================
 # INTERFAZ STREAMLIT
 # =============================================================================
 
 
 def init_state():
+    st.session_state.setdefault("authenticated", False)
+    st.session_state.setdefault("authenticated_user", "")
+    st.session_state.setdefault("current_audit_id", "")
+    st.session_state.setdefault("autosave_last_hash", "")
+    st.session_state.setdefault("autosave_last_success", "")
+    st.session_state.setdefault("autosave_pending", False)
+    st.session_state.setdefault("autosave_error", "")
+    st.session_state.setdefault("autosave_file_id", "")
     st.session_state.setdefault("claims", {})
     st.session_state.setdefault("selected_claim", None)
     st.session_state.setdefault("audit_name", "Auditoría garantías")
@@ -3815,8 +4267,9 @@ def render_claim_paste_loader(dealer: str, show_title: bool = True):
 # =============================================================================
 
 APP_PAGE_ACTIVE = "📝 Auditoría activa"
-APP_PAGE_HISTORY = "📚 Histórico / Reabrir"
-APP_PAGES = [APP_PAGE_ACTIVE, APP_PAGE_HISTORY]
+APP_PAGE_PERSISTENT = "☁️ Mis auditorías"
+APP_PAGE_HISTORY = "📚 Importar archivo"
+APP_PAGES = [APP_PAGE_ACTIVE, APP_PAGE_PERSISTENT, APP_PAGE_HISTORY]
 
 
 def clear_active_audit_widget_state() -> None:
@@ -3949,6 +4402,9 @@ def load_history_entry_as_active(history_id: str) -> None:
     st.session_state.audit_name = audit_name
     st.session_state.audit_dealer = dealer
     st.session_state.audit_auditor = auditor
+    st.session_state.current_audit_id = safe_str(payload.get("audit_id", "")) or ""
+    st.session_state.autosave_last_hash = ""
+    st.session_state.autosave_pending = True
     st.session_state.audit_date = audit_date_value
     st.session_state.selected_claim = next(iter(claims.keys())) if claims else None
     restore_ai_outputs_from_payload(payload)
@@ -3984,8 +4440,8 @@ def history_records_dataframe(entries: List[Dict[str, Any]]) -> pd.DataFrame:
 def render_history_section() -> None:
     st.subheader("📚 Histórico / Reabrir auditoría")
     st.info(
-        "Este histórico es manual y temporal: subes ZIP/JSON de auditorías anteriores, "
-        "la app los lee y puedes abrirlos para revisar o editar. Para conservar algo, descarga siempre el ZIP completo."
+        "Esta sección es un respaldo manual para importar ZIP/JSON antiguos. "
+        "Las auditorías nuevas se guardan automáticamente en ☁️ Mis auditorías."
     )
 
     uploaded_key = f"history_upload_{st.session_state.get('history_uploader_version', 0)}"
@@ -4010,7 +4466,7 @@ def render_history_section() -> None:
             st.session_state.history_uploader_version = st.session_state.get("history_uploader_version", 0) + 1
             st.rerun()
     with history_cols[2]:
-        st.caption("El histórico cargado vive solo en esta sesión de Streamlit. Tus archivos maestros siguen siendo los ZIP que guardas tú.")
+        st.caption("Los archivos importados aquí viven solo en esta sesión. Para auditorías nuevas usa ☁️ Mis auditorías; el ZIP/JSON sigue siendo un respaldo manual.")
 
     library = st.session_state.get("audit_history_library", {})
     if not library:
@@ -4152,11 +4608,18 @@ def render_history_section() -> None:
 def main():
     st.set_page_config(page_title="Warranty Audit Assistant", page_icon="🧾", layout="wide")
     init_state()
+    audit_login_gate()
 
     st.title("🧾 Warranty Audit Assistant")
     st.caption("Herramienta interna para revisar claims, calcular puntuación y generar automáticamente boletín/plan de acción en español e inglés.")
 
     with st.sidebar:
+        st.caption(f"👤 {safe_str(st.session_state.get('authenticated_user', ''))}")
+        if st.button("Cerrar sesión", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.authenticated_user = ""
+            st.rerun()
+
         st.header("Auditoría")
         st.session_state.audit_name = st.text_input("Nombre auditoría", value=st.session_state.audit_name)
         st.session_state.audit_date = st.date_input(
@@ -4188,6 +4651,9 @@ def main():
                 st.session_state.audit_auditor = loaded_auditor
                 st.session_state.audit_date = loaded_date
                 st.session_state.selected_claim = next(iter(claims.keys()))
+                st.session_state.current_audit_id = safe_str(payload.get("audit_id", "")) or ""
+                st.session_state.autosave_last_hash = ""
+                st.session_state.autosave_pending = True
                 restore_ai_outputs_from_payload(payload)
                 if payload_has_saved_ai_outputs(payload):
                     st.session_state.audit_section_index = 3
@@ -4200,6 +4666,11 @@ def main():
                 st.error(f"No se pudo cargar el JSON: {exc}")
 
         st.divider()
+        if st.button("☁️ Ver mis auditorías", use_container_width=True):
+            st.session_state.app_page = APP_PAGE_PERSISTENT
+            st.rerun()
+
+        st.divider()
         st.subheader("Regla de puntuación")
         st.write(f"Documentación: **{MAX_DOCUMENT_POINTS}**")
         st.write(f"Piezas viejas: **{MAX_OLD_PARTS_POINTS}**")
@@ -4208,6 +4679,11 @@ def main():
 
     page = st.radio("Vista", APP_PAGES, horizontal=True, key="app_page", label_visibility="collapsed")
     st.divider()
+
+    if page == APP_PAGE_PERSISTENT:
+        render_persistent_audits()
+        st.stop()
+
     if page == APP_PAGE_HISTORY:
         render_history_section()
         st.stop()
@@ -4221,9 +4697,18 @@ def main():
     sync_all_claims_from_widget_state(claims)
 
     if not claims:
-        st.info("Pega la lista de claims, con dealer si aplica, en la tabla de abajo para empezar. Si quieres reabrir una auditoría anterior, entra en 📚 Histórico / Reabrir.")
+        st.info("Pega la lista de claims para empezar, o entra en ☁️ Mis auditorías para continuar una guardada. La importación manual de JSON/ZIP sigue disponible como respaldo.")
         render_claim_paste_loader(dealer, show_title=True)
         st.stop()
+
+    ensure_audit_id()
+    render_autosave_status(
+        claims,
+        audit_name,
+        dealer,
+        auditor,
+        audit_date_value,
+    )
 
     with st.expander("Añadir o reemplazar claims desde tabla", expanded=False):
         render_claim_paste_loader(dealer, show_title=False)
@@ -4417,6 +4902,21 @@ def main():
             )
         elif section_index == 1 and current_index == 0:
             st.caption("Estás en II. Piezas viejas. El botón 'Siguiente claim' seguirá en piezas viejas para trabajar desde almacén.")
+
+    # -----------------------------------------------------------------
+    # AUTOGUARDADO
+    # -----------------------------------------------------------------
+    # Se ejecuta al final de cada rerun. El hash evita escrituras cuando
+    # nada ha cambiado. Si una escritura falla por red, queda pendiente
+    # y se vuelve a intentar en el siguiente rerun.
+    autosave_current_audit(
+        claims,
+        audit_name,
+        dealer,
+        auditor,
+        audit_date_value,
+        force=bool(st.session_state.get("autosave_pending", False)),
+    )
 
 
 if __name__ == "__main__":
