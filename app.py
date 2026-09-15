@@ -3845,6 +3845,7 @@ def render_persistent_audits() -> None:
     selected_id = st.selectbox(
         "Abrir auditoría",
         ids,
+        key="persistent_audit_selector",
         format_func=lambda file_id: persistent_audit_label(
             next((x for x in audits if safe_str(x.get("file_id", "")) == file_id), {})
         ),
@@ -3860,16 +3861,41 @@ def render_persistent_audits() -> None:
     if load_error:
         st.error(f"No se pudo abrir la auditoría: {load_error}")
 
-    st.button(
+    if st.button(
         "📂 Abrir para continuar",
         type="primary",
         use_container_width=True,
-        on_click=load_persistent_audit_callback,
-        args=(
-            selected_id,
-            safe_str(selected_meta.get("audit_id", "")),
-        ),
-    )
+        key="open_selected_persistent_audit",
+    ):
+        try:
+            # Aquí usamos el valor ACTUAL del selectbox de este mismo rerun.
+            # Antes se pasaba como argumento de callback y podía quedarse con
+            # el valor del render anterior (normalmente la auditoría más reciente).
+            current_selected_id = safe_str(
+                st.session_state.get("persistent_audit_selector", selected_id)
+            )
+
+            current_selected = next(
+                (
+                    x for x in audits
+                    if safe_str(x.get("file_id", "")) == current_selected_id
+                ),
+                {},
+            )
+            current_meta = (
+                current_selected.get("metadata", {})
+                if isinstance(current_selected.get("metadata"), dict)
+                else {}
+            )
+
+            load_persistent_audit(
+                current_selected_id,
+                safe_str(current_meta.get("audit_id", "")),
+            )
+            st.rerun()
+
+        except Exception as exc:
+            st.error(f"No se pudo abrir la auditoría: {exc}")
 
 
 
