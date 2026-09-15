@@ -3407,9 +3407,9 @@ def audit_api_request(action: str, **payload) -> Dict[str, Any]:
     """
     Habla con el Google Apps Script que guarda los JSON en tu Drive personal.
 
-    Google Apps Script ContentService responde mediante una redirección temporal
-    a script.googleusercontent.com. La gestionamos manualmente porque esas URLs
-    pueden devolver un 404 transitorio si se siguen de forma automática.
+    Apps Script ContentService responde mediante una redirección temporal a
+    script.googleusercontent.com. Usamos la MISMA requests.Session para el POST
+    inicial y el GET de la redirección, conservando cookies/cabeceras de Google.
     """
     url = get_required_secret("AUDIT_DRIVE_API_URL")
     token = get_required_secret("AUDIT_DRIVE_API_TOKEN")
@@ -3434,86 +3434,84 @@ def audit_api_request(action: str, **payload) -> Dict[str, Any]:
 
     last_error = None
 
-    # Dos intentos cubren los 404 transitorios de las URLs temporales
-    # de script.googleusercontent.com sin duplicar indefinidamente peticiones.
-    for attempt in range(2):
+    for attempt in range(3):
         try:
-            response = requests.post(
-                url,
-                json=body,
-                headers=headers,
-                timeout=AUTOSAVE_API_TIMEOUT,
-                allow_redirects=False,
-            )
+            with requests.Session() as http:
+                http.headers.update(headers)
 
-            # Apps Script ContentService suele responder 302/303 hacia una URL
-            # temporal de googleusercontent que debe consultarse mediante GET.
-            if response.status_code in (301, 302, 303, 307, 308):
-                redirect_url = response.headers.get("Location", "").strip()
-                if not redirect_url:
-                    raise RuntimeError(
-                        f"Google Apps Script respondió HTTP {response.status_code} "
-                        "sin una URL de redirección."
+                response = http.post(
+                    url,
+                    json=body,
+                    timeout=AUTOSAVE_API_TIMEOUT,
+                    allow_redirects=False,
+                )
+
+                if response.status_code in (301, 302, 303, 307, 308):
+                    redirect_url = response.headers.get("Location", "").strip()
+                    if not redirect_url:
+                        raise RuntimeError(
+                            f"Google Apps Script respondió HTTP {response.status_code} "
+                            "sin una URL de redirección."
+                        )
+
+                    # MUY IMPORTANTE: usamos la misma Session para conservar
+                    # cualquier cookie que Google haya emitido en el POST.
+                    response = http.get(
+                        redirect_url,
+                        timeout=AUTOSAVE_API_TIMEOUT,
+                        allow_redirects=True,
                     )
 
-                response = requests.get(
-                    redirect_url,
-                    headers=headers,
-                    timeout=AUTOSAVE_API_TIMEOUT,
-                    allow_redirects=True,
-                )
+                # La URL temporal de googleusercontent puede caducar. Si ocurre,
+                # repetimos todo desde /exec para obtener una nueva.
+                if response.status_code == 404:
+                    last_error = RuntimeError(
+                        "Google devolvió un 404 temporal al recoger la respuesta "
+                        "de Apps Script."
+                    )
+                    if attempt < 2:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
 
-            # Si la URL temporal de googleusercontent caduca o falla, repetimos
-            # desde /exec para obtener una nueva.
-            if response.status_code == 404 and attempt == 0:
-                last_error = RuntimeError(
-                    "Google devolvió un 404 temporal al recoger la respuesta "
-                    "de Apps Script. Reintentando..."
-                )
-                time.sleep(0.4)
-                continue
+                response.raise_for_status()
 
-            response.raise_for_status()
+                try:
+                    result = response.json()
+                except Exception as exc:
+                    preview = safe_str(response.text)[:1000]
+                    raise RuntimeError(
+                        "El servicio de Drive devolvió una respuesta no válida. "
+                        f"HTTP {response.status_code}. "
+                        f"Content-Type: {response.headers.get('Content-Type', '')}. "
+                        f"Respuesta: {preview or '[vacía]'}"
+                    ) from exc
 
-            try:
-                result = response.json()
-            except Exception as exc:
-                preview = safe_str(response.text)[:700]
-                raise RuntimeError(
-                    "El servicio de Drive devolvió una respuesta no válida. "
-                    f"HTTP {response.status_code}. Respuesta: {preview or '[vacía]'}"
-                ) from exc
+                if not isinstance(result, dict):
+                    raise RuntimeError(
+                        "El servicio de Drive devolvió JSON, pero no es un objeto válido."
+                    )
 
-            if not isinstance(result, dict):
-                raise RuntimeError(
-                    "El servicio de Drive devolvió JSON, pero no es un objeto válido."
-                )
+                if not result.get("ok"):
+                    detail = (
+                        safe_str(result.get("message", ""))
+                        or safe_str(result.get("error", ""))
+                        or "Error desconocido de Drive."
+                    )
+                    raise RuntimeError(detail)
 
-            if not result.get("ok"):
-                detail = (
-                    safe_str(result.get("message", ""))
-                    or safe_str(result.get("error", ""))
-                    or "Error desconocido de Drive."
-                )
-                raise RuntimeError(detail)
-
-            return result
+                return result
 
         except requests.RequestException as exc:
             last_error = exc
-            if attempt == 0:
-                time.sleep(0.4)
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
                 continue
             break
-        except RuntimeError as exc:
-            last_error = exc
-            if attempt == 0 and "404 temporal" in str(exc):
-                time.sleep(0.4)
-                continue
-            raise
 
     if last_error:
-        raise RuntimeError(f"No se pudo comunicar con Google Drive: {last_error}") from last_error
+        raise RuntimeError(
+            f"No se pudo comunicar con Google Drive: {last_error}"
+        ) from last_error
 
     raise RuntimeError("No se pudo comunicar con Google Drive.")
 
