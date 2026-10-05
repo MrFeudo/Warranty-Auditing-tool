@@ -1523,9 +1523,16 @@ def collect_ai_outputs_for_workfile() -> Dict[str, Any]:
     return outputs
 
 
+def restore_audit_notes_from_payload(payload: Dict[str, Any]) -> None:
+    """Restaura las notas generales del auditor guardadas en el JSON (si existen)."""
+    audit = payload.get("audit", {}) if isinstance(payload, dict) and isinstance(payload.get("audit", {}), dict) else {}
+    st.session_state["audit_notes"] = safe_str(audit.get("auditor_notes", ""))
+
+
 def restore_ai_outputs_from_payload(payload: Dict[str, Any]) -> None:
     """Restaura el informe/plan IA guardado en un JSON histórico, si existe."""
     clear_ai_outputs()
+    restore_audit_notes_from_payload(payload)
     ai_outputs = payload.get("ai_outputs", {}) if isinstance(payload, dict) else {}
     if not isinstance(ai_outputs, dict):
         return
@@ -1653,6 +1660,7 @@ def serialize_audit_workfile(claims: Dict[str, Dict[str, Any]], audit_name: str,
             "dealer": dealer or "",
             "auditor": auditor or "",
             "audit_date": audit_date,
+            "auditor_notes": safe_str(get_streamlit_state_value("audit_notes", "")),
         },
         "manifest": build_audit_manifest(claims, audit_name, dealer, auditor, audit_date_value),
         "ai_outputs": collect_ai_outputs_for_workfile(),
@@ -2101,6 +2109,7 @@ def build_ai_audit_payload(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             "campaigns": "Not included",
         },
         "audit_score": audit_score,
+        "auditor_general_notes": safe_str(get_streamlit_state_value("audit_notes", "")),
         "data_scope_for_ai": "The regular claims array intentionally includes only claims with observations, score deviations or deductions. Claims marked as not covered by warranty are separated in not_warranty_claims and must not be expanded as deviations in every checklist item.",
         "action_plan_context": action_plan_context,
         "not_warranty_claims": not_warranty_payload,
@@ -2212,6 +2221,13 @@ CAUTIOUS WORDING RULES:
 - Avoid wording such as: sancionar, incumplimiento grave, obligación inmediata, the dealer failed, mandatory sanction.
 - Do not include claims without observations in narrative sections. They are represented only in global scores.
 - If an item has a low score but no observation, do not invent the reason. State cautiously that the score indicates a deviation without a specific note, only if needed.
+
+AUDITOR GENERAL NOTES RULE:
+- auditor_general_notes contains free text written by the auditor about the audit as a whole (for example an action plan agreed with the dealer, responsibilities, deadlines, follow-up visits or general context). It is first-hand auditor input and must be used.
+- When auditor_general_notes is not empty, add a section titled exactly "Notas y plan de acción del auditor" in report_es and "Auditor notes and action plan" in report_en, presenting those notes clearly and professionally (translated naturally into English for report_en).
+- Keep any actions, owners, deadlines or commitments exactly as the auditor wrote them: do not drop, soften or invent them. These notes take precedence over the cautious wording rules.
+- When a note clearly relates to an audited parameter, also reflect it in that parameter's countermeasures in action_plan_rows_es / action_plan_rows_en.
+- Do not add content that is not in the notes. If auditor_general_notes is empty, omit that section.
 
 REPORT FORMAT:
 - report_es and report_en must be highly readable.
@@ -2923,6 +2939,7 @@ def export_scorecard_excel(claims: Dict[str, Dict[str, Any]], audit_name: str, d
             ["Scoring rule" if language == "en" else "Regla de puntuación", "Claim document checklist I = 58 / Claim old parts checklist II = 42 / Total = 100"],
             ["N/A rule" if language == "en" else "Regla N/A", "No aplica = maximum score" if language == "en" else "No aplica = puntuación máxima del apartado"],
             ["Manual observations" if language == "en" else "Observaciones manuales", t["not_translated_note"]],
+            ["Auditor notes" if language == "en" else "Notas del auditor", comment_for_language(get_streamlit_state_value("audit_notes", ""), language) or "-"],
             ["Deduction" if language == "en" else "Deducción", "Financial deduction is informative and does not modify the audit score unless the claim is marked as not covered by warranty." if language == "en" else "La deducción económica es informativa y no modifica la nota salvo que se marque la claim como no cubierta por garantía."],
         ]
         set_widths(content_ws, [28, 90, 18, 18])
@@ -3142,6 +3159,15 @@ def generate_text_report(claims: Dict[str, Dict[str, Any]], audit_name: str, dea
                 lines.append(f"- {claim_id}: {total_points}/100.")
     else:
         lines.append("No hay claims con desviaciones puntuables fuera de las reclamaciones no cubiertas por garantía." if language == "es" else "There are no score deviations outside the claims not covered by warranty.")
+
+    auditor_notes = safe_str(get_streamlit_state_value("audit_notes", ""))
+    if auditor_notes:
+        lines.append("")
+        lines.append("Notas y plan de acción del auditor" if language == "es" else "Auditor notes and action plan")
+        for note_line in auditor_notes.splitlines():
+            note_line = safe_str(note_line)
+            if note_line:
+                lines.append(comment_for_language(note_line, language))
 
     lines.append("")
     lines.append(t["conclusion"])
@@ -3699,6 +3725,7 @@ def start_new_audit() -> None:
         st.session_state.get("authenticated_user", "")
     )
     st.session_state.audit_date = datetime.now().date()
+    st.session_state.audit_notes = ""
     st.session_state.current_audit_id = ""
     st.session_state.autosave_last_hash = ""
     st.session_state.autosave_last_success = ""
@@ -3919,6 +3946,7 @@ def init_state():
     st.session_state.setdefault("audit_dealer", "")
     st.session_state.setdefault("audit_auditor", "")
     st.session_state.setdefault("audit_date", datetime.now().date())
+    st.session_state.setdefault("audit_notes", "")
     st.session_state.setdefault("audit_section_index", 0)
     st.session_state.setdefault("claim_paste_editor_version", 0)
     st.session_state.setdefault("evidence_uploader_version", 0)
@@ -4213,6 +4241,22 @@ def render_comments_editor(claim: Dict[str, Any]):
 
 def render_report_section(claims: Dict[str, Dict[str, Any]], audit_name: str, dealer: str, auditor: str, base_name: str, audit_date_value: Any = None):
     st.subheader("Informe y resumen de observaciones")
+
+    # Widget con key propia: Streamlit borra el estado de un widget cuando no se pinta
+    # (p. ej. al ir a "I. Documentación"), así que el valor real vive en "audit_notes".
+    st.session_state["audit_notes_widget"] = safe_str(st.session_state.get("audit_notes", ""))
+
+    def _sync_audit_notes() -> None:
+        st.session_state["audit_notes"] = safe_str(st.session_state.get("audit_notes_widget", ""))
+
+    st.text_area(
+        "📝 Notas generales / plan de acción del auditor",
+        key="audit_notes_widget",
+        on_change=_sync_audit_notes,
+        height=140,
+        placeholder="Ej.: Se acuerda con el dealer revisar el proceso de etiquetado de piezas viejas antes del 30/11. Próxima visita de seguimiento en enero.",
+        help="Texto libre sobre la auditoría en conjunto. Se guarda con la auditoría y Gemini lo incorpora al informe (sección 'Notas y plan de acción del auditor'). Si no usas Gemini, aparece igualmente en el informe básico.",
+    )
 
     with st.expander("✨ Generación con Gemini", expanded=not bool(get_ai_report_for_language("es"))):
         st.caption(
